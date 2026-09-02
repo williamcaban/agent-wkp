@@ -47,7 +47,7 @@ def search(
 
     params_vec: list = [query_vec]
     params_fts: list = [query]
-    params_join: list = [*((workspaces or []))]
+    params_join: list = [*(workspaces or [])]
 
     sql = f"""
     WITH vec_hits AS (

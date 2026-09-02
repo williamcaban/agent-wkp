@@ -1,5 +1,4 @@
 """Tests for retriever.py — hybrid search, traversal, context assembly."""
-from pathlib import Path
 
 
 class TestSearch:
@@ -11,7 +10,7 @@ class TestSearch:
         assert len(results) > 0
 
     def test_results_have_required_fields(self, populated_db) -> None:
-        from wkp.retriever import search, SearchResult
+        from wkp.retriever import SearchResult, search
 
         conn, _ = populated_db
         results = search(conn, "project")

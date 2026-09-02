@@ -102,6 +102,7 @@ def index(files: tuple[str, ...], force: bool, workspace: str) -> None:
 def search(query: str, tier: int, budget: int, workspace: str, fmt: str, k: int) -> None:
     """Hybrid semantic + keyword search over the knowledge index."""
     import json as _json
+
     from .retriever import search as _search
 
     root = _find_workspace_root(Path(workspace))
@@ -285,5 +286,5 @@ def analyze(top: int, workspace: str) -> None:
     for c in candidates:
         click.echo(f"  score={c.pagerank_score:.4f}  [{c.reason}]")
         click.echo(f"  {c.title or c.path}")
-        click.echo(f"  → add 'type: feedback' or 'type: project-state' to OKF frontmatter")
+        click.echo("  → add 'type: feedback' or 'type: project-state' to OKF frontmatter")
         click.echo(f"  path: {c.path}\n")

@@ -101,8 +101,9 @@ class TestSearch:
     def test_json_format(
         self, runner: CliRunner, populated_db, patch_model
     ) -> None:
-        from wkp.cli import main
         import json
+
+        from wkp.cli import main
 
         _, workspace = populated_db
         result = runner.invoke(

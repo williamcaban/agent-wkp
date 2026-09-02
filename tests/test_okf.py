@@ -1,8 +1,6 @@
 """Tests for okf.py — frontmatter parsing and edge extraction."""
 from pathlib import Path
 
-import pytest
-
 
 def write(tmp_path: Path, name: str, content: str) -> Path:
     p = tmp_path / name
@@ -122,8 +120,9 @@ class TestExtractEdges:
 
 class TestHelpers:
     def test_tags_to_json_list(self) -> None:
-        from wkp.okf import tags_to_json
         import json
+
+        from wkp.okf import tags_to_json
 
         result = json.loads(tags_to_json(["a", "b"]))
         assert result == ["a", "b"]
@@ -134,8 +133,9 @@ class TestHelpers:
         assert tags_to_json(None) == "[]"
 
     def test_refs_to_json_list(self) -> None:
-        from wkp.okf import refs_to_json
         import json
+
+        from wkp.okf import refs_to_json
 
         result = json.loads(refs_to_json(["x.md", "y.md"]))
         assert result == ["x.md", "y.md"]
