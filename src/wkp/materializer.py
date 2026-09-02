@@ -135,7 +135,7 @@ fi
 def generate_post_commit_hook() -> str:
     """Return text of a post-commit hook that incrementally re-indexes changed files.
 
-    Requires `wkp` on PATH (install with `pip install wkp` or `pipx install wkp`).
+    Requires `wkp` on PATH (install with `pip install agent-wkp` or `pipx install agent-wkp`).
     The hook runs from the git repo root, so `wkp` will auto-detect the workspace.
     """
     return """\

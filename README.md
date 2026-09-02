@@ -28,7 +28,7 @@ Tier 0 is **structurally guaranteed** — it is never retrieved, never skipped, 
 ## Quickstart
 
 ```bash
-pip install wkp    # or: pipx install wkp
+pip install agent-wkp    # or: pipx install agent-wkp
 
 cd your-workspace
 wkp init           # creates .wkp/, adds to .gitignore
