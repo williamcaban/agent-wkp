@@ -25,7 +25,7 @@ class TestMaterializeTier0:
         assert "WKP Tier 0" in content
 
     def test_respects_token_budget(self, populated_db) -> None:
-        from wkp.materializer import materialize_tier0, _TIER0_TOKEN_BUDGET
+        from wkp.materializer import _TIER0_TOKEN_BUDGET, materialize_tier0
 
         conn, workspace = populated_db
         out = workspace / ".wkp" / "tier0.md"
@@ -90,8 +90,9 @@ class TestGenerateSessionHook:
         assert str(wkp_dir.resolve()) in script
 
     def test_unknown_framework_raises(self, tmp_path: Path) -> None:
-        from wkp.materializer import generate_session_hook
         import pytest
+
+        from wkp.materializer import generate_session_hook
 
         with pytest.raises(ValueError, match="Unknown framework"):
             generate_session_hook(tmp_path / ".wkp", "unknown_framework")
