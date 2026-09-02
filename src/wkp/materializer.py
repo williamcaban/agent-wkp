@@ -4,7 +4,6 @@ from __future__ import annotations
 import sqlite3
 from pathlib import Path
 
-
 _TIER0_TOKEN_BUDGET = 4000
 _TIER1_TOKEN_BUDGET = 8000
 
