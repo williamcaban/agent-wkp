@@ -23,7 +23,22 @@ Tier 0 is **structurally guaranteed** — it is never retrieved, never skipped, 
 2. `wkp index` embeds each file (CPU-only, `all-MiniLM-L6-v2`, ~40ms/file) and stores the embeddings alongside metadata and explicit graph edges in a single SQLite file (`.wkp/index.db`).
 3. `wkp search "topic"` runs hybrid retrieval: vector similarity + BM25 keyword search merged via Reciprocal Rank Fusion, filtered by tier and token budget.
 4. `wkp materialize --tier 0` pre-assembles the always-on context into `.wkp/tier0.md`.
-5. A git post-commit hook keeps the index current — only re-embeds files whose git blob SHA changed.
+5. The index stays current via git blob SHA — only files whose content actually changed are re-embedded on the next `wkp index` run.
+
+## Storage
+
+Everything lives in `.wkp/` at the workspace root — two files, nothing else:
+
+```
+your-workspace/
+  .wkp/
+    index.db    ← single SQLite file: embeddings + metadata + FTS + graph (typically 1–10 MB)
+    tier0.md    ← pre-assembled Tier 0 context injected at session start
+```
+
+Both files are in `.gitignore`. They are derived artifacts — deleting `.wkp/` and running `wkp init && wkp index` reconstructs everything from your markdown files in seconds.
+
+Sub-workspaces each get their own `.wkp/` shard. `wkp search --all-workspaces` federates across all shards.
 
 ## Quickstart
 
@@ -31,17 +46,92 @@ Tier 0 is **structurally guaranteed** — it is never retrieved, never skipped, 
 pip install agent-wkp    # or: pipx install agent-wkp
 
 cd your-workspace
-wkp init           # creates .wkp/, adds to .gitignore
-wkp index          # full index (downloads ~22MB model on first run)
-wkp materialize --tier 0
-wkp hooks --framework claude_code --post-commit
+wkp init                          # creates .wkp/, adds to .gitignore
+wkp index                         # full index (downloads ~22MB model on first run)
+wkp materialize --tier 0          # pre-assemble Tier 0 context file
+wkp hooks --framework claude_code # install SessionStart hook for Claude Code
 
 # Search from any agent or shell
 wkp search "rfe creation workflow"
 wkp context "evalhub adapter" --tier 2 --budget 8000
 wkp traverse memory/my-file.md --depth 2
-wkp analyze        # PageRank — suggests Tier 1 promotions
+wkp analyze                       # PageRank — suggests Tier 1 promotions
 ```
+
+## Keeping the index fresh
+
+The index only re-embeds files whose git blob SHA changed — unchanged files are skipped in milliseconds. The question is *what triggers* a re-index run.
+
+**Choose the trigger that matches your commit frequency:**
+
+### Option A — SessionStart hook (recommended for knowledge bases)
+
+Re-index any changed files at the start of every agent session, before the first prompt. Best for repos where commits happen infrequently (days or weeks apart).
+
+```bash
+wkp hooks --framework claude_code   # generates .claude/hooks/wkp-session-start.sh
+```
+
+Then update the hook script to re-index before injecting Tier 0:
+
+```bash
+#!/bin/bash
+# .claude/hooks/wkp-session-start.sh
+cd "$(git rev-parse --show-toplevel)" || exit 0
+
+# Re-index any files changed since the last index run (skips unchanged via SHA)
+wkp index --quiet 2>/dev/null || true
+
+echo "<wkp-context tier=\"0\">"
+cat .wkp/tier0.md
+echo "</wkp-context>"
+```
+
+Wire it in `.claude/settings.local.json`:
+
+```json
+{
+  "hooks": {
+    "SessionStart": [
+      { "hooks": [{ "type": "command", "command": "bash .claude/hooks/wkp-session-start.sh" }] }
+    ]
+  }
+}
+```
+
+### Option B — git post-commit hook (recommended for active code repos)
+
+Re-index only the files changed in each commit. Best for repos where commits happen frequently (multiple times per day).
+
+```bash
+wkp hooks --framework claude_code --post-commit
+```
+
+### Option C — Manual
+
+Run `wkp index` whenever you want a fresh index. Useful for large batch changes or initial setup.
+
+```bash
+wkp index            # re-index everything changed since last run
+wkp index file.md    # re-index a single file immediately
+```
+
+### Hot files: UserPromptSubmit hook
+
+If specific files change frequently mid-session (e.g. a Claude Code memory directory), re-index them on every prompt:
+
+```json
+{
+  "hooks": {
+    "UserPromptSubmit": [
+      { "hooks": [{ "type": "command",
+          "command": "wkp index ~/.claude/projects/<your-project>/memory/ 2>/dev/null || true" }] }
+    ]
+  }
+}
+```
+
+This is fast (~100ms) because SHA comparison skips unchanged files.
 
 ## OKF Frontmatter
 

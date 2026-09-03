@@ -25,7 +25,7 @@ def _open_db(workspace_root: Path):
 
 
 @click.group()
-@click.version_option()
+@click.version_option(package_name="agent-wkp")
 def main() -> None:
     """Workspace Knowledge Protocol — progressive disclosure knowledge index."""
 

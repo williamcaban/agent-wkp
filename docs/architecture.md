@@ -182,33 +182,68 @@ After search, the `context_assemble` function additionally traverses explicit ed
 
 ### Cache invalidation
 
+Git blob SHA is the cache invalidation key. `git hash-object <file>` returns a content-addressed hash. If the stored SHA matches the current SHA, the file is skipped — no re-embedding, no disk read of the content.
+
 ```python
 sha = subprocess.run(["git", "hash-object", path], ...).stdout.strip()
 if db.get_blob_sha(path) == sha:
     return  # skip — content unchanged
 ```
 
-### Post-commit hook flow
+This means `wkp index` is always safe to run at any frequency. The cost is proportional to what actually changed, not the total corpus size.
+
+### Update triggers — choose by commit frequency
+
+The git blob SHA mechanism is the *how*. The *when* depends on how often commits happen in your workspace:
+
+**Knowledge bases (infrequent commits — days or weeks apart)**
+
+Use the SessionStart hook to re-index before each session:
+
+```
+Session start
+  → .claude/hooks/wkp-session-start.sh
+      → wkp index          # skips unchanged files via SHA; re-embeds anything new
+      → wkp materialize --tier 0   # regenerate tier0 only if Tier 1 items changed
+      → cat .wkp/tier0.md
+      → stdout injected as <wkp-context tier="0"> before first prompt
+```
+
+For a corpus of 200–500 files with few changes, the SHA scan takes <200ms and the session starts with a fully current index.
+
+**Active code repos (frequent commits — multiple times per day)**
+
+The post-commit hook is more efficient — it only re-indexes files touched in each commit:
 
 ```
 git commit
   → post-commit hook
       → git diff --name-only HEAD~1 HEAD | grep '\.md$'
-      → wkp index [changed files]   # re-embeds only changed files
-      → wkp materialize --tier 0    # regenerates static context file
+      → wkp index [changed files]   # targeted re-embed
+      → wkp materialize --tier 0
 ```
 
-### SessionStart hook flow
+**Hot files changed mid-session**
+
+For files edited frequently without committing (e.g. agent memory directories), use a UserPromptSubmit hook to re-index on every prompt:
+
+```
+User sends prompt
+  → UserPromptSubmit hook
+      → wkp index ~/.claude/projects/<project>/memory/
+         (SHA check makes this ~100ms even for large directories)
+```
+
+### Tier 0 injection
 
 ```
 Session start
   → .claude/hooks/wkp-session-start.sh
-      → cat .wkp/tier0.md
-      → stdout injected as <wkp-context tier="0"> block
-         before first prompt
+      → stdout: <wkp-context tier="0"> ... </wkp-context>
+         injected before the first prompt
 ```
 
-Tier 0 injection has zero latency (file read, no subprocess, no network) because the file is pre-assembled.
+`tier0.md` is a static pre-assembled file — injection is a simple file read with zero subprocess overhead. If the SessionStart hook also runs `wkp index`, the materialize step regenerates `tier0.md` if any Tier 1 items changed.
 
 ---
 
