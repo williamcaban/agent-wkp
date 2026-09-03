@@ -80,7 +80,7 @@ def _det_embedding(text: str) -> np.ndarray:
     return vec / norm if norm > 0 else vec
 
 
-def _det_embedding_bytes(text: str) -> bytes:
+def _det_embedding_bytes(text: str, conn=None) -> bytes:
     return _det_embedding(text).tobytes()
 
 

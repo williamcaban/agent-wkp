@@ -126,6 +126,18 @@ CREATE VIRTUAL TABLE knowledge_fts USING fts5(
 
 FTS5 content table — no data duplication. Triggers on `knowledge_items` keep it in sync. BM25 ranking via the `rank` column.
 
+### `query_cache` — query embedding cache
+
+```sql
+CREATE TABLE query_cache (
+    query     TEXT PRIMARY KEY,
+    embedding BLOB NOT NULL,
+    created   TEXT DEFAULT (datetime('now'))
+);
+```
+
+Caches query embeddings to avoid reloading the embedding model on repeated queries. The `query` key is compound: `"local|{text}"` for the local sentence-transformers model, or `"{url}|{model}|{text}"` for remote endpoints. Entries from different models never collide. Not consulted for BM25-only search.
+
 ### `knowledge_edges` — explicit graph
 
 ```sql
@@ -160,21 +172,73 @@ ORDER BY r.depth, ki.tier, ki.tokens;
 
 ---
 
-## Retrieval: Hybrid RRF
+## Retrieval
 
-Search combines two signals via Reciprocal Rank Fusion (k=60):
+### Default: BM25 keyword search (FTS5)
+
+By default, `wkp search` uses BM25 via the FTS5 virtual table — instant, zero model load:
+
+```sql
+SELECT ki.path, ki.title, ki.type, ki.workspace, ki.tokens, ki.tier,
+       (-knowledge_fts.rank) AS score
+FROM knowledge_fts
+JOIN knowledge_items ki ON ki.rowid = knowledge_fts.rowid
+WHERE knowledge_fts MATCH ?
+  AND ki.visibility = 'shared'
+  AND ki.tier <= ?
+ORDER BY knowledge_fts.rank DESC
+LIMIT ?
+```
+
+FTS5 `rank` is a negative BM25 score (less negative = better match). Negating gives a positive score for display. Query strings are sanitized via `_sanitize_fts5()` before passing to FTS5 to strip special characters that cause syntax errors (e.g. periods in version numbers like `3.6`).
+
+### Hybrid: vector + BM25 via RRF (optional)
+
+When `--embed-url` is provided (or `WKP_EMBED_URL` is set), search adds a semantic vector signal merged via Reciprocal Rank Fusion (k=60):
 
 ```
 score(item) = Σ  1 / (60 + rank_in_signal)
               signals
 ```
 
-- **Signal 1 (semantic)**: vector similarity via `knowledge_vec` ANN search
+- **Signal 1 (semantic)**: vector similarity via `knowledge_vec` ANN search — query embedded via remote OpenAI-compatible endpoint
 - **Signal 2 (keyword)**: BM25 via `knowledge_fts` MATCH
 
-Both signals run in a single SQL query with a CTE. No application-layer merge. Post-RRF filtering applies tier ceiling, visibility, and token budget constraints.
+Both signals run in a single SQL query with CTEs. No application-layer merge. If the vector search fails (e.g. embedding dimension mismatch between the query model and index model), WKP automatically falls back to BM25-only.
 
-After search, the `context_assemble` function additionally traverses explicit edges from the top-3 results (depth 2) to pull in directly-referenced items within the remaining token budget.
+### Remote embeddings endpoint
+
+`EmbedConfig` holds the endpoint URL, optional API key, and model name:
+
+```python
+@dataclass
+class EmbedConfig:
+    url: str             # e.g. "http://localhost:11434/v1"
+    api_key: str | None  # read from WKP_EMBED_API_KEY — keep out of shell history
+    model: str | None    # e.g. "nomic-embed-text" — omit for server default
+```
+
+The CLI reads these from env vars (`WKP_EMBED_URL`, `WKP_EMBED_API_KEY`, `WKP_EMBED_MODEL`) or flags. The `httpx` library makes the POST to `/v1/embeddings`. Requires `pip install 'agent-wkp[embed]'`.
+
+**Embedding consistency**: vector search is meaningful only when the query model matches the model used during `wkp index`. The indexer currently always uses `all-MiniLM-L6-v2` (384-dim). If a remote model produces a different dimension, the vector leg silently falls back to BM25-only rather than returning garbage results.
+
+### Query embedding cache
+
+Query embeddings are cached in `query_cache` (a regular SQLite table in `index.db`):
+
+```sql
+CREATE TABLE query_cache (
+    query     TEXT PRIMARY KEY,  -- compound key: "local|{text}" or "{url}|{model}|{text}"
+    embedding BLOB NOT NULL,
+    created   TEXT DEFAULT (datetime('now'))
+);
+```
+
+The compound key encodes the embedding source so entries from different models don't collide. Cache lookup happens before any model load — if the query was seen before (with the same source), no model call is made. For BM25-only search, the cache is not consulted (no embedding needed).
+
+### Context assembly
+
+After search, `context_assemble` traverses explicit edges from the top-3 results (depth 2) to pull in directly-referenced items within the remaining token budget. Both search and traversal respect the tier ceiling and token budget constraints.
 
 ---
 

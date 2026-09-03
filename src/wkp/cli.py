@@ -104,6 +104,34 @@ def index(files: tuple[str, ...], force: bool, quiet: bool, workspace: str) -> N
 # wkp search
 # ---------------------------------------------------------------------------
 
+def _embed_options(cmd):
+    """Decorator that adds --embed-url / --embed-api-key / --embed-model to a command."""
+    cmd = click.option(
+        "--embed-url", envvar="WKP_EMBED_URL", default=None, metavar="URL",
+        help="OpenAI-compatible embeddings endpoint for semantic search "
+             "(e.g. http://localhost:11434/v1). Reads WKP_EMBED_URL env var. "
+             "Default: BM25 keyword search only.",
+    )(cmd)
+    cmd = click.option(
+        "--embed-api-key", envvar="WKP_EMBED_API_KEY", default=None, metavar="KEY",
+        help="API key for the embeddings endpoint. "
+             "Prefer WKP_EMBED_API_KEY env var over this flag to avoid key in shell history.",
+    )(cmd)
+    cmd = click.option(
+        "--embed-model", envvar="WKP_EMBED_MODEL", default=None, metavar="MODEL",
+        help="Embedding model name sent to the endpoint (e.g. nomic-embed-text). "
+             "Reads WKP_EMBED_MODEL env var. Omit to use the server's default.",
+    )(cmd)
+    return cmd
+
+
+def _build_embed_config(embed_url, embed_api_key, embed_model):
+    from .retriever import EmbedConfig
+    if embed_url:
+        return EmbedConfig(url=embed_url, api_key=embed_api_key, model=embed_model)
+    return None
+
+
 @main.command()
 @click.argument("query")
 @click.option("--tier", default=2, show_default=True, help="Max tier to include")
@@ -112,15 +140,24 @@ def index(files: tuple[str, ...], force: bool, quiet: bool, workspace: str) -> N
 @click.option("--format", "fmt", default="text",
               type=click.Choice(["text", "json", "paths"]), show_default=True)
 @click.option("-k", default=10, show_default=True, help="Max results")
-def search(query: str, tier: int, budget: int, workspace: str, fmt: str, k: int) -> None:
-    """Hybrid semantic + keyword search over the knowledge index."""
+@_embed_options
+def search(
+    query: str, tier: int, budget: int, workspace: str, fmt: str, k: int,
+    embed_url: str | None, embed_api_key: str | None, embed_model: str | None,
+) -> None:
+    """Search the knowledge index.
+
+    Default: instant BM25 keyword search (no model required).
+    Add --embed-url to enable hybrid semantic + keyword search via RRF.
+    """
     import json as _json
 
     from .retriever import search as _search
 
     root = _find_workspace_root(Path(workspace), explicit=workspace != ".")
     conn = _open_db(root)
-    results = _search(conn, query, max_tier=tier, token_budget=budget, k=k)
+    embed_config = _build_embed_config(embed_url, embed_api_key, embed_model)
+    results = _search(conn, query, embed_config=embed_config, max_tier=tier, token_budget=budget, k=k)
     conn.close()
 
     if fmt == "json":
@@ -135,8 +172,9 @@ def search(query: str, tier: int, budget: int, workspace: str, fmt: str, k: int)
     else:
         for r in results:
             tier_label = f"T{r.tier}" if r.tier else "T?"
+            mode = " [semantic]" if embed_config else ""
             click.echo(
-                f"[{tier_label}] {r.title or r.path}  "
+                f"[{tier_label}]{mode} {r.title or r.path}  "
                 f"(score={r.score:.3f}, ~{r.tokens or '?'}t)"
             )
             click.echo(f"     {r.path}")
@@ -153,13 +191,18 @@ def search(query: str, tier: int, budget: int, workspace: str, fmt: str, k: int)
 @click.option("--workspace", default=".", help="Workspace root")
 @click.option("--format", "fmt", default="text",
               type=click.Choice(["text", "paths"]), show_default=True)
-def context(topic: str, tier: int, budget: int, workspace: str, fmt: str) -> None:
+@_embed_options
+def context(
+    topic: str, tier: int, budget: int, workspace: str, fmt: str,
+    embed_url: str | None, embed_api_key: str | None, embed_model: str | None,
+) -> None:
     """Assemble tier-aware context for a topic within a token budget."""
     from .retriever import context_assemble
 
     root = _find_workspace_root(Path(workspace), explicit=workspace != ".")
     conn = _open_db(root)
-    results = context_assemble(conn, topic, tier=tier, token_budget=budget)
+    embed_config = _build_embed_config(embed_url, embed_api_key, embed_model)
+    results = context_assemble(conn, topic, tier=tier, token_budget=budget, embed_config=embed_config)
     conn.close()
 
     if fmt == "paths":

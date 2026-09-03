@@ -65,6 +65,13 @@ CREATE TABLE IF NOT EXISTS knowledge_edges (
 );
 CREATE INDEX IF NOT EXISTS idx_edges_target ON knowledge_edges(target_path);
 CREATE INDEX IF NOT EXISTS idx_edges_source ON knowledge_edges(source_path);
+
+-- Cache query embeddings to avoid reloading the model for repeated queries
+CREATE TABLE IF NOT EXISTS query_cache (
+    query     TEXT PRIMARY KEY,
+    embedding BLOB NOT NULL,
+    created   TEXT DEFAULT (datetime('now'))
+);
 """
 
 

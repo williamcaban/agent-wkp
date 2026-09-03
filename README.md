@@ -20,10 +20,11 @@ Tier 0 is **structurally guaranteed** — it is never retrieved, never skipped, 
 ## How it works
 
 1. You write markdown files with [OKF frontmatter](#okf-frontmatter) declaring `type`, `workspace`, `tokens`, and `refs`.
-2. `wkp index` embeds each file (CPU-only, `all-MiniLM-L6-v2`, ~40ms/file) and stores the embeddings alongside metadata and explicit graph edges in a single SQLite file (`.wkp/index.db`).
-3. `wkp search "topic"` runs hybrid retrieval: vector similarity + BM25 keyword search merged via Reciprocal Rank Fusion, filtered by tier and token budget.
+2. `wkp index` embeds each file (CPU-only, `all-MiniLM-L6-v2`, ~40ms/file) and stores embeddings, metadata, and explicit graph edges in a single SQLite file (`.wkp/index.db`).
+3. `wkp search "topic"` runs **BM25 keyword search (FTS5) by default** — instant, no model load. Add `--embed-url` for hybrid semantic + keyword search via Reciprocal Rank Fusion against an OpenAI-compatible embeddings endpoint (Ollama, LM Studio, vLLM, OpenAI, etc.).
 4. `wkp materialize --tier 0` pre-assembles the always-on context into `.wkp/tier0.md`.
 5. The index stays current via git blob SHA — only files whose content actually changed are re-embedded on the next `wkp index` run.
+6. Query embeddings are cached in SQLite (`query_cache` table) — repeated queries skip the model entirely.
 
 ## Storage
 
@@ -193,12 +194,17 @@ To wire the hook into Claude Code add to `.claude/settings.local.json`:
 wkp init                          Initialise index in this workspace
 wkp index [FILES]                 Index all (or specified) markdown files
   --force                         Re-embed even if git blob SHA unchanged
-wkp search QUERY                  Hybrid semantic + keyword search
+wkp search QUERY                  BM25 keyword search (default: instant, no model load)
+  --embed-url URL                 Enable hybrid semantic+keyword search via RRF.
+                                  Reads WKP_EMBED_URL env var.
+  --embed-api-key KEY             API key for endpoint. Prefer WKP_EMBED_API_KEY env var.
+  --embed-model MODEL             Model name (e.g. nomic-embed-text). Reads WKP_EMBED_MODEL.
   --tier INT                      Max tier to include (default: 2)
   --budget INT                    Token budget (default: 8000)
   -k INT                          Max results (default: 10)
   --format [text|json|paths]
 wkp context TOPIC                 Tier-aware context assembly
+  --embed-url / --embed-api-key / --embed-model   same as search
   --tier INT  --budget INT
 wkp traverse PATH                 BFS traversal from PATH via explicit edges
   --depth INT  --budget INT
@@ -209,15 +215,46 @@ wkp analyze                       PageRank — suggest Tier 1 promotions
   --top INT                       Number of candidates (default: 10)
 ```
 
+### Semantic search with Ollama
+
+```bash
+# Start Ollama and pull a small embedding model
+ollama pull nomic-embed-text
+
+# One-time: set env vars
+export WKP_EMBED_URL=http://localhost:11434/v1
+export WKP_EMBED_MODEL=nomic-embed-text
+
+# Hybrid search: semantic + keyword via RRF
+wkp search "evaluation drift detection"
+
+# Or per-call:
+wkp search "evaluation drift" --embed-url http://localhost:11434/v1 --embed-model nomic-embed-text
+```
+
+For endpoints that require an API key (OpenAI, hosted Ollama, etc.):
+
+```bash
+export WKP_EMBED_API_KEY=sk-...   # avoid --embed-api-key to keep key out of shell history
+export WKP_EMBED_URL=https://api.openai.com/v1
+export WKP_EMBED_MODEL=text-embedding-3-small
+wkp search "rfe creation workflow"
+```
+
+> **Note on embedding consistency**: vector search is most meaningful when the index was built with the same model used at query time. The embedding model for indexing is controlled separately in `indexer.py` (currently always `all-MiniLM-L6-v2`). If your remote model has a different dimension than the index (384), WKP automatically falls back to BM25-only rather than returning meaningless results.
+
 ## Requirements
 
 - Python 3.12+
 - `sqlite-vec` (vector similarity in SQLite — no server required)
-- `sentence-transformers` (downloads `all-MiniLM-L6-v2` on first index run, ~22MB)
+- `sentence-transformers` (downloads `all-MiniLM-L6-v2` on first `wkp index` run, ~22MB — required for indexing, not for search)
 - `networkx` (graph analytics — only loaded by `wkp analyze`)
+- `httpx` (optional — only required for `--embed-url` remote embeddings): `pip install 'agent-wkp[embed]'`
 - Git (for blob SHA cache invalidation)
 
 No database server. No Docker. The entire index is a single file: `.wkp/index.db`.
+
+> **Search without the model**: `wkp search` uses BM25 by default — the embedding model is only loaded during `wkp index`. If you never call `wkp search --embed-url`, sentence-transformers is loaded only at index time, not during agent sessions.
 
 ## Scalability
 
