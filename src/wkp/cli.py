@@ -9,9 +9,19 @@ WKP_DIR_NAME = ".wkp"
 DB_NAME = "index.db"
 
 
-def _find_workspace_root(start: Path = Path(".")) -> Path:
-    """Walk up from start until we find a .git directory (workspace root)."""
+def _find_workspace_root(start: Path = Path("."), explicit: bool = False) -> Path:
+    """Return the workspace root as an absolute path.
+
+    When `explicit` is True (caller passed --workspace explicitly), the provided
+    path is used as-is — this enables sub-workspace shards (e.g. eval-hub/ as
+    its own index unit separate from the git root).
+
+    When `explicit` is False (default workspace '.'), walk up from cwd to find
+    the nearest .git directory so the whole repo is covered.
+    """
     current = start.resolve()
+    if explicit:
+        return current
     for parent in [current, *current.parents]:
         if (parent / ".git").exists():
             return parent
@@ -38,7 +48,7 @@ def main() -> None:
 @click.option("--workspace", default=".", help="Workspace root (default: git root)")
 def init(workspace: str) -> None:
     """Initialise WKP index in this workspace."""
-    root = _find_workspace_root(Path(workspace))
+    root = _find_workspace_root(Path(workspace), explicit=workspace != ".")
     wkp_dir = root / WKP_DIR_NAME
 
     conn = _open_db(root)
@@ -68,7 +78,9 @@ def init(workspace: str) -> None:
 @click.option("--force", is_flag=True, default=False,
               help="Re-index all files regardless of SHA")
 @click.option("--workspace", default=".", help="Workspace root")
-def index(files: tuple[str, ...], force: bool, workspace: str) -> None:
+@click.option("--quiet", "-q", is_flag=True, default=False,
+              help="Suppress output (for use in hooks)")
+def index(files: tuple[str, ...], force: bool, quiet: bool, workspace: str) -> None:
     """Index markdown files into the WKP database.
 
     With no arguments, indexes all markdown files under the workspace.
@@ -77,14 +89,15 @@ def index(files: tuple[str, ...], force: bool, workspace: str) -> None:
     """
     from .indexer import index_workspace
 
-    root = _find_workspace_root(Path(workspace))
+    root = _find_workspace_root(Path(workspace), explicit=workspace != ".")
     conn = _open_db(root)
 
     paths = [Path(f) for f in files] if files else None
     indexed, skipped = index_workspace(conn, root, paths=paths, force=force)
     conn.close()
 
-    click.echo(f"Indexed {indexed} files, skipped {skipped} (unchanged)")
+    if not quiet:
+        click.echo(f"Indexed {indexed} files, skipped {skipped} (unchanged)")
 
 
 # ---------------------------------------------------------------------------
@@ -105,7 +118,7 @@ def search(query: str, tier: int, budget: int, workspace: str, fmt: str, k: int)
 
     from .retriever import search as _search
 
-    root = _find_workspace_root(Path(workspace))
+    root = _find_workspace_root(Path(workspace), explicit=workspace != ".")
     conn = _open_db(root)
     results = _search(conn, query, max_tier=tier, token_budget=budget, k=k)
     conn.close()
@@ -144,7 +157,7 @@ def context(topic: str, tier: int, budget: int, workspace: str, fmt: str) -> Non
     """Assemble tier-aware context for a topic within a token budget."""
     from .retriever import context_assemble
 
-    root = _find_workspace_root(Path(workspace))
+    root = _find_workspace_root(Path(workspace), explicit=workspace != ".")
     conn = _open_db(root)
     results = context_assemble(conn, topic, tier=tier, token_budget=budget)
     conn.close()
@@ -182,7 +195,7 @@ def traverse(path: str, depth: int, budget: int, workspace: str) -> None:
     """Show all items reachable from PATH via explicit edges."""
     from .retriever import traverse as _traverse
 
-    root = _find_workspace_root(Path(workspace))
+    root = _find_workspace_root(Path(workspace), explicit=workspace != ".")
     conn = _open_db(root)
     results = _traverse(conn, path, max_depth=depth, token_budget=budget)
     conn.close()
@@ -204,7 +217,7 @@ def materialize(tier: str, workspace: str) -> None:
     """Pre-assemble Tier 0 or 1 context into a static file for zero-latency injection."""
     from .materializer import materialize_tier0, materialize_tier1
 
-    root = _find_workspace_root(Path(workspace))
+    root = _find_workspace_root(Path(workspace), explicit=workspace != ".")
     wkp_dir = root / WKP_DIR_NAME
     conn = _open_db(root)
 
@@ -234,7 +247,7 @@ def hooks(framework: str, post_commit: bool, workspace: str) -> None:
     """Generate and install hook scripts."""
     from .materializer import generate_post_commit_hook, generate_session_hook
 
-    root = _find_workspace_root(Path(workspace))
+    root = _find_workspace_root(Path(workspace), explicit=workspace != ".")
     wkp_dir = root / WKP_DIR_NAME
 
     # Session hook
@@ -273,7 +286,7 @@ def analyze(top: int, workspace: str) -> None:
     """Run PageRank analysis and suggest Tier 1 promotions (requires networkx)."""
     from .graph import suggest_tier_promotions
 
-    root = _find_workspace_root(Path(workspace))
+    root = _find_workspace_root(Path(workspace), explicit=workspace != ".")
     conn = _open_db(root)
     candidates = suggest_tier_promotions(conn, top_n=top)
     conn.close()

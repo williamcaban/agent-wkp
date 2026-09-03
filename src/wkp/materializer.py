@@ -124,7 +124,7 @@ def generate_session_hook(
 
 # Re-index any files changed since the last run (SHA check skips unchanged files).
 # This keeps the index current for workspaces where git commits are infrequent.
-wkp index --workspace "{workspace_abs}" 2>/dev/null || true
+wkp index --quiet --workspace "{workspace_abs}" 2>/dev/null || true
 
 # Regenerate Tier 0 in case Tier 1 items changed.
 wkp materialize --tier 0 --workspace "{workspace_abs}" 2>/dev/null || true
