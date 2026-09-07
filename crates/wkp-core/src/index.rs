@@ -129,7 +129,16 @@ fn create_schema(conn: &Connection) -> rusqlite::Result<()> {
 /// - Otherwise: `project-state`/`instruction` -> 0, `feedback`/`knowledge`
 ///   -> 1, everything else (`reference`, `skill`, `memory`, unrecognized
 ///   types, or no type at all) -> 2.
-fn compute_tier(fm: &Frontmatter) -> u8 {
+/// - Anything under `inbox/` (design 5.4: "agent-written, unreviewed
+///   memory (Tier 2 only until promoted)") is always tier 2, regardless of
+///   `type` or `confidence` -- `wkp promote` (M2) is what's meant to move
+///   an item out of `inbox/` once it's reviewed, and this heuristic must
+///   not let an item promote itself just by claiming `type: project-state`
+///   while still sitting in `inbox/`.
+fn compute_tier(path: &str, fm: &Frontmatter) -> u8 {
+    if path.starts_with("inbox/") || path.contains("/inbox/") {
+        return 2;
+    }
     if matches!(
         fm.confidence,
         Some(Confidence::Inferred | Confidence::Proposed)
@@ -154,7 +163,7 @@ fn estimate_tokens(fm: &Frontmatter, body: &str) -> u32 {
 
 fn insert_item(conn: &Connection, item: &Item) -> rusqlite::Result<()> {
     let fm = &item.frontmatter;
-    let tier = compute_tier(fm);
+    let tier = compute_tier(&item.path, fm);
     let tokens_estimate = estimate_tokens(fm, &item.body);
     conn.execute("INSERT INTO paths (path) VALUES (?1)", [&item.path])?;
     conn.execute(
@@ -645,6 +654,40 @@ pub fn context(
     Ok(apply_budget(combined, filter.budget))
 }
 
+/// Assembles the exact `tier{N}.md` content for `wkp materialize` (design
+/// 4.2/4.3, M1-6): every item whose computed tier equals `tier` exactly
+/// (not "at or below" -- each materialized file is its own tier's content,
+/// composable by concatenation if a caller wants more than one), wrapped
+/// in a `<wkp-context tier="N">` block matching the marker `AGENTS.md`
+/// already documents for a harness to recognize injected content by.
+///
+/// `compute_tier`'s `inbox/` exclusion means this can never surface
+/// agent-written, unreviewed content in tier 0/1 output -- there is no
+/// separate check here for it, because there is nothing to filter: an
+/// `inbox/` item is never tier 0 or 1 in the first place.
+pub fn materialize(conn: &Connection, tier: u8) -> Result<String, IndexError> {
+    let mut stmt =
+        conn.prepare("SELECT path, title, content FROM items WHERE tier = ?1 ORDER BY path")?;
+    let rows = stmt.query_map([tier], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
+        ))
+    })?;
+
+    let mut body = String::new();
+    for row in rows {
+        let (path, title, content) = row?;
+        body.push_str(&format!(
+            "## {title}\n\n<!-- source: {path} -->\n\n{content}\n\n"
+        ));
+    }
+    Ok(format!(
+        "<wkp-context tier=\"{tier}\">\n\n{body}</wkp-context>\n"
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -724,20 +767,43 @@ mod tests {
             item_type: Some(ItemType::ProjectState),
             ..Default::default()
         };
-        assert_eq!(compute_tier(&fm), 0);
+        assert_eq!(compute_tier("a.md", &fm), 0);
 
         fm.item_type = Some(ItemType::Feedback);
-        assert_eq!(compute_tier(&fm), 1);
+        assert_eq!(compute_tier("a.md", &fm), 1);
 
         fm.item_type = Some(ItemType::Reference);
-        assert_eq!(compute_tier(&fm), 2);
+        assert_eq!(compute_tier("a.md", &fm), 2);
 
         // Agent-written content is tier 2 regardless of type, until human
         // review changes its confidence (design 7.4's real gate; this is
         // the provisional stand-in -- see compute_tier's doc comment).
         fm.item_type = Some(ItemType::ProjectState);
         fm.confidence = Some(Confidence::Proposed);
-        assert_eq!(compute_tier(&fm), 2);
+        assert_eq!(compute_tier("a.md", &fm), 2);
+    }
+
+    #[test]
+    fn compute_tier_forces_tier_2_for_anything_under_inbox() {
+        let fm = Frontmatter {
+            item_type: Some(ItemType::ProjectState),
+            ..Default::default()
+        };
+        assert_eq!(
+            compute_tier("inbox/import/claude-md.md", &fm),
+            2,
+            "an inbox/ item must not self-promote to tier 0 via its type"
+        );
+        assert_eq!(
+            compute_tier("projects/wkp/inbox/note.md", &fm),
+            2,
+            "a nested inbox/ directory anywhere in the path must also be caught"
+        );
+        assert_eq!(
+            compute_tier("projects/wkp/decision.md", &fm),
+            0,
+            "a normal path with the same frontmatter is unaffected"
+        );
     }
 
     #[test]
@@ -989,6 +1055,54 @@ mod tests {
             neighbors.is_empty(),
             "stale edge must not survive an update: {neighbors:?}"
         );
+    }
+
+    #[test]
+    fn materialize_includes_only_the_exact_requested_tier() {
+        let mut tier0 = item("t0.md", "Tier Zero", "tier zero content");
+        tier0.frontmatter.item_type = Some(ItemType::ProjectState);
+        let mut tier1 = item("t1.md", "Tier One", "tier one content");
+        tier1.frontmatter.item_type = Some(ItemType::Feedback);
+        let mut tier2 = item("t2.md", "Tier Two", "tier two content");
+        tier2.frontmatter.item_type = Some(ItemType::Reference);
+        let conn = build_in_memory(&[tier0, tier1, tier2]).expect("build in-memory index");
+
+        let rendered0 = materialize(&conn, 0).expect("materialize tier 0");
+        assert!(rendered0.starts_with("<wkp-context tier=\"0\">"));
+        assert!(rendered0.ends_with("</wkp-context>\n"));
+        assert!(rendered0.contains("tier zero content"));
+        assert!(!rendered0.contains("tier one content"));
+        assert!(!rendered0.contains("tier two content"));
+
+        let rendered1 = materialize(&conn, 1).expect("materialize tier 1");
+        assert!(rendered1.contains("tier one content"));
+        assert!(!rendered1.contains("tier zero content"));
+    }
+
+    #[test]
+    fn materialize_never_includes_inbox_items_in_tier_0_or_1() {
+        // An inbox/ item claiming type: project-state would compute to
+        // tier 0 by type alone; compute_tier's inbox/ exclusion (M1-6)
+        // must override that, and materialize must reflect it -- this is
+        // the M1-6 acceptance criterion boundary test.
+        let mut smuggled = item(
+            "inbox/import/claude-md.md",
+            "Smuggled",
+            "should never appear in tier 0 output",
+        );
+        smuggled.frontmatter.item_type = Some(ItemType::ProjectState);
+        smuggled.frontmatter.confidence = Some(Confidence::Proposed);
+        let conn = build_in_memory(&[smuggled]).expect("build in-memory index");
+
+        let rendered0 = materialize(&conn, 0).expect("materialize tier 0");
+        assert!(!rendered0.contains("should never appear"));
+        let rendered1 = materialize(&conn, 1).expect("materialize tier 1");
+        assert!(!rendered1.contains("should never appear"));
+
+        // It's still reachable at tier 2 -- excluded from auto-injection,
+        // not deleted or hidden from explicit search.
+        let rendered2 = materialize(&conn, 2).expect("materialize tier 2");
+        assert!(rendered2.contains("should never appear"));
     }
 
     #[test]

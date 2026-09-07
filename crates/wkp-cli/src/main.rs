@@ -106,6 +106,42 @@ fn main() {
                 }
             }
         }
+        Some("materialize") => {
+            if let Err(msg) = wkp_git::ensure_min_git_version() {
+                eprintln!("{msg}");
+                std::process::exit(1);
+            }
+            match parse_materialize_args(args) {
+                Ok(opts) => match run_materialize(&opts) {
+                    Ok(()) => {}
+                    Err(msg) => {
+                        eprintln!("wkp: materialize failed: {msg}");
+                        std::process::exit(1);
+                    }
+                },
+                Err(msg) => {
+                    eprintln!("wkp: {msg}");
+                    std::process::exit(1);
+                }
+            }
+        }
+        // Deliberately no `ensure_min_git_version` check: `wkp hooks`
+        // never touches git or the store, only prints static text (design
+        // 3.3: "the binary never writes outside its own store" -- this
+        // command doesn't write anywhere at all).
+        Some("hooks") => match parse_hooks_args(args) {
+            Ok(framework) => match render_hooks(&framework) {
+                Ok(text) => println!("{text}"),
+                Err(msg) => {
+                    eprintln!("wkp: {msg}");
+                    std::process::exit(1);
+                }
+            },
+            Err(msg) => {
+                eprintln!("wkp: {msg}");
+                std::process::exit(1);
+            }
+        },
         _ => {
             if let Err(msg) = wkp_git::ensure_min_git_version() {
                 eprintln!("{msg}");
@@ -250,6 +286,130 @@ fn run_index(path: &Path) -> Result<IndexSummary, String> {
 fn path_to_store_string(p: &Path) -> String {
     p.to_string_lossy().into_owned()
 }
+
+struct MaterializeOptions {
+    path: PathBuf,
+    tier: u8,
+}
+
+/// Parses `wkp materialize --tier N [--path DIR]`. `--tier` is required
+/// (no default): materializing "whatever tier" by accident is exactly the
+/// kind of silent behavior CLAUDE.md's "no shortcuts" list warns against
+/// for tier promotion.
+fn parse_materialize_args(
+    mut args: impl Iterator<Item = String>,
+) -> Result<MaterializeOptions, String> {
+    let mut path = std::env::current_dir().map_err(|e| e.to_string())?;
+    let mut tier: Option<u8> = None;
+
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--tier" => {
+                let v = args.next().ok_or("--tier requires a value")?;
+                tier = Some(
+                    v.parse::<u8>()
+                        .map_err(|_| format!("invalid --tier value: {v}"))?,
+                );
+            }
+            "--path" => {
+                let v = args.next().ok_or("--path requires a value")?;
+                path = PathBuf::from(v);
+            }
+            other => return Err(format!("unrecognized argument: {other}")),
+        }
+    }
+
+    let tier = tier.ok_or_else(|| {
+        "materialize requires --tier N, e.g. `wkp materialize --tier 0`".to_string()
+    })?;
+    Ok(MaterializeOptions { path, tier })
+}
+
+/// `wkp materialize --tier N`: writes `.wkp/tier{N}.md` (design 4.2, M1-6),
+/// atomically -- a temp file in the same directory, renamed into place
+/// (CLAUDE.md hard rule: `tier0.md` is a file a harness reads, same
+/// atomicity requirement as `index.db`). Design 4.3's session-start
+/// injection target (`cat tier0.md` < 1ms/2ms) is trivially met once this
+/// file exists: it's a plain file read, no `wkp` code runs on that path at
+/// all.
+fn run_materialize(opts: &MaterializeOptions) -> Result<(), String> {
+    let index_path = opts.path.join(".wkp/index.db");
+    let conn = wkp_core::index::open_index(&index_path).map_err(|e| e.to_string())?;
+    let content = wkp_core::index::materialize(&conn, opts.tier).map_err(|e| e.to_string())?;
+    let dest = opts.path.join(format!(".wkp/tier{}.md", opts.tier));
+    atomic_write(&dest, &content)
+}
+
+/// Writes `content` to `dest` via a temp file in the same directory,
+/// renamed into place -- never in place (CLAUDE.md hard rule).
+fn atomic_write(dest: &Path, content: &str) -> Result<(), String> {
+    let file_name = dest
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "materialized.md".to_string());
+    let pid = std::process::id();
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let tmp = dest.with_file_name(format!(".{file_name}.tmp-{pid}-{nanos}"));
+    let result = std::fs::write(&tmp, content).map_err(|e| e.to_string());
+    match result {
+        Ok(()) => std::fs::rename(&tmp, dest).map_err(|e| e.to_string()),
+        Err(e) => {
+            let _ = std::fs::remove_file(&tmp);
+            Err(e)
+        }
+    }
+}
+
+/// Parses `wkp hooks --framework <name>`.
+fn parse_hooks_args(mut args: impl Iterator<Item = String>) -> Result<String, String> {
+    let mut framework: Option<String> = None;
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--framework" => {
+                framework = Some(args.next().ok_or("--framework requires a value")?);
+            }
+            other => return Err(format!("unrecognized argument: {other}")),
+        }
+    }
+    framework.ok_or_else(|| {
+        "hooks requires --framework <name>, e.g. `wkp hooks --framework claude_code`".to_string()
+    })
+}
+
+/// `wkp hooks --framework claude_code`: prints the exact Claude Code
+/// `SessionStart` hook text (design 3.3: "the only 'installer'... prints
+/// the exact hook text for an agent or a human to apply") -- applying it
+/// to `.claude/settings.local.json` is left to the caller. Re-indexes
+/// quietly and best-effort (`|| true`: a broken index must never block
+/// session start), then `cat`s `tier0.md`, also best-effort (a store that
+/// hasn't run `wkp materialize` yet has no `tier0.md`, which must not be
+/// an error either).
+fn render_hooks(framework: &str) -> Result<String, String> {
+    match framework {
+        "claude_code" => Ok(CLAUDE_CODE_HOOK.to_string()),
+        other => Err(format!(
+            "unknown --framework value: {other} (expected: claude_code)"
+        )),
+    }
+}
+
+const CLAUDE_CODE_HOOK: &str = r#"{
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "wkp index >/dev/null 2>&1 || true; cat .wkp/tier0.md 2>/dev/null || true"
+          }
+        ]
+      }
+    ]
+  }
+}"#;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SearchFormat {
@@ -895,5 +1055,151 @@ mod tests {
             "[T1] A Title  (score=0.500, ~42t)\n     a.md\n\
              [T2 +1] B Title  (score=0.250, ~7t)\n     b.md"
         );
+    }
+
+    #[test]
+    fn parse_materialize_args_requires_tier() {
+        assert!(parse_materialize_args(args(&[])).is_err());
+    }
+
+    #[test]
+    fn parse_materialize_args_reads_tier_and_path() {
+        let opts = parse_materialize_args(args(&["--tier", "1", "--path", "/tmp/x"]))
+            .expect("parse_materialize_args");
+        assert_eq!(opts.tier, 1);
+        assert_eq!(opts.path, PathBuf::from("/tmp/x"));
+    }
+
+    #[test]
+    fn run_materialize_writes_tier0_and_tier1_content() {
+        let temp = temp_dir("materialize");
+        let dir = temp.path();
+        run_init(dir).expect("run_init");
+        std::fs::write(
+            dir.join("a.md"),
+            "---\ntitle: A\ntype: project-state\n---\n\ntier zero body\n",
+        )
+        .expect("write a.md");
+        std::fs::write(
+            dir.join("b.md"),
+            "---\ntitle: B\ntype: feedback\n---\n\ntier one body\n",
+        )
+        .expect("write b.md");
+        wkp_git::commit_all(dir, "seed").expect("commit_all");
+        run_index(dir).expect("run_index");
+
+        run_materialize(&MaterializeOptions {
+            path: dir.to_path_buf(),
+            tier: 0,
+        })
+        .expect("materialize tier 0");
+        let tier0 = std::fs::read_to_string(dir.join(".wkp/tier0.md")).expect("read tier0.md");
+        assert!(tier0.starts_with("<wkp-context tier=\"0\">"));
+        assert!(tier0.contains("tier zero body"));
+        assert!(!tier0.contains("tier one body"));
+
+        run_materialize(&MaterializeOptions {
+            path: dir.to_path_buf(),
+            tier: 1,
+        })
+        .expect("materialize tier 1");
+        let tier1 = std::fs::read_to_string(dir.join(".wkp/tier1.md")).expect("read tier1.md");
+        assert!(tier1.contains("tier one body"));
+        assert!(!tier1.contains("tier zero body"));
+    }
+
+    #[test]
+    fn run_materialize_never_includes_inbox_items() {
+        let temp = temp_dir("materialize-inbox");
+        let dir = temp.path();
+        run_init(dir).expect("run_init");
+        std::fs::create_dir_all(dir.join("inbox/import")).expect("create inbox dir");
+        std::fs::write(
+            dir.join("inbox/import/claude-md.md"),
+            "---\ntitle: Imported\ntype: project-state\nconfidence: proposed\n---\n\nshould never be auto-injected\n",
+        )
+        .expect("write inbox item");
+        wkp_git::commit_all(dir, "seed").expect("commit_all");
+        run_index(dir).expect("run_index");
+
+        run_materialize(&MaterializeOptions {
+            path: dir.to_path_buf(),
+            tier: 0,
+        })
+        .expect("materialize tier 0");
+        let tier0 = std::fs::read_to_string(dir.join(".wkp/tier0.md")).expect("read tier0.md");
+        assert!(!tier0.contains("should never be auto-injected"));
+    }
+
+    #[test]
+    fn run_materialize_is_atomic_on_a_failed_write() {
+        let temp = temp_dir("materialize-atomic");
+        let dir = temp.path();
+        run_init(dir).expect("run_init");
+        run_materialize(&MaterializeOptions {
+            path: dir.to_path_buf(),
+            tier: 0,
+        })
+        .expect("initial materialize");
+        let original = std::fs::read(dir.join(".wkp/tier0.md")).expect("read original tier0.md");
+
+        // Force the temp-file write to fail: make the .wkp/ directory
+        // read-only so `atomic_write`'s initial `fs::write` to a new temp
+        // path inside it cannot succeed. Restore the original mode
+        // explicitly afterward rather than `set_readonly(false)`, which on
+        // Unix would leave the directory world-writable (0o777).
+        use std::os::unix::fs::PermissionsExt;
+        let wkp_dir = dir.join(".wkp");
+        let original_mode = std::fs::metadata(&wkp_dir).unwrap().permissions().mode();
+        std::fs::set_permissions(&wkp_dir, std::fs::Permissions::from_mode(0o555))
+            .expect("make .wkp/ read-only");
+
+        let result = run_materialize(&MaterializeOptions {
+            path: dir.to_path_buf(),
+            tier: 0,
+        });
+
+        std::fs::set_permissions(&wkp_dir, std::fs::Permissions::from_mode(original_mode))
+            .expect("restore .wkp/ original permissions");
+
+        assert!(
+            result.is_err(),
+            "expected the write to a read-only dir to fail"
+        );
+        let after = std::fs::read(dir.join(".wkp/tier0.md")).expect("read tier0.md after failure");
+        assert_eq!(
+            original, after,
+            "a failed materialize must not touch the existing tier0.md"
+        );
+    }
+
+    #[test]
+    fn render_hooks_claude_code_matches_golden_output() {
+        let output = render_hooks("claude_code").expect("render_hooks");
+        assert_eq!(output, CLAUDE_CODE_HOOK);
+        assert!(output.contains("SessionStart"));
+        assert!(output.contains("wkp index"));
+        assert!(output.contains("tier0.md"));
+    }
+
+    #[test]
+    fn render_hooks_rejects_unknown_framework() {
+        assert!(render_hooks("opencode").is_err());
+    }
+
+    #[test]
+    fn hooks_never_writes_any_file() {
+        let temp = temp_dir("hooks-no-write");
+        let dir = temp.path();
+        let before = std::fs::read_dir(dir).unwrap().count();
+
+        // render_hooks takes no path at all, so there is structurally
+        // nothing for it to write to; this asserts the observable
+        // consequence (no new file appears anywhere near it) rather than
+        // relying solely on the type signature.
+        let _ = render_hooks("claude_code");
+
+        let after = std::fs::read_dir(dir).unwrap().count();
+        assert_eq!(before, after, "wkp hooks must never write a file");
     }
 }
