@@ -23,6 +23,7 @@ use crate::frontmatter::{Confidence, Frontmatter, ItemType};
 // SQLite (design 3.3) and re-exports it, so this is the one place the
 // dependency is named.
 use wkp_sys::rusqlite;
+use wkp_sys::rusqlite::OptionalExtension;
 
 /// One store item: a path relative to the store root, its parsed
 /// frontmatter, and its body (frontmatter already stripped).
@@ -93,6 +94,13 @@ CREATE VIRTUAL TABLE items_trigram USING fts5(
     path UNINDEXED,
     content,
     tokenize = 'trigram'
+);
+
+CREATE TABLE edges (
+    source_path TEXT NOT NULL,
+    target_path TEXT NOT NULL,
+    edge_type TEXT NOT NULL,
+    PRIMARY KEY (source_path, target_path, edge_type)
 );
 "#;
 
@@ -192,7 +200,65 @@ fn populate(conn: &Connection, items: &[Item]) -> rusqlite::Result<()> {
     for item in items {
         insert_item(conn, item)?;
     }
+    // Edges are extracted in a second pass, after every item's content row
+    // exists: a `[[wikilink]]` can name any item in the batch regardless of
+    // insertion order, and resolving it (see `resolve_wikilink`) queries
+    // `paths` directly.
+    for item in items {
+        insert_edges_for_item(conn, item)?;
+    }
     Ok(())
+}
+
+fn delete_edges_from(conn: &Connection, source_path: &str) -> rusqlite::Result<()> {
+    conn.execute("DELETE FROM edges WHERE source_path = ?1", [source_path])?;
+    Ok(())
+}
+
+/// Recomputes `item`'s outgoing edges: `refs:` entries (normalized via
+/// [`crate::graph::normalize_ref`]) and `[[wikilink]]` mentions in the body
+/// (extracted via [`crate::graph::extract_wikilink_names`], resolved
+/// against the store's current paths via [`resolve_wikilink`]). Always
+/// clears the item's previous outgoing edges first, so calling this again
+/// after the body changed doesn't leave stale edges behind.
+fn insert_edges_for_item(conn: &Connection, item: &Item) -> rusqlite::Result<()> {
+    delete_edges_from(conn, &item.path)?;
+    for raw_ref in &item.frontmatter.refs {
+        if let Some(target) = crate::graph::normalize_ref(&item.path, raw_ref) {
+            conn.execute(
+                "INSERT OR IGNORE INTO edges (source_path, target_path, edge_type) \
+                 VALUES (?1, ?2, 'refs')",
+                rusqlite::params![item.path, target],
+            )?;
+        }
+    }
+    for name in crate::graph::extract_wikilink_names(&item.body) {
+        if let Some(target) = resolve_wikilink(conn, &name)? {
+            conn.execute(
+                "INSERT OR IGNORE INTO edges (source_path, target_path, edge_type) \
+                 VALUES (?1, ?2, 'mentions')",
+                rusqlite::params![item.path, target],
+            )?;
+        }
+    }
+    Ok(())
+}
+
+/// Resolves a `[[name]]` wikilink to a store path by filename stem,
+/// matching the old Python tool's `**/{name}.md` glob semantics: an exact
+/// `<name>.md` at the store root, or `<name>.md` anywhere in a
+/// subdirectory. Ambiguous matches (more than one file with that stem)
+/// resolve to the lexicographically first path — a best-effort choice,
+/// same posture as the old tool's `glob()`-order pick.
+fn resolve_wikilink(conn: &Connection, name: &str) -> rusqlite::Result<Option<String>> {
+    let exact = format!("{name}.md");
+    let suffix = format!("%/{name}.md");
+    conn.query_row(
+        "SELECT path FROM paths WHERE path = ?1 OR path LIKE ?2 ORDER BY path LIMIT 1",
+        rusqlite::params![exact, suffix],
+        |row| row.get(0),
+    )
+    .optional()
 }
 
 /// Builds an index from `items` entirely in memory. Useful for one-shot
@@ -235,6 +301,14 @@ fn delete_item(conn: &Connection, path: &str) -> rusqlite::Result<()> {
     conn.execute("DELETE FROM paths WHERE path = ?1", [path])?;
     conn.execute("DELETE FROM items WHERE path = ?1", [path])?;
     conn.execute("DELETE FROM items_trigram WHERE path = ?1", [path])?;
+    delete_edges_from(conn, path)?;
+    // Known limitation: edges *pointing at* `path` from other, unchanged
+    // items are left dangling rather than cleaned up -- `traverse`'s join
+    // against `items` already excludes them from results (a dangling edge
+    // has no matching row to join to), so this doesn't produce wrong
+    // output, just an unused row. A full incoming-edge sweep would need to
+    // touch every item that might reference the deleted path, which is
+    // exactly the O(corpus) cost M1-3 exists to avoid.
     Ok(())
 }
 
@@ -290,6 +364,13 @@ pub fn update_index(
             // the caller classified it as "added" or "modified".
             delete_item(&conn, &item.path)?;
             insert_item(&conn, item)?;
+        }
+        // Same reasoning as `populate`: edges recomputed only after every
+        // upserted item's content row exists, so a wikilink in one changed
+        // item can resolve against another changed item in the same batch.
+        // Unchanged items keep whatever edges `VACUUM INTO` already copied.
+        for item in upserts {
+            insert_edges_for_item(&conn, item)?;
         }
         Ok(())
     })();
@@ -364,6 +445,9 @@ pub struct SearchHit {
     pub score: f64,
     pub tier: u8,
     pub tokens: u32,
+    /// Hops from a `traverse`/`context` starting point along explicit
+    /// `refs:`/`[[wikilink]]` edges; `0` for a direct search match.
+    pub hop_distance: u32,
 }
 
 /// Runs a BM25 full-text query against the `items` table, applying the
@@ -417,6 +501,7 @@ pub fn search(
             score: row.get(2)?,
             tier: row.get(3)?,
             tokens: row.get(4)?,
+            hop_distance: 0,
         })
     })?;
     let hits = rows.collect::<Result<Vec<_>, _>>()?;
@@ -460,9 +545,104 @@ pub fn search_trigram(
             score: 0.0,
             tier: 0,
             tokens: 0,
+            hop_distance: 0,
         })
     })?;
     Ok(rows.collect::<Result<Vec<_>, _>>()?)
+}
+
+/// Follows explicit `refs:`/`[[wikilink]]` edges from `start_path` up to
+/// `max_depth` hops (design 5.1, M1-5), ordered by hop distance then tier.
+/// A cycle terminates naturally at `max_depth` rather than needing
+/// separate cycle-detection: `WITH RECURSIVE` bounds recursion by depth
+/// regardless of how many cyclic paths reach a node, and `GROUP BY`
+/// collapses a node reached multiple ways to its single shortest depth.
+pub fn traverse(
+    conn: &Connection,
+    start_path: &str,
+    max_depth: u32,
+) -> Result<Vec<SearchHit>, IndexError> {
+    let sql = "
+        WITH RECURSIVE reachable(path, depth) AS (
+            SELECT ?1, 0
+            UNION ALL
+            SELECT e.target_path, r.depth + 1
+            FROM edges e
+            JOIN reachable r ON e.source_path = r.path
+            WHERE r.depth < ?2
+        )
+        SELECT i.path, i.title, i.tier, i.tokens_estimate, MIN(r.depth) AS depth
+        FROM reachable r
+        JOIN items i ON i.path = r.path
+        WHERE i.path != ?1
+        GROUP BY i.path
+        ORDER BY depth ASC, i.tier ASC
+    ";
+    let mut stmt = conn.prepare(sql)?;
+    let rows = stmt.query_map(rusqlite::params![start_path, max_depth], |row| {
+        let depth: u32 = row.get(4)?;
+        Ok(SearchHit {
+            path: row.get(0)?,
+            title: row.get(1)?,
+            score: 1.0 / f64::from(1 + depth),
+            tier: row.get(2)?,
+            tokens: row.get(3)?,
+            hop_distance: depth,
+        })
+    })?;
+    Ok(rows.collect::<Result<Vec<_>, _>>()?)
+}
+
+/// Tier-aware context assembly (design 5.1/5.4, M1-5): BM25 search for
+/// `topic`, then graph traversal (depth 2) from the top three hits,
+/// deduplicated by path, truncated to `filter.budget` estimated tokens.
+///
+/// Deliberate behavioral difference from the old Python tool's
+/// `context_assemble`: that implementation skips *any* item whose own
+/// token count exceeds the remaining budget, including the very first one
+/// — a topic whose best match alone exceeds the budget returns nothing at
+/// all. This reuses [`apply_budget`]'s "always keep the best single
+/// result" rule (already established in M1-4 for `search`) instead, for
+/// the same reason: an empty result is a worse outcome than one
+/// over-budget result for a caller assembling context.
+pub fn context(
+    conn: &Connection,
+    topic: &str,
+    filter: &SearchFilter,
+) -> Result<Vec<SearchHit>, IndexError> {
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut combined = Vec::new();
+
+    let search_filter = SearchFilter {
+        item_type: filter.item_type.clone(),
+        tier: filter.tier,
+        workspace: filter.workspace.clone(),
+        visibility: filter.visibility.clone(),
+        scope: filter.scope.clone(),
+        budget: None,
+        limit: Some(20),
+    };
+    for hit in search(conn, topic, &search_filter)? {
+        if seen.insert(hit.path.clone()) {
+            combined.push(hit);
+        }
+    }
+
+    let seeds: Vec<String> = combined.iter().take(3).map(|h| h.path.clone()).collect();
+    for seed in seeds {
+        for neighbor in traverse(conn, &seed, 2)? {
+            if let Some(tier) = filter.tier {
+                if neighbor.tier > tier {
+                    continue;
+                }
+            }
+            if seen.insert(neighbor.path.clone()) {
+                combined.push(neighbor);
+            }
+        }
+    }
+
+    Ok(apply_budget(combined, filter.budget))
 }
 
 #[cfg(test)]
@@ -635,6 +815,180 @@ mod tests {
             "a budget smaller than any item must still return the best match"
         );
         assert_eq!(hits[0].path, "huge.md");
+    }
+
+    #[test]
+    fn refs_edge_is_extracted_and_traversable() {
+        let mut a = item("a.md", "A", "links to b via refs");
+        a.frontmatter.refs = vec!["b.md".to_string()];
+        let b = item("b.md", "B", "target of the ref");
+        let conn = build_in_memory(&[a, b]).expect("build in-memory index");
+
+        let neighbors = traverse(&conn, "a.md", 1).expect("traverse");
+        assert_eq!(neighbors.len(), 1);
+        assert_eq!(neighbors[0].path, "b.md");
+        assert_eq!(neighbors[0].hop_distance, 1);
+    }
+
+    #[test]
+    fn wikilink_edge_is_extracted_and_traversable() {
+        let a = item("a.md", "A", "see [[Target Note]] for details");
+        let b = item("Target Note.md", "Target Note", "the referenced content");
+        let conn = build_in_memory(&[a, b]).expect("build in-memory index");
+
+        let neighbors = traverse(&conn, "a.md", 1).expect("traverse");
+        assert_eq!(neighbors.len(), 1);
+        assert_eq!(neighbors[0].path, "Target Note.md");
+    }
+
+    #[test]
+    fn wikilink_in_a_subdirectory_resolves_by_filename_stem() {
+        let a = item("a.md", "A", "see [[note]] elsewhere");
+        let b = item("projects/note.md", "Note", "nested target");
+        let conn = build_in_memory(&[a, b]).expect("build in-memory index");
+
+        let neighbors = traverse(&conn, "a.md", 1).expect("traverse");
+        assert_eq!(neighbors.len(), 1);
+        assert_eq!(neighbors[0].path, "projects/note.md");
+    }
+
+    #[test]
+    fn traverse_respects_max_depth() {
+        let mut a = item("a.md", "A", "chain start");
+        a.frontmatter.refs = vec!["b.md".to_string()];
+        let mut b = item("b.md", "B", "chain middle");
+        b.frontmatter.refs = vec!["c.md".to_string()];
+        let c = item("c.md", "C", "chain end");
+        let conn = build_in_memory(&[a, b, c]).expect("build in-memory index");
+
+        let depth1 = traverse(&conn, "a.md", 1).expect("traverse depth 1");
+        assert_eq!(
+            depth1.iter().map(|h| h.path.as_str()).collect::<Vec<_>>(),
+            vec!["b.md"]
+        );
+
+        let depth2 = traverse(&conn, "a.md", 2).expect("traverse depth 2");
+        let mut paths: Vec<&str> = depth2.iter().map(|h| h.path.as_str()).collect();
+        paths.sort_unstable();
+        assert_eq!(paths, vec!["b.md", "c.md"]);
+    }
+
+    #[test]
+    fn traverse_handles_a_cycle_without_infinite_loop_or_duplicates() {
+        let mut a = item("a.md", "A", "cycle start");
+        a.frontmatter.refs = vec!["b.md".to_string()];
+        let mut b = item("b.md", "B", "cycle back to a");
+        b.frontmatter.refs = vec!["a.md".to_string()];
+        let conn = build_in_memory(&[a, b]).expect("build in-memory index");
+
+        let neighbors = traverse(&conn, "a.md", 5).expect("traverse a 5-deep cycle");
+        // Must terminate (this call returning at all is half the test) and
+        // must not report "a.md" (the start) or duplicate "b.md".
+        assert_eq!(neighbors.len(), 1);
+        assert_eq!(neighbors[0].path, "b.md");
+    }
+
+    #[test]
+    fn context_combines_search_and_traversal_deduplicated() {
+        let mut hit = item("hit.md", "Hit", "distinctive search topic");
+        hit.frontmatter.refs = vec!["neighbor.md".to_string()];
+        let neighbor = item("neighbor.md", "Neighbor", "reached only via refs");
+        let conn = build_in_memory(&[hit, neighbor]).expect("build in-memory index");
+
+        let hits = context(&conn, "distinctive", &SearchFilter::default()).expect("context");
+        let mut paths: Vec<&str> = hits.iter().map(|h| h.path.as_str()).collect();
+        paths.sort_unstable();
+        assert_eq!(paths, vec!["hit.md", "neighbor.md"]);
+
+        let hit_entry = hits.iter().find(|h| h.path == "hit.md").unwrap();
+        assert_eq!(hit_entry.hop_distance, 0);
+        let neighbor_entry = hits.iter().find(|h| h.path == "neighbor.md").unwrap();
+        assert_eq!(neighbor_entry.hop_distance, 1);
+    }
+
+    #[test]
+    fn context_does_not_duplicate_a_neighbor_that_is_also_a_direct_hit() {
+        let mut hit = item("hit.md", "Hit", "distinctive search topic");
+        hit.frontmatter.refs = vec!["other.md".to_string()];
+        let mut other = item("other.md", "Other", "distinctive search topic too");
+        other.frontmatter.refs = vec!["hit.md".to_string()];
+        let conn = build_in_memory(&[hit, other]).expect("build in-memory index");
+
+        let hits = context(&conn, "distinctive", &SearchFilter::default()).expect("context");
+        let paths: Vec<&str> = hits.iter().map(|h| h.path.as_str()).collect();
+        assert_eq!(
+            paths.len(),
+            2,
+            "each path must appear exactly once: {paths:?}"
+        );
+    }
+
+    #[test]
+    fn context_tier_filter_excludes_higher_tier_neighbors() {
+        let mut hit = item("hit.md", "Hit", "distinctive search topic");
+        hit.frontmatter.item_type = Some(ItemType::ProjectState); // tier 0
+        hit.frontmatter.refs = vec!["neighbor.md".to_string()];
+        let mut neighbor = item("neighbor.md", "Neighbor", "reached via refs");
+        neighbor.frontmatter.item_type = Some(ItemType::Reference); // tier 2
+        let conn = build_in_memory(&[hit, neighbor]).expect("build in-memory index");
+
+        let filter = SearchFilter {
+            tier: Some(0),
+            ..Default::default()
+        };
+        let hits = context(&conn, "distinctive", &filter).expect("context");
+        assert_eq!(
+            hits.iter().map(|h| h.path.as_str()).collect::<Vec<_>>(),
+            vec!["hit.md"]
+        );
+    }
+
+    #[test]
+    fn context_respects_budget_across_search_and_traversal() {
+        let mut hit = item("hit.md", "Hit", "distinctive search topic");
+        hit.frontmatter.tokens = Some(10);
+        hit.frontmatter.refs = vec!["neighbor.md".to_string()];
+        let mut neighbor = item("neighbor.md", "Neighbor", "reached via refs");
+        neighbor.frontmatter.tokens = Some(1_000);
+        let conn = build_in_memory(&[hit, neighbor]).expect("build in-memory index");
+
+        let filter = SearchFilter {
+            budget: Some(10),
+            ..Default::default()
+        };
+        let hits = context(&conn, "distinctive", &filter).expect("context");
+        assert_eq!(
+            hits.iter().map(|h| h.path.as_str()).collect::<Vec<_>>(),
+            vec!["hit.md"],
+            "the 1000-token neighbor must not fit in a 10-token remaining budget"
+        );
+    }
+
+    #[test]
+    fn edges_are_recomputed_when_an_item_is_updated() {
+        let dir = temp_db_dir("edges-update");
+        let dest = dir.path().join("index.db");
+        let mut a = item("a.md", "A", "first version");
+        a.frontmatter.refs = vec!["b.md".to_string()];
+        let b = item("b.md", "B", "target");
+        build_index(&dest, &[a, b]).expect("initial build");
+
+        {
+            let conn = open_index(&dest).expect("open index");
+            let neighbors = traverse(&conn, "a.md", 1).expect("traverse");
+            assert_eq!(neighbors.len(), 1);
+        }
+
+        // a.md no longer refs b.md.
+        let a_updated = item("a.md", "A", "no longer links anywhere");
+        update_index(&dest, &[a_updated], &[]).expect("update_index");
+
+        let conn = open_index(&dest).expect("open index");
+        let neighbors = traverse(&conn, "a.md", 1).expect("traverse after update");
+        assert!(
+            neighbors.is_empty(),
+            "stale edge must not survive an update: {neighbors:?}"
+        );
     }
 
     #[test]
