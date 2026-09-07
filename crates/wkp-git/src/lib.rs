@@ -9,6 +9,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 pub mod allowed_signers;
+pub mod signed_commit;
 
 /// Minimum git version `wkp` requires. Decided in `docs/adr/0001-git-minimum-version.md`:
 /// SSH commit signing (`gpg.format = ssh`) needs git >= 2.34, and that is the
