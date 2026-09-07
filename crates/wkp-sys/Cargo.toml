@@ -10,3 +10,6 @@ repository.workspace = true
 
 [lib]
 name = "wkp_sys"
+
+[dependencies]
+rusqlite = { version = "0.40.2", default-features = false, features = ["bundled"] }
