@@ -22,6 +22,7 @@ declare -A BENCHES=(
   [fixture_corpus_generate_5k]="fixture_corpus_generate_5k"
   [fixture_corpus_generate_50k]="fixture_corpus_generate_50k/run"
   [incremental_update_50k_corpus]="incremental_update_50k_corpus/10_changed"
+  [cold_search_50k_corpus]="cold_search_50k_corpus/open_and_query"
 )
 
 if [[ "$UPDATE" -eq 1 ]]; then

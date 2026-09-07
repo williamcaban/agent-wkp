@@ -168,10 +168,68 @@ fn corpus_item(dir: &Path, i: usize) -> wkp_core::index::Item {
     }
 }
 
+/// M1-4: "cold `wkp search` process" (design 4.3, p50 < 10ms / p95 < 25ms).
+/// `wkp` never keeps `index.db` open across invocations (design 4.2: no
+/// daemon), so each real `wkp search` call opens a fresh connection. This
+/// benchmark reproduces that per-iteration open cost against a 50k-item
+/// index, missing only the OS-level process-spawn and dynamic-linking
+/// overhead a real subprocess pays -- that part isn't measurable from
+/// inside a Criterion harness in the same process, and was measured
+/// separately with the actual release binary (reported in the PR, not
+/// gated in CI, since it needs the built binary rather than `cargo bench`
+/// alone): ~2-3ms wall-clock for `wkp search` end to end on this fixture,
+/// comfortably within budget on top of whatever this benchmark reports.
+fn cold_search_50k_corpus(c: &mut Criterion) {
+    let dir = bench_dir("cold-search-50k");
+    let dest = dir.join("index.db");
+    let items: Vec<wkp_core::index::Item> = (0..50_000)
+        .map(|i| synthetic_item(i, i == 12_345))
+        .collect();
+    wkp_core::index::build_index(&dest, &items).expect("build 50k index");
+
+    let mut group = c.benchmark_group("cold_search_50k_corpus");
+    group.sample_size(50);
+    group.bench_function("open_and_query", |b| {
+        b.iter(|| {
+            let conn = wkp_core::index::open_index(black_box(&dest)).unwrap();
+            let hits = wkp_core::index::search(
+                &conn,
+                black_box("distinctive"),
+                &wkp_core::index::SearchFilter::default(),
+            )
+            .unwrap();
+            black_box(hits);
+        })
+    });
+    group.finish();
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A synthetic item with generic filler words, except item `12345` (or
+/// whichever index `distinctive_content` is set for), which gets one rare
+/// term so a query for it matches exactly one document out of 50,000 --
+/// closer to a realistic targeted search than a query matching the whole
+/// corpus equally.
+fn synthetic_item(i: usize, distinctive_content: bool) -> wkp_core::index::Item {
+    let mut rng = support::Xorshift64::new(i as u64 + 1);
+    let body = if distinctive_content {
+        "this item has a distinctive term nobody else shares".to_string()
+    } else {
+        support::synthetic_body(&mut rng, 30)
+    };
+    wkp_core::index::Item {
+        path: format!("item-{i:06}.md"),
+        frontmatter: wkp_core::frontmatter::Frontmatter::default(),
+        body,
+    }
+}
+
 criterion_group!(
     benches,
     fixture_corpus_generate_5k,
     fixture_corpus_generate_50k,
-    incremental_update_50k_corpus
+    incremental_update_50k_corpus,
+    cold_search_50k_corpus
 );
 criterion_main!(benches);

@@ -41,6 +41,18 @@ a regression to chase away with a threshold — see
 (not yet made) decision. The baseline entry for this bench exists to catch a
 *further* regression on top of the already-known-slow path.
 
+**M1-4 (`wkp search`) added `cold_search_50k_corpus`**: opens a fresh
+connection to a 50k-item `index.db` and runs one query per iteration,
+reproducing the per-invocation open cost design 4.3's "cold `wkp search`
+process" target measures against (`wkp` never keeps the database open
+across invocations — design 4.2, no daemon). This one **meets** the target
+comfortably: ~237µs, against p50 < 10ms / p95 < 25ms. The real release
+binary's full process-spawn overhead (fork/exec, dynamic linking, the
+`ensure_min_git_version` subprocess check every subcommand pays) was
+measured separately with `/usr/bin/time -v` and a timing loop, not gated in
+CI: ~7.75ms wall-clock per invocation and ~5.7MB peak RSS on a 2k-item
+store, both within design 4.3's budget (RSS target: < 30MB).
+
 ## Running
 
 ```bash
