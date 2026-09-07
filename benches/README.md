@@ -29,6 +29,18 @@ them here alongside (not instead of) the fixture-generation ones, reusing
 the same corpora. Update `BENCHES` in `compare.sh` and re-run
 `--update` to seed their baselines.
 
+**M1-3 (change detection) added `incremental_update_50k_corpus`**: builds a
+50k-item index once, then times `wkp_core::index::update_index` re-applying
+a 10-item change against it — the steady-state `wkp index` scenario. This
+measured ~460ms on `ubuntu-latest`, missing design 4.3's incremental-index
+target (p50 < 30ms / p95 < 100ms) by roughly an order of magnitude, because
+the current implementation's `VACUUM INTO` copies the whole file regardless
+of change count. This is a real, documented design-vs-reality conflict, not
+a regression to chase away with a threshold — see
+`docs/adr/0002-incremental-index-write-mechanism.md` for the options and the
+(not yet made) decision. The baseline entry for this bench exists to catch a
+*further* regression on top of the already-known-slow path.
+
 ## Running
 
 ```bash

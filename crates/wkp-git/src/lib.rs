@@ -5,7 +5,7 @@
 //! No `Command::new("git")` is allowed outside this crate (CLAUDE.md hard rule).
 //! Implementation lands starting in M2; see `docs/plan/milestones.md`.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 /// Minimum git version `wkp` requires. Decided in `docs/adr/0001-git-minimum-version.md`:
@@ -107,6 +107,35 @@ pub fn init_repo(path: &Path) -> Result<(), String> {
     run_git(path, &["init", "--quiet"])
 }
 
+/// Stages every change in `repo_dir` and commits it with `message`.
+/// Porcelain, not plumbing, and no signing -- for test setup and simple
+/// CLI flows (change detection needs a committed base state to diff
+/// against). The write path's actual audit-trail commits go through
+/// signed plumbing instead (design 5.1); that lands in M2. A per-call
+/// identity override (`-c user.*`) means this works standalone in a
+/// fresh environment with no global git identity configured, without
+/// mutating that environment's global config as a side effect.
+///
+/// CLAUDE.md's "no `Command::new(\"git\")` outside this crate" rule means
+/// other crates' tests that need to commit a fixture file must go
+/// through this rather than shelling out themselves.
+pub fn commit_all(repo_dir: &Path, message: &str) -> Result<(), String> {
+    run_git(repo_dir, &["add", "-A"])?;
+    run_git(
+        repo_dir,
+        &[
+            "-c",
+            "user.email=wkp-test@example.com",
+            "-c",
+            "user.name=wkp test",
+            "commit",
+            "-q",
+            "-m",
+            message,
+        ],
+    )
+}
+
 /// Applies the design-5.1 git settings to the repository at `repo_dir`,
 /// then best-effort registers `git maintenance start`'s background
 /// schedule. Registration needs cron or systemd/launchd, which isn't
@@ -126,6 +155,165 @@ pub fn apply_init_settings(repo_dir: &Path) -> Result<(), String> {
     // Best-effort only; see doc comment above.
     let _ = run_git(repo_dir, &["maintenance", "start"]);
     Ok(())
+}
+
+/// Which store files changed in the working tree, relative to git's own
+/// index (design 5.1: "which files changed" from cached stat metadata,
+/// not a full-corpus content read). Renames are reported distinctly so a
+/// caller can move an index row instead of deleting and re-inserting it,
+/// but treating a rename as delete-then-add is also correct.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ChangeSet {
+    pub added: Vec<PathBuf>,
+    pub modified: Vec<PathBuf>,
+    pub deleted: Vec<PathBuf>,
+    pub renamed: Vec<Renamed>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Renamed {
+    pub from: PathBuf,
+    pub to: PathBuf,
+}
+
+impl ChangeSet {
+    pub fn is_empty(&self) -> bool {
+        self.added.is_empty()
+            && self.modified.is_empty()
+            && self.deleted.is_empty()
+            && self.renamed.is_empty()
+    }
+}
+
+/// Detects which tracked or untracked files changed in `repo_dir`'s working
+/// tree, using git's own stat cache rather than reading every file's
+/// content (design 5.1). `git update-index --refresh` updates that cache
+/// from cheap stat metadata (size, mtime, inode) before `git status
+/// --porcelain=v2` reports the result; a repo with `core.fsmonitor`
+/// enabled skips even the stat walk transparently to this function, since
+/// fsmonitor is consulted internally by `git status` itself; there is no
+/// separate code path here for it (ADR-0001: fsmonitor stays opportunistic).
+///
+/// A known limitation: paths containing characters `core.quotePath` would
+/// quote (non-ASCII, embedded quotes/tabs/newlines) are not unquoted here.
+/// Store paths are expected to be ordinary filenames; revisit if that
+/// stops being true.
+pub fn detect_changes(repo_dir: &Path) -> Result<ChangeSet, String> {
+    // Best-effort: `--refresh` can exit non-zero for a file it can't
+    // confirm clean from stat alone (rare), which isn't fatal here --
+    // `status` below still produces a correct answer either way, just
+    // possibly slower for that one file.
+    let _ = run_git(repo_dir, &["update-index", "-q", "--refresh"]);
+
+    let stdout = run_git_stdout(
+        repo_dir,
+        &["status", "--porcelain=v2", "--untracked-files=all"],
+    )?;
+    Ok(parse_porcelain_v2(&stdout))
+}
+
+fn parse_porcelain_v2(output: &str) -> ChangeSet {
+    let mut changes = ChangeSet::default();
+    for line in output.lines() {
+        let Some((kind, rest)) = line.split_once(' ') else {
+            continue;
+        };
+        match kind {
+            // Ordinary changed entry: `<XY> <sub> <mH> <mI> <mW> <hH> <hI> <path>`
+            "1" => {
+                let fields: Vec<&str> = rest.splitn(8, ' ').collect();
+                let (Some(xy), Some(path)) = (fields.first(), fields.get(7)) else {
+                    continue;
+                };
+                classify_ordinary(xy, PathBuf::from(*path), &mut changes);
+            }
+            // Renamed/copied entry:
+            // `<XY> <sub> <mH> <mI> <mW> <hH> <hI> <X><score> <path>\t<origPath>`
+            "2" => {
+                let fields: Vec<&str> = rest.splitn(9, ' ').collect();
+                let Some(tail) = fields.get(8) else {
+                    continue;
+                };
+                if let Some((to, from)) = tail.split_once('\t') {
+                    changes.renamed.push(Renamed {
+                        from: PathBuf::from(from),
+                        to: PathBuf::from(to),
+                    });
+                }
+            }
+            // Untracked file.
+            "?" => changes.added.push(PathBuf::from(rest)),
+            // Unmerged entry: `<XY> <sub> <m1> <m2> <m3> <mW> <h1> <h2> <h3> <path>`.
+            // Conservative: treat a conflict as needing reindexing rather
+            // than skipping it.
+            "u" => {
+                let fields: Vec<&str> = rest.splitn(10, ' ').collect();
+                if let Some(path) = fields.get(9) {
+                    changes.modified.push(PathBuf::from(*path));
+                }
+            }
+            // Ignored entries only appear with `--ignored`, which isn't
+            // passed; header lines only appear with `--branch`, also not
+            // passed. Anything else is unrecognized and skipped rather
+            // than guessed at.
+            _ => {}
+        }
+    }
+    changes
+}
+
+fn classify_ordinary(xy: &str, path: PathBuf, changes: &mut ChangeSet) {
+    let mut chars = xy.chars();
+    let x = chars.next().unwrap_or('.');
+    let y = chars.next().unwrap_or('.');
+    if x == 'D' || y == 'D' {
+        changes.deleted.push(path);
+    } else if x == 'A' {
+        changes.added.push(path);
+    } else {
+        // M (modified) or T (typechange) on either side; anything else
+        // unrecognized is still treated as "needs reindexing" rather than
+        // silently skipped.
+        changes.modified.push(path);
+    }
+}
+
+fn run_git_stdout(repo_dir: &Path, args: &[&str]) -> Result<String, String> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(repo_dir)
+        .args(args)
+        .output()
+        .map_err(|e| e.to_string())?;
+    if output.status.success() {
+        Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+    } else {
+        Err(String::from_utf8_lossy(&output.stderr).trim().to_string())
+    }
+}
+
+/// Every path git currently tracks in `repo_dir` (its index/staging area,
+/// which for a repo with nothing staged is the same as HEAD's tree).
+/// Cheap: reads git's own index metadata, not file content. Combined with
+/// [`ChangeSet::added`]'s untracked entries, this gives the full current
+/// set of store paths -- needed alongside [`detect_changes`] because a
+/// file can be "in the working tree but never indexed" (a fresh clone, or
+/// the first `wkp index` run after `wkp init`) without git considering it
+/// changed at all, since it may already be fully committed.
+pub fn list_tracked_files(repo_dir: &Path) -> Result<Vec<PathBuf>, String> {
+    let stdout = run_git_stdout(repo_dir, &["ls-files"])?;
+    Ok(stdout.lines().map(PathBuf::from).collect())
+}
+
+/// Whether `core.fsmonitor` is enabled for `repo_dir`. Purely
+/// informational (e.g. for tests or diagnostics): [`detect_changes`]
+/// behaves identically either way, since `git status` consults fsmonitor
+/// internally when configured (ADR-0001).
+pub fn fsmonitor_enabled(repo_dir: &Path) -> bool {
+    matches!(
+        run_git_stdout(repo_dir, &["config", "--get", "core.fsmonitor"]),
+        Ok(value) if value.trim() == "true"
+    )
 }
 
 fn run_git(repo_dir: &Path, args: &[&str]) -> Result<(), String> {
@@ -213,6 +401,112 @@ mod tests {
         fn path(&self) -> &Path {
             self.dir.path()
         }
+
+        fn write(&self, relative_path: &str, contents: &str) {
+            let full = self.path().join(relative_path);
+            if let Some(parent) = full.parent() {
+                std::fs::create_dir_all(parent).expect("create parent dir");
+            }
+            std::fs::write(full, contents).expect("write file");
+        }
+
+        fn commit_all(&self, message: &str) {
+            commit_all(self.path(), message).expect("commit_all");
+        }
+    }
+
+    #[test]
+    fn detect_changes_reports_nothing_on_a_clean_repo() {
+        let repo = TempGitRepo::new("clean");
+        repo.write("a.md", "hello\n");
+        repo.commit_all("initial");
+
+        let changes = detect_changes(repo.path()).expect("detect_changes");
+        assert!(changes.is_empty(), "{changes:?}");
+    }
+
+    #[test]
+    fn detect_changes_reports_an_untracked_added_file() {
+        let repo = TempGitRepo::new("added");
+        repo.write("a.md", "hello\n");
+        repo.commit_all("initial");
+        repo.write("b.md", "new file\n");
+
+        let changes = detect_changes(repo.path()).expect("detect_changes");
+        assert_eq!(changes.added, vec![PathBuf::from("b.md")]);
+        assert!(changes.modified.is_empty());
+        assert!(changes.deleted.is_empty());
+    }
+
+    #[test]
+    fn detect_changes_reports_a_modified_tracked_file() {
+        let repo = TempGitRepo::new("modified");
+        repo.write("a.md", "hello\n");
+        repo.commit_all("initial");
+        repo.write("a.md", "hello, edited\n");
+
+        let changes = detect_changes(repo.path()).expect("detect_changes");
+        assert_eq!(changes.modified, vec![PathBuf::from("a.md")]);
+        assert!(changes.added.is_empty());
+        assert!(changes.deleted.is_empty());
+    }
+
+    #[test]
+    fn detect_changes_reports_a_deleted_tracked_file() {
+        let repo = TempGitRepo::new("deleted");
+        repo.write("a.md", "hello\n");
+        repo.commit_all("initial");
+        std::fs::remove_file(repo.path().join("a.md")).expect("remove file");
+
+        let changes = detect_changes(repo.path()).expect("detect_changes");
+        assert_eq!(changes.deleted, vec![PathBuf::from("a.md")]);
+        assert!(changes.added.is_empty());
+        assert!(changes.modified.is_empty());
+    }
+
+    #[test]
+    fn detect_changes_reports_a_renamed_tracked_file() {
+        let repo = TempGitRepo::new("renamed");
+        // Content long/distinctive enough that git's rename heuristic
+        // (similarity index) reliably detects the rename rather than
+        // reporting a plain delete+add.
+        let body = "hello world, this is a fairly long body of text that git's \
+                     similarity-index rename detector should recognize as the \
+                     same content under a new name.\n";
+        repo.write("a.md", body);
+        repo.commit_all("initial");
+        std::fs::rename(repo.path().join("a.md"), repo.path().join("b.md")).expect("rename file");
+        run_git(repo.path(), &["add", "-A"]).expect("stage the rename");
+
+        let changes = detect_changes(repo.path()).expect("detect_changes");
+        assert_eq!(
+            changes.renamed,
+            vec![Renamed {
+                from: PathBuf::from("a.md"),
+                to: PathBuf::from("b.md"),
+            }]
+        );
+        assert!(changes.added.is_empty());
+        assert!(changes.modified.is_empty());
+        assert!(changes.deleted.is_empty());
+    }
+
+    #[test]
+    fn fsmonitor_enabled_reflects_repo_config() {
+        let repo = TempGitRepo::new("fsmonitor");
+        assert!(!fsmonitor_enabled(repo.path()));
+
+        run_git(repo.path(), &["config", "core.fsmonitor", "true"]).expect("enable fsmonitor");
+        assert!(fsmonitor_enabled(repo.path()));
+
+        // detect_changes must behave identically either way -- fsmonitor
+        // is a transparent optimization inside `git status`, not a
+        // separate code path here.
+        repo.write("a.md", "hello\n");
+        repo.commit_all("initial");
+        repo.write("a.md", "edited\n");
+        let changes = detect_changes(repo.path()).expect("detect_changes");
+        assert_eq!(changes.modified, vec![PathBuf::from("a.md")]);
     }
 
     fn git_config_get(repo: &Path, key: &str) -> Option<String> {
