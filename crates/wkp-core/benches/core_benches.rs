@@ -165,6 +165,7 @@ fn corpus_item(dir: &Path, i: usize) -> wkp_core::index::Item {
         path,
         frontmatter: parsed.frontmatter,
         body: parsed.body,
+        embedding: None,
     }
 }
 
@@ -222,6 +223,7 @@ fn synthetic_item(i: usize, distinctive_content: bool) -> wkp_core::index::Item 
         path: format!("item-{i:06}.md"),
         frontmatter: wkp_core::frontmatter::Frontmatter::default(),
         body,
+        embedding: None,
     }
 }
 

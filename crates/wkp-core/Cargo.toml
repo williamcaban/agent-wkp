@@ -20,4 +20,15 @@ name = "core_benches"
 harness = false
 
 [dependencies]
+ureq = { version = "3.4.1", default-features = false, optional = true, features = ["rustls"] }
 wkp-sys = { version = "0.1.0", path = "../wkp-sys" }
+
+[features]
+# M1-9: opt-in hybrid search (design 5.3's "remains available... but only
+# when the user configures an endpoint"). Off by default: CLAUDE.md's
+# slim-core rule and the M0 binary-size gate apply to the default build,
+# and `cargo deny`/`cargo vet`'s default feature-set check (deny.toml
+# `[graph] all-features = false`) does not exercise this dependency tree
+# unless it's requested explicitly with `--features embed`. See
+# docs/adr/0003-hybrid-search-embed-feature-gate.md.
+embed = ["dep:ureq"]
