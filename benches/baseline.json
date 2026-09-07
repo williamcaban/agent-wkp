@@ -1,0 +1,8 @@
+{
+  "fixture_corpus_generate_50k": {
+    "mean_ns": 568636597.3
+  },
+  "fixture_corpus_generate_5k": {
+    "mean_ns": 53247098.39
+  }
+}
