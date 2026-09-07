@@ -95,3 +95,36 @@ in CI (or push a throwaway commit with `./benches/compare.sh --update`
 added temporarily to the workflow), read the numbers from the run's log,
 and commit them directly — don't `--update` from a local run and assume it
 transfers.
+
+**Second incident (2026-09-07): even a CI-captured baseline kept drifting
+by 80-160% across unrelated PRs with zero bench-code changes.** Four
+consecutive PRs (none touching `benches/`) failed this gate on different
+`ubuntu-latest` allocations, with `fixture_corpus_generate_5k` measured at
+93ms, 196ms, and 244ms for the *same* commit's code across three separate
+runs. The runner-to-runner variance itself wasn't the root problem — it was
+that these benches are dominated by thousands of small `fs::write` calls to
+`std::env::temp_dir()`, and shared, multi-tenant cloud VMs have highly
+variable disk I/O latency, far more than their CPU scheduling variance.
+Fixed at the source rather than by further widening the threshold:
+`bench_dir()` in `core_benches.rs` now writes to `/dev/shm` (tmpfs) when
+available, falling back to `std::env::temp_dir()` only when it isn't (e.g.
+local macOS development, or a CI image without a `/dev/shm` mount). This
+moves the benchmark's dominant cost off the disk I/O layer entirely, which
+local testing showed both faster (53ms vs. 93-244ms for the 5k corpus) and
+far more consistent run-to-run.
+
+**Third incident, same day: even with disk I/O removed, back-to-back CI
+runs of the identical commit still differed by ~90%** (5k: 40.7ms then
+78.9ms; 50k: 404.9ms then 796.6ms — both almost exactly 2x). Within a
+single run, criterion's own confidence intervals are tight (e.g. `[40.548ms
+40.674ms 40.825ms]`), so this isn't sampling noise; it's variance *between*
+job runs landing on different underlying hosts, i.e. ordinary
+shared-vCPU/noisy-neighbor variance on GitHub-hosted runners, for even a
+lightweight, mostly-CPU-bound operation (string formatting in a loop).
+There's no code-level fix for that short of dedicated benchmark hardware,
+which doesn't exist for this project. The threshold moved 25% -> 60% -> a
+generous **150%**, with the explicit understanding that this placeholder
+fixture-generation bench is a smoke test that the harness and CI wiring
+work, not a precise regression gate — see "Revisit this number once M1's
+search/index/materialize benches exist" below, which is where real,
+evidence-based tuning belongs.
