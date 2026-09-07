@@ -37,6 +37,12 @@ criteria = "safe-to-deploy"
 delta = "1.15.2 -> 1.16.0"
 notes = "Reviewed full diff (1458 lines): rustfmt reformatting, doc comment rewrapping, use-statement reordering, and removal of the nightly-only debugger_visualizer feature/tests. Every unsafe-block diff is pure reformatting of pre-existing unsafe code (MaybeUninit::assume_init, from_const_with_len_unchecked) with no logic change. No new unsafe code, no new capability."
 
+[[trusted.aho-corasick]]
+criteria = "safe-to-deploy"
+user-id = 189 # Andrew Gallant (BurntSushi)
+start = "2019-03-28"
+end = "2027-09-07"
+
 [[trusted.cc]]
 criteria = "safe-to-deploy"
 user-id = 55123 # rust-lang-owner
@@ -50,3 +56,39 @@ user-id = 539 # Josh Stone (cuviper)
 start = "2025-08-29"
 end = "2027-09-07"
 notes = "Also published by rust-lang/cc-rs; mozilla and bytecode-alliance already trust cuviper for other crates in this same repo/publisher group."
+
+[[trusted.memchr]]
+criteria = "safe-to-deploy"
+user-id = 189 # Andrew Gallant (BurntSushi)
+start = "2019-07-07"
+end = "2027-09-07"
+
+[[trusted.regex]]
+criteria = "safe-to-deploy"
+user-id = 189 # Andrew Gallant (BurntSushi)
+start = "2019-02-27"
+end = "2027-09-07"
+
+[[trusted.regex-automata]]
+criteria = "safe-to-deploy"
+user-id = 189 # Andrew Gallant (BurntSushi)
+start = "2019-02-25"
+end = "2027-09-07"
+
+[[trusted.regex-syntax]]
+criteria = "safe-to-deploy"
+user-id = 189 # Andrew Gallant (BurntSushi)
+start = "2019-03-30"
+end = "2027-09-07"
+
+[[trusted.walkdir]]
+criteria = "safe-to-deploy"
+user-id = 189 # Andrew Gallant (BurntSushi)
+start = "2019-06-09"
+end = "2027-09-07"
+
+[[trusted.winapi-util]]
+criteria = "safe-to-deploy"
+user-id = 189 # Andrew Gallant (BurntSushi)
+start = "2020-01-11"
+end = "2027-09-07"
