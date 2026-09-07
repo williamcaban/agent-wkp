@@ -111,6 +111,20 @@ available, falling back to `std::env::temp_dir()` only when it isn't (e.g.
 local macOS development, or a CI image without a `/dev/shm` mount). This
 moves the benchmark's dominant cost off the disk I/O layer entirely, which
 local testing showed both faster (53ms vs. 93-244ms for the 5k corpus) and
-far more consistent run-to-run. The threshold also moved from 25% to 60%
-as a residual safety margin for ordinary shared-vCPU scheduling noise,
-which is real but much smaller than the disk I/O variance was.
+far more consistent run-to-run.
+
+**Third incident, same day: even with disk I/O removed, back-to-back CI
+runs of the identical commit still differed by ~90%** (5k: 40.7ms then
+78.9ms; 50k: 404.9ms then 796.6ms — both almost exactly 2x). Within a
+single run, criterion's own confidence intervals are tight (e.g. `[40.548ms
+40.674ms 40.825ms]`), so this isn't sampling noise; it's variance *between*
+job runs landing on different underlying hosts, i.e. ordinary
+shared-vCPU/noisy-neighbor variance on GitHub-hosted runners, for even a
+lightweight, mostly-CPU-bound operation (string formatting in a loop).
+There's no code-level fix for that short of dedicated benchmark hardware,
+which doesn't exist for this project. The threshold moved 25% -> 60% -> a
+generous **150%**, with the explicit understanding that this placeholder
+fixture-generation bench is a smoke test that the harness and CI wiring
+work, not a precise regression gate — see "Revisit this number once M1's
+search/index/materialize benches exist" below, which is where real,
+evidence-based tuning belongs.
