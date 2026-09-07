@@ -46,6 +46,22 @@ impl ItemType {
     }
 }
 
+impl fmt::Display for ItemType {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let s = match self {
+            ItemType::ProjectState => "project-state",
+            ItemType::Knowledge => "knowledge",
+            ItemType::Reference => "reference",
+            ItemType::Feedback => "feedback",
+            ItemType::Skill => "skill",
+            ItemType::Instruction => "instruction",
+            ItemType::Memory => "memory",
+            ItemType::Other(s) => s,
+        };
+        f.write_str(s)
+    }
+}
+
 /// `scope` (design 5.4): who the item is about or for.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Scope {
@@ -66,6 +82,18 @@ impl Scope {
     }
 }
 
+impl fmt::Display for Scope {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let s = match self {
+            Scope::User => "user",
+            Scope::Project => "project",
+            Scope::Org => "org",
+            Scope::Other(s) => s,
+        };
+        f.write_str(s)
+    }
+}
+
 /// `visibility` (design 5.4 / 7.2): gates client-side encryption.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Visibility {
@@ -81,6 +109,17 @@ impl Visibility {
             "private" => Visibility::Private,
             other => Visibility::Other(other.to_string()),
         }
+    }
+}
+
+impl fmt::Display for Visibility {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let s = match self {
+            Visibility::Shared => "shared",
+            Visibility::Private => "private",
+            Visibility::Other(s) => s,
+        };
+        f.write_str(s)
     }
 }
 
@@ -104,6 +143,18 @@ impl Confidence {
     }
 }
 
+impl fmt::Display for Confidence {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let s = match self {
+            Confidence::Stated => "stated",
+            Confidence::Inferred => "inferred",
+            Confidence::Proposed => "proposed",
+            Confidence::Other(s) => s,
+        };
+        f.write_str(s)
+    }
+}
+
 /// `provenance.source` (design 5.4).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SourceKind {
@@ -123,6 +174,19 @@ impl SourceKind {
             "import" => SourceKind::Import,
             other => SourceKind::Other(other.to_string()),
         }
+    }
+}
+
+impl fmt::Display for SourceKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let s = match self {
+            SourceKind::Conversation => "conversation",
+            SourceKind::File => "file",
+            SourceKind::Tool => "tool",
+            SourceKind::Import => "import",
+            SourceKind::Other(s) => s,
+        };
+        f.write_str(s)
     }
 }
 
@@ -600,6 +664,34 @@ Body text follows.
             let input = format!("---\ntype: {raw}\n---\nBody\n");
             let result = parse(&input);
             assert_eq!(result.frontmatter.item_type, Some(expected), "raw={raw}");
+        }
+    }
+
+    #[test]
+    fn display_round_trips_through_parse_for_known_variants() {
+        for raw in [
+            "project-state",
+            "knowledge",
+            "reference",
+            "feedback",
+            "skill",
+            "instruction",
+            "memory",
+        ] {
+            let item_type = ItemType::parse(raw);
+            assert_eq!(item_type.to_string(), raw);
+        }
+        for raw in ["user", "project", "org"] {
+            assert_eq!(Scope::parse(raw).to_string(), raw);
+        }
+        for raw in ["shared", "private"] {
+            assert_eq!(Visibility::parse(raw).to_string(), raw);
+        }
+        for raw in ["stated", "inferred", "proposed"] {
+            assert_eq!(Confidence::parse(raw).to_string(), raw);
+        }
+        for raw in ["conversation", "file", "tool", "import"] {
+            assert_eq!(SourceKind::parse(raw).to_string(), raw);
         }
     }
 

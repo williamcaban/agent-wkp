@@ -4,3 +4,4 @@
 //! Implementation lands starting in M1; see `docs/plan/milestones.md`.
 
 pub mod frontmatter;
+pub mod index;

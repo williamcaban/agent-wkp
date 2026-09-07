@@ -472,6 +472,7 @@ dependencies = [
 name = "wkp-cli"
 version = "0.1.0"
 dependencies = [
+ "wkp-core",
  "wkp-git",
 ]
 
@@ -480,6 +481,7 @@ name = "wkp-core"
 version = "0.1.0"
 dependencies = [
  "criterion",
+ "wkp-sys",
 ]
 
 [[package]]
