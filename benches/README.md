@@ -84,3 +84,14 @@ GitHub-hosted runner is not dedicated benchmark hardware, so treat a
 borderline `FAIL` as a prompt to re-run before assuming a real regression,
 especially until M1's real operations replace these fixture-generation
 placeholders.
+
+**`baseline.json` must be captured on a GitHub-hosted runner, not a
+developer machine.** The first version of this file was generated locally
+and immediately failed CI: the GitHub-hosted `ubuntu-latest` runner was
+~70-90% slower than the local dev box for both benches, blowing well past
+even the generous 25% threshold — not a real regression, just different
+hardware. To regenerate the baseline correctly, run the `bench` job's steps
+in CI (or push a throwaway commit with `./benches/compare.sh --update`
+added temporarily to the workflow), read the numbers from the run's log,
+and commit them directly — don't `--update` from a local run and assume it
+transfers.
