@@ -1,0 +1,12 @@
+[package]
+name = "wkp-core"
+description = "Store model, frontmatter, tiers, index, FTS5 search, merge driver"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+name = "wkp_core"

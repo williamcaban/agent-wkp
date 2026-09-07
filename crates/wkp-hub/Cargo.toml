@@ -1,0 +1,13 @@
+[package]
+name = "wkp-hub"
+description = "wkp hub mode: wkp-shell, tenant mapping, indexer, control plane"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "wkp-hub"
+path = "src/main.rs"

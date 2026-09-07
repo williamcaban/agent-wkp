@@ -1,0 +1,12 @@
+[package]
+name = "wkp-sys"
+description = "The only crate permitted unsafe code (bundled SQLite)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+name = "wkp_sys"
