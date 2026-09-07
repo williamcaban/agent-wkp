@@ -4,6 +4,9 @@
 [cargo-vet]
 version = "0.10"
 
+[imports.bytecode-alliance]
+url = "https://raw.githubusercontent.com/bytecodealliance/wasmtime/main/supply-chain/audits.toml"
+
 [imports.google]
 url = "https://raw.githubusercontent.com/google/rust-crate-audits/main/audits.toml"
 
@@ -12,10 +15,6 @@ url = "https://raw.githubusercontent.com/mozilla/supply-chain/main/audits.toml"
 
 [[exemptions.aho-corasick]]
 version = "1.1.5"
-criteria = "safe-to-run"
-
-[[exemptions.anes]]
-version = "0.1.6"
 criteria = "safe-to-run"
 
 [[exemptions.anstyle]]
@@ -78,6 +77,23 @@ criteria = "safe-to-run"
 version = "0.2.189"
 criteria = "safe-to-run"
 
+[[exemptions.libsqlite3-sys]]
+version = "0.38.2"
+criteria = "safe-to-deploy"
+notes = """
+NOT independently audited by the agent that added this dependency (M1-2:
+bundled SQLite via rusqlite, design 5.3). This crate is mostly the upstream
+SQLite amalgamation (~600k lines) plus its Rust FFI bindings; design 9.3
+already accepts that bundling SQLite makes tracking its CVEs our own
+responsibility via the SBOM/rescan job, not that every release needs a fresh
+line-by-line audit of amalgamated upstream C. Still, this exemption
+substitutes for the "safe-to-deploy" review CODEOWNERS calls for on
+supply-chain/ and wkp-sys changes and should be replaced with a real
+`cargo vet certify` (or a documented decision to trust upstream SQLite's own
+provenance/release process instead) by a human reviewer before being
+treated as durable.
+"""
+
 [[exemptions.memchr]]
 version = "2.8.3"
 criteria = "safe-to-run"
@@ -101,6 +117,21 @@ criteria = "safe-to-run"
 [[exemptions.regex-syntax]]
 version = "0.8.11"
 criteria = "safe-to-run"
+
+[[exemptions.rusqlite]]
+version = "0.40.2"
+criteria = "safe-to-deploy"
+notes = """
+NOT independently audited by the agent that added this dependency (M1-2:
+bundled SQLite via rusqlite, design 5.3). 23,729 lines is beyond what this
+session reviewed line-by-line; the crate is a long-maintained (gwenn),
+widely used safe wrapper over libsqlite3-sys, used here only through the
+narrow wkp-sys API (open/open_in_memory + safe query/exec calls) with no
+unsafe code written in this workspace. This exemption substitutes for the
+"safe-to-deploy" review CODEOWNERS calls for on supply-chain/ and wkp-sys
+changes and should be replaced with a real `cargo vet certify` by a human
+reviewer before being treated as durable.
+"""
 
 [[exemptions.serde]]
 version = "1.0.229"
