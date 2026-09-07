@@ -8,10 +8,10 @@ use std::fs;
 use std::io;
 use std::path::Path;
 
-struct Xorshift64(u64);
+pub(crate) struct Xorshift64(u64);
 
 impl Xorshift64 {
-    fn new(seed: u64) -> Self {
+    pub(crate) fn new(seed: u64) -> Self {
         Xorshift64(seed | 1)
     }
 
@@ -48,7 +48,7 @@ const WORDS: &[&str] = &[
     "criterion",
 ];
 
-fn synthetic_body(rng: &mut Xorshift64, word_count: usize) -> String {
+pub(crate) fn synthetic_body(rng: &mut Xorshift64, word_count: usize) -> String {
     (0..word_count)
         .map(|_| WORDS[(rng.next_u64() as usize) % WORDS.len()])
         .collect::<Vec<_>>()

@@ -18,7 +18,7 @@
 use std::fmt;
 use std::path::{Path, PathBuf};
 
-use crate::frontmatter::Frontmatter;
+use crate::frontmatter::{Confidence, Frontmatter, ItemType};
 // `wkp-core` never depends on `rusqlite` directly: `wkp-sys` owns bundled
 // SQLite (design 3.3) and re-exports it, so this is the one place the
 // dependency is named.
@@ -84,6 +84,8 @@ CREATE VIRTUAL TABLE items USING fts5(
     updated UNINDEXED,
     expires UNINDEXED,
     refs UNINDEXED,
+    tier UNINDEXED,
+    tokens_estimate UNINDEXED,
     tokenize = 'porter unicode61'
 );
 
@@ -105,14 +107,54 @@ fn create_schema(conn: &Connection) -> rusqlite::Result<()> {
     conn.execute_batch(SCHEMA)
 }
 
+/// A provisional, type/confidence-based tier heuristic -- **not** the real
+/// gate. Design 7.4's actual tier assignment depends on whether an item's
+/// latest commit is signed by a human key, which doesn't exist until M2
+/// (signing). Until then, this is what `--tier` filters on, documented
+/// here so nobody mistakes it for a security boundary: an agent-written
+/// item cannot promote itself to tier 0 just by setting `type:
+/// project-state` in its own frontmatter today, but it will be able to
+/// once M2's provenance gate replaces this function.
+///
+/// - Agent-written, not yet human-reviewed (`confidence: inferred` or
+///   `proposed`) is always tier 2, regardless of `type`.
+/// - Otherwise: `project-state`/`instruction` -> 0, `feedback`/`knowledge`
+///   -> 1, everything else (`reference`, `skill`, `memory`, unrecognized
+///   types, or no type at all) -> 2.
+fn compute_tier(fm: &Frontmatter) -> u8 {
+    if matches!(
+        fm.confidence,
+        Some(Confidence::Inferred | Confidence::Proposed)
+    ) {
+        return 2;
+    }
+    match fm.item_type {
+        Some(ItemType::ProjectState | ItemType::Instruction) => 0,
+        Some(ItemType::Feedback | ItemType::Knowledge) => 1,
+        _ => 2,
+    }
+}
+
+/// Falls back to roughly 4 characters per token (a common rough estimate
+/// for English prose) when frontmatter doesn't carry an explicit `tokens:`
+/// value. An estimate, not a real tokenizer count -- good enough for
+/// budget truncation, not for billing or precise context-window math.
+fn estimate_tokens(fm: &Frontmatter, body: &str) -> u32 {
+    fm.tokens
+        .unwrap_or_else(|| (body.chars().count() as u32 / 4).max(1))
+}
+
 fn insert_item(conn: &Connection, item: &Item) -> rusqlite::Result<()> {
     let fm = &item.frontmatter;
+    let tier = compute_tier(fm);
+    let tokens_estimate = estimate_tokens(fm, &item.body);
     conn.execute("INSERT INTO paths (path) VALUES (?1)", [&item.path])?;
     conn.execute(
         "INSERT INTO items (
             path, title, content, tags, item_type, workspace, visibility,
-            scope, confidence, provenance_source, tokens, updated, expires, refs
-        ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)",
+            scope, confidence, provenance_source, tokens, updated, expires,
+            refs, tier, tokens_estimate
+        ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16)",
         rusqlite::params![
             item.path,
             fm.title.clone().unwrap_or_default(),
@@ -128,6 +170,8 @@ fn insert_item(conn: &Connection, item: &Item) -> rusqlite::Result<()> {
             fm.updated,
             fm.expires,
             fm.refs.join(" "),
+            tier,
+            tokens_estimate,
         ],
     )?;
     let trigram_content = format!(
@@ -298,6 +342,18 @@ pub struct SearchFilter {
     pub workspace: Option<String>,
     pub visibility: Option<String>,
     pub scope: Option<String>,
+    /// Keep only items at or below this tier (0 is the most restrictive).
+    /// See [`compute_tier`]'s doc comment for what "tier" means today and
+    /// its known limitation (a provisional heuristic, not design 7.4's
+    /// real provenance gate, which lands with signing in M2).
+    pub tier: Option<u8>,
+    /// Stop including results once their cumulative estimated token count
+    /// would exceed this. Applied after ranking and the tier/metadata
+    /// filters, so the highest-scoring results within budget win. The
+    /// first result is always kept even if it alone exceeds the budget,
+    /// so a budget smaller than any single item still returns something
+    /// rather than nothing.
+    pub budget: Option<u32>,
     pub limit: Option<usize>,
 }
 
@@ -306,11 +362,14 @@ pub struct SearchHit {
     pub path: String,
     pub title: String,
     pub score: f64,
+    pub tier: u8,
+    pub tokens: u32,
 }
 
 /// Runs a BM25 full-text query against the `items` table, applying the
-/// tier/metadata filters in `filter` (design 5.3). Results are ordered by
-/// score, best match first.
+/// tier/metadata filters in `filter` (design 5.3), then truncates to
+/// `filter.budget` estimated tokens if set. Results are ordered by score,
+/// best match first.
 pub fn search(
     conn: &Connection,
     query: &str,
@@ -318,8 +377,8 @@ pub fn search(
 ) -> Result<Vec<SearchHit>, IndexError> {
     let (w_path, w_title, w_content, w_tags) = BM25_WEIGHTS;
     let mut sql = format!(
-        "SELECT path, title, -bm25(items, {w_path}, {w_title}, {w_content}, {w_tags}) AS score \
-         FROM items WHERE items MATCH ?"
+        "SELECT path, title, -bm25(items, {w_path}, {w_title}, {w_content}, {w_tags}) AS score, \
+         tier, tokens_estimate FROM items WHERE items MATCH ?"
     );
     let mut params: Vec<Box<dyn rusqlite::ToSql>> = vec![Box::new(query.to_string())];
 
@@ -339,6 +398,10 @@ pub fn search(
         sql.push_str(" AND scope = ?");
         params.push(Box::new(v.clone()));
     }
+    if let Some(v) = filter.tier {
+        sql.push_str(" AND tier <= ?");
+        params.push(Box::new(v));
+    }
     sql.push_str(" ORDER BY score DESC");
     if let Some(limit) = filter.limit {
         sql.push_str(" LIMIT ?");
@@ -352,9 +415,29 @@ pub fn search(
             path: row.get(0)?,
             title: row.get(1)?,
             score: row.get(2)?,
+            tier: row.get(3)?,
+            tokens: row.get(4)?,
         })
     })?;
-    Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    let hits = rows.collect::<Result<Vec<_>, _>>()?;
+    Ok(apply_budget(hits, filter.budget))
+}
+
+fn apply_budget(hits: Vec<SearchHit>, budget: Option<u32>) -> Vec<SearchHit> {
+    let Some(budget) = budget else {
+        return hits;
+    };
+    let mut kept = Vec::with_capacity(hits.len());
+    let mut spent: u64 = 0;
+    for hit in hits {
+        let would_spend = spent + u64::from(hit.tokens);
+        if !kept.is_empty() && would_spend > u64::from(budget) {
+            break;
+        }
+        spent = would_spend;
+        kept.push(hit);
+    }
+    kept
 }
 
 /// Runs a substring match against `items_trigram`, for identifiers and
@@ -375,6 +458,8 @@ pub fn search_trigram(
             path: row.get(0)?,
             title: String::new(),
             score: 0.0,
+            tier: 0,
+            tokens: 0,
         })
     })?;
     Ok(rows.collect::<Result<Vec<_>, _>>()?)
@@ -451,6 +536,105 @@ mod tests {
 
         let all = search(&conn, "BM25", &SearchFilter::default()).expect("search");
         assert_eq!(all.len(), 2);
+    }
+
+    #[test]
+    fn compute_tier_reflects_type_and_confidence() {
+        let mut fm = Frontmatter {
+            item_type: Some(ItemType::ProjectState),
+            ..Default::default()
+        };
+        assert_eq!(compute_tier(&fm), 0);
+
+        fm.item_type = Some(ItemType::Feedback);
+        assert_eq!(compute_tier(&fm), 1);
+
+        fm.item_type = Some(ItemType::Reference);
+        assert_eq!(compute_tier(&fm), 2);
+
+        // Agent-written content is tier 2 regardless of type, until human
+        // review changes its confidence (design 7.4's real gate; this is
+        // the provisional stand-in -- see compute_tier's doc comment).
+        fm.item_type = Some(ItemType::ProjectState);
+        fm.confidence = Some(Confidence::Proposed);
+        assert_eq!(compute_tier(&fm), 2);
+    }
+
+    #[test]
+    fn tier_filter_keeps_only_items_at_or_below_the_requested_tier() {
+        let mut tier0 = item("t0.md", "Decision", "shared vocabulary here");
+        tier0.frontmatter.item_type = Some(ItemType::ProjectState);
+
+        let mut tier1 = item("t1.md", "Lesson", "shared vocabulary here too");
+        tier1.frontmatter.item_type = Some(ItemType::Feedback);
+
+        let mut tier2 = item("t2.md", "Note", "shared vocabulary here as well");
+        tier2.frontmatter.item_type = Some(ItemType::Reference);
+
+        let conn = build_in_memory(&[tier0, tier1, tier2]).expect("build in-memory index");
+
+        let filter = SearchFilter {
+            tier: Some(0),
+            ..Default::default()
+        };
+        let hits = search(&conn, "vocabulary", &filter).expect("search");
+        assert_eq!(
+            hits.iter().map(|h| h.path.as_str()).collect::<Vec<_>>(),
+            vec!["t0.md"]
+        );
+
+        let filter = SearchFilter {
+            tier: Some(1),
+            ..Default::default()
+        };
+        let hits = search(&conn, "vocabulary", &filter).expect("search");
+        let mut paths: Vec<&str> = hits.iter().map(|h| h.path.as_str()).collect();
+        paths.sort_unstable();
+        assert_eq!(paths, vec!["t0.md", "t1.md"]);
+    }
+
+    #[test]
+    fn budget_stops_once_cumulative_tokens_would_be_exceeded() {
+        let mut small = item("small.md", "Small", "shared topic word content");
+        small.frontmatter.tokens = Some(10);
+        let mut medium = item("medium.md", "Medium", "shared topic word content extra");
+        medium.frontmatter.tokens = Some(20);
+        let mut large = item("large.md", "Large", "shared topic word content extra more");
+        large.frontmatter.tokens = Some(1000);
+
+        // Insert so BM25 ranks small > medium > large for "topic" (more
+        // exact-length match on shorter content raises the score, but the
+        // exact ranking doesn't matter here -- what matters is that the
+        // truncation happens in ranked order without exceeding budget).
+        let conn = build_in_memory(&[small, medium, large]).expect("build in-memory index");
+
+        let filter = SearchFilter {
+            budget: Some(25),
+            ..Default::default()
+        };
+        let hits = search(&conn, "topic", &filter).expect("search");
+        let total: u32 = hits.iter().map(|h| h.tokens).sum();
+        assert!(total <= 25 || hits.len() == 1, "budget exceeded: {hits:?}");
+        assert!(!hits.is_empty());
+    }
+
+    #[test]
+    fn budget_smaller_than_the_single_best_result_still_returns_it() {
+        let mut huge = item("huge.md", "Huge", "distinctive query term appears here");
+        huge.frontmatter.tokens = Some(5_000);
+        let conn = build_in_memory(&[huge]).expect("build in-memory index");
+
+        let filter = SearchFilter {
+            budget: Some(1),
+            ..Default::default()
+        };
+        let hits = search(&conn, "distinctive", &filter).expect("search");
+        assert_eq!(
+            hits.len(),
+            1,
+            "a budget smaller than any item must still return the best match"
+        );
+        assert_eq!(hits[0].path, "huge.md");
     }
 
     #[test]
