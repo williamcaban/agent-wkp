@@ -1,0 +1,13 @@
+[package]
+name = "wkp-cli"
+description = "The wkp binary (wkpd is a subcommand)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "wkp"
+path = "src/main.rs"
