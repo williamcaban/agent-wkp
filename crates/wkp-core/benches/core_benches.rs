@@ -114,11 +114,12 @@ fn fixture_corpus_generate_50k(c: &mut Criterion) {
 /// this benchmark's setup does once per changed item, not once per corpus
 /// item. See `crates/wkp-core/src/index.rs`'s `update_index` doc comment.
 ///
-/// This benchmark measured 461.88ms mean on the 50k fixture (ubuntu-latest,
-/// tmpfs, 20 samples) for a 10-item change -- design 4.3's incremental-index
-/// target (p50 < 30ms / p95 < 100ms) is missed by roughly an order of
-/// magnitude, because `VACUUM INTO`'s copy dominates. This is a real
-/// design-vs-reality conflict, not a bug: see
+/// This benchmark measured 383-462ms mean on the 50k fixture across two
+/// separate ubuntu-latest CI runs (tmpfs, 20 samples) for a 10-item change
+/// -- design 4.3's incremental-index target (p50 < 30ms / p95 < 100ms) is
+/// missed by roughly an order of magnitude either way, because `VACUUM
+/// INTO`'s copy dominates. This is a real design-vs-reality conflict, not a
+/// bug: see
 /// `docs/adr/0002-incremental-index-write-mechanism.md` for the options and
 /// the (not yet made) decision. `benches/baseline.json`'s entry for this
 /// bench exists to catch a *further* regression on top of this

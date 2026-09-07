@@ -28,7 +28,10 @@ is `wkp_core::index::update_index` as merged.
 file regardless of how many rows changed. Benchmarked on the 50k-item
 fixture corpus (`crates/wkp-core/benches/core_benches.rs`,
 `incremental_update_50k_corpus/10_changed`, `ubuntu-latest`, tmpfs, 20
-samples): **461.88 ms mean**, updating only 10 of 50,000 items. Design 4.3's
+samples): **461.88 ms mean**, updating only 10 of 50,000 items (a second,
+separate CI run measured 383.04 ms — the exact figure moves with ordinary
+shared-runner variance, see `benches/README.md`'s own documented incidents
+on that; the order of magnitude does not). Design 4.3's
 target for "incremental index check" is p50 < 30 ms / p95 < 100 ms — this
 implementation misses it by roughly an order of magnitude at realistic
 corpus scale, and the miss gets worse as the corpus grows, since the copy
