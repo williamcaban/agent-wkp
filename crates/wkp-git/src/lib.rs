@@ -8,6 +8,8 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+pub mod allowed_signers;
+
 /// Minimum git version `wkp` requires. Decided in `docs/adr/0001-git-minimum-version.md`:
 /// SSH commit signing (`gpg.format = ssh`) needs git >= 2.34, and that is the
 /// only hard floor. The builtin fsmonitor daemon is opportunistic (wired up
@@ -147,11 +149,18 @@ pub fn commit_all(repo_dir: &Path, message: &str) -> Result<(), String> {
 /// user input, but plumbing (`git config`, not the porcelain command) is
 /// used throughout per design 5.1: deterministic, non-interactive, and
 /// immune to a user's global hooks or aliases.
+///
+/// Also wires up SSH commit signing (design 7.3, M2-1): see
+/// [`allowed_signers::configure_ssh_signing`] for what that adds --
+/// `gpg.format`/`gpg.ssh.allowedSignersFile` aren't in
+/// [`INIT_CONFIG_SETTINGS`] because the signers-file path is derived
+/// from `repo_dir`, not a static value.
 pub fn apply_init_settings(repo_dir: &Path) -> Result<(), String> {
     for (key, value) in INIT_CONFIG_SETTINGS {
         run_git(repo_dir, &["config", "--local", key, value])
             .map_err(|e| format!("wkp: failed to set git config {key}={value}: {e}"))?;
     }
+    allowed_signers::configure_ssh_signing(repo_dir)?;
     // Best-effort only; see doc comment above.
     let _ = run_git(repo_dir, &["maintenance", "start"]);
     Ok(())
