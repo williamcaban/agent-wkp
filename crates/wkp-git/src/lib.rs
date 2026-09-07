@@ -186,33 +186,32 @@ mod tests {
         assert!(ensure_min_git_version().is_ok());
     }
 
+    /// `tempfile` rather than `std::env::temp_dir()` + a predictable name:
+    /// the latter is flagged by this repo's semgrep gate as an
+    /// insecure-temp-file pattern (a shared temp directory with a
+    /// guessable name invites symlink/TOCTOU races).
     struct TempGitRepo {
-        path: std::path::PathBuf,
+        dir: tempfile::TempDir,
     }
 
     impl TempGitRepo {
         fn new(name: &str) -> Self {
-            let pid = std::process::id();
-            let nanos = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_nanos())
-                .unwrap_or(0);
-            let path = std::env::temp_dir().join(format!("wkp-git-test-{name}-{pid}-{nanos}"));
-            std::fs::create_dir_all(&path).expect("create temp dir");
+            let dir = tempfile::Builder::new()
+                .prefix(&format!("wkp-git-test-{name}-"))
+                .tempdir()
+                .expect("create temp dir");
             let status = Command::new("git")
                 .arg("-C")
-                .arg(&path)
+                .arg(dir.path())
                 .args(["init", "--quiet"])
                 .status()
                 .expect("run git init");
             assert!(status.success(), "git init failed");
-            Self { path }
+            Self { dir }
         }
-    }
 
-    impl Drop for TempGitRepo {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.path);
+        fn path(&self) -> &Path {
+            self.dir.path()
         }
     }
 
@@ -232,28 +231,26 @@ mod tests {
 
     #[test]
     fn init_repo_creates_a_working_git_repository() {
-        let pid = std::process::id();
-        let nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0);
-        let dir = std::env::temp_dir().join(format!("wkp-git-test-init-repo-{pid}-{nanos}"));
-        // Deliberately does not exist yet; init_repo must create it.
+        let temp = tempfile::Builder::new()
+            .prefix("wkp-git-test-init-repo-")
+            .tempdir()
+            .expect("create temp dir");
+        // Point at a not-yet-existing subdirectory; init_repo must create it.
+        let dir = temp.path().join("store");
         init_repo(&dir).expect("init_repo");
         assert!(dir.join(".git").is_dir());
         // Idempotent: a second call on the same path must not error.
         init_repo(&dir).expect("init_repo again");
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn apply_init_settings_writes_expected_git_config() {
         let repo = TempGitRepo::new("init-settings");
-        apply_init_settings(&repo.path).expect("apply_init_settings");
+        apply_init_settings(repo.path()).expect("apply_init_settings");
 
         for (key, expected) in INIT_CONFIG_SETTINGS {
             assert_eq!(
-                git_config_get(&repo.path, key).as_deref(),
+                git_config_get(repo.path(), key).as_deref(),
                 Some(*expected),
                 "unexpected value for {key}"
             );
@@ -263,27 +260,22 @@ mod tests {
     #[test]
     fn apply_init_settings_is_idempotent() {
         let repo = TempGitRepo::new("init-settings-idempotent");
-        apply_init_settings(&repo.path).expect("first apply");
-        apply_init_settings(&repo.path).expect("second apply");
+        apply_init_settings(repo.path()).expect("first apply");
+        apply_init_settings(repo.path()).expect("second apply");
 
         for (key, expected) in INIT_CONFIG_SETTINGS {
-            assert_eq!(git_config_get(&repo.path, key).as_deref(), Some(*expected));
+            assert_eq!(git_config_get(repo.path(), key).as_deref(), Some(*expected));
         }
     }
 
     #[test]
     fn apply_init_settings_fails_clearly_outside_a_git_repo() {
-        let pid = std::process::id();
-        let nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0);
-        let dir = std::env::temp_dir().join(format!("wkp-git-test-not-a-repo-{pid}-{nanos}"));
-        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let dir = tempfile::Builder::new()
+            .prefix("wkp-git-test-not-a-repo-")
+            .tempdir()
+            .expect("create temp dir");
 
-        let result = apply_init_settings(&dir);
+        let result = apply_init_settings(dir.path());
         assert!(result.is_err(), "expected an error outside a git repo");
-
-        let _ = std::fs::remove_dir_all(&dir);
     }
 }

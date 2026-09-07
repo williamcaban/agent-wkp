@@ -311,13 +311,16 @@ mod tests {
         }
     }
 
-    fn temp_db_path(name: &str) -> PathBuf {
-        let pid = std::process::id();
-        let nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0);
-        std::env::temp_dir().join(format!("wkp-core-test-{name}-{pid}-{nanos}.db"))
+    /// A securely created, uniquely named temp directory for a test's own
+    /// `index.db` (`tempfile` rather than `std::env::temp_dir()` +
+    /// a predictable name: the latter is flagged by this repo's semgrep
+    /// gate as an insecure-temp-file pattern, since a shared temp
+    /// directory with a guessable name invites symlink/TOCTOU races).
+    fn temp_db_dir(name: &str) -> tempfile::TempDir {
+        tempfile::Builder::new()
+            .prefix(&format!("wkp-core-test-{name}-"))
+            .tempdir()
+            .expect("create temp dir")
     }
 
     #[test]
@@ -379,20 +382,20 @@ mod tests {
 
     #[test]
     fn build_index_is_atomic_and_query_works_after_swap() {
-        let dest = temp_db_path("atomic-happy");
+        let dir = temp_db_dir("atomic-happy");
+        let dest = dir.path().join("index.db");
         let items = vec![item("a.md", "A", "first version")];
         build_index(&dest, &items).expect("build index");
 
         let conn = open_index(&dest).expect("open index");
         let hits = search(&conn, "first", &SearchFilter::default()).expect("search");
         assert_eq!(hits.len(), 1);
-        drop(conn);
-        let _ = std::fs::remove_file(&dest);
     }
 
     #[test]
     fn failed_rebuild_leaves_previous_index_db_untouched() {
-        let dest = temp_db_path("atomic-crash");
+        let dir = temp_db_dir("atomic-crash");
+        let dest = dir.path().join("index.db");
         let good_items = vec![item("a.md", "A", "first version")];
         build_index(&dest, &good_items).expect("initial build");
         let original_bytes = std::fs::read(&dest).expect("read original index.db");
@@ -423,15 +426,12 @@ mod tests {
         // No leftover temp file either. `temp_path_for` embeds a
         // nanosecond timestamp, so recomputing it wouldn't match the
         // actual name `build_index` used; scan the directory instead.
-        let dir = dest.parent().unwrap_or_else(|| Path::new("."));
         let prefix = format!(".{}.tmp-", dest.file_name().unwrap().to_string_lossy());
-        let leftover: Vec<_> = std::fs::read_dir(dir)
+        let leftover: Vec<_> = std::fs::read_dir(dir.path())
             .expect("read temp dir")
             .filter_map(|e| e.ok())
             .filter(|e| e.file_name().to_string_lossy().starts_with(&prefix))
             .collect();
         assert!(leftover.is_empty(), "leftover temp files: {leftover:?}");
-
-        let _ = std::fs::remove_file(&dest);
     }
 }

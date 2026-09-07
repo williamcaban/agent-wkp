@@ -94,19 +94,22 @@ fn ensure_gitignored(path: &Path, patterns: &[&str]) -> Result<(), String> {
 mod tests {
     use super::*;
 
-    fn temp_dir(name: &str) -> PathBuf {
-        let pid = std::process::id();
-        let nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0);
-        std::env::temp_dir().join(format!("wkp-cli-test-{name}-{pid}-{nanos}"))
+    /// `tempfile` rather than `std::env::temp_dir()` + a predictable name:
+    /// the latter is flagged by this repo's semgrep gate as an
+    /// insecure-temp-file pattern (a shared temp directory with a
+    /// guessable name invites symlink/TOCTOU races).
+    fn temp_dir(name: &str) -> tempfile::TempDir {
+        tempfile::Builder::new()
+            .prefix(&format!("wkp-cli-test-{name}-"))
+            .tempdir()
+            .expect("create temp dir")
     }
 
     #[test]
     fn run_init_creates_store_with_gitignored_index() {
-        let dir = temp_dir("run-init");
-        run_init(&dir).expect("run_init");
+        let temp = temp_dir("run-init");
+        let dir = temp.path();
+        run_init(dir).expect("run_init");
 
         assert!(dir.join(".git").is_dir());
         assert!(dir.join(".wkp/index.db").is_file());
@@ -122,23 +125,19 @@ mod tests {
             wkp_core::index::search(&conn, "anything", &wkp_core::index::SearchFilter::default())
                 .expect("search empty index");
         assert!(hits.is_empty());
-
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn run_init_is_idempotent_and_preserves_existing_gitignore_entries() {
-        let dir = temp_dir("run-init-idempotent");
-        std::fs::create_dir_all(&dir).expect("create dir");
+        let temp = temp_dir("run-init-idempotent");
+        let dir = temp.path();
         std::fs::write(dir.join(".gitignore"), "target/\n").expect("seed .gitignore");
 
-        run_init(&dir).expect("first run_init");
-        run_init(&dir).expect("second run_init");
+        run_init(dir).expect("first run_init");
+        run_init(dir).expect("second run_init");
 
         let gitignore = std::fs::read_to_string(dir.join(".gitignore")).expect("read .gitignore");
         assert_eq!(gitignore.matches(".wkp/index.db").count(), 1);
         assert!(gitignore.contains("target/"));
-
-        let _ = std::fs::remove_dir_all(&dir);
     }
 }
