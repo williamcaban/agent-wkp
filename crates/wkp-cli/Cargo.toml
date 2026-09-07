@@ -11,3 +11,6 @@ repository.workspace = true
 [[bin]]
 name = "wkp"
 path = "src/main.rs"
+
+[dependencies]
+wkp-git = { path = "../wkp-git" }
