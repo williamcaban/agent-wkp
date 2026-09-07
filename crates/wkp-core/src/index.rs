@@ -1105,6 +1105,40 @@ mod tests {
         assert!(rendered2.contains("should never appear"));
     }
 
+    /// Golden test (M1-8): locks down the exact `tier0.md` shape a harness's
+    /// `SessionStart` hook `cat`s verbatim into the model's context --
+    /// heading, source comment, body, ordering and blank-line spacing are
+    /// all part of the contract, not just "contains" substring checks.
+    /// Update this string deliberately if the format changes.
+    #[test]
+    fn materialize_tier0_output_is_locked_down() {
+        let mut zebra = item("z.md", "Zebra Item", "zebra body");
+        zebra.frontmatter.item_type = Some(ItemType::ProjectState);
+        let mut apple = item("a.md", "Apple Item", "apple body");
+        apple.frontmatter.item_type = Some(ItemType::Instruction);
+        let conn = build_in_memory(&[zebra, apple]).expect("build in-memory index");
+
+        let rendered = materialize(&conn, 0).expect("materialize tier 0");
+        assert_eq!(
+            rendered,
+            "<wkp-context tier=\"0\">\n\n\
+             ## Apple Item\n\n<!-- source: a.md -->\n\napple body\n\n\
+             ## Zebra Item\n\n<!-- source: z.md -->\n\nzebra body\n\n\
+             </wkp-context>\n",
+            "materialize must order items by path and use this exact heading/comment shape"
+        );
+    }
+
+    /// Golden test (M1-8): a tier with no items still produces a
+    /// well-formed, harness-safe wrapper -- `cat`-ing this must never
+    /// inject a bare error or truncated tag into context.
+    #[test]
+    fn materialize_empty_tier_output_is_locked_down() {
+        let conn = build_in_memory(&[]).expect("build in-memory index");
+        let rendered = materialize(&conn, 0).expect("materialize empty tier 0");
+        assert_eq!(rendered, "<wkp-context tier=\"0\">\n\n</wkp-context>\n");
+    }
+
     #[test]
     fn trigram_search_finds_path_substrings() {
         let items = vec![item(
