@@ -4,5 +4,8 @@
   },
   "fixture_corpus_generate_5k": {
     "mean_ns": 40674104.455
+  },
+  "incremental_update_50k_corpus": {
+    "mean_ns": 383039844.35
   }
 }

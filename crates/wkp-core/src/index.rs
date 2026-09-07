@@ -187,6 +187,81 @@ pub fn build_index(dest: &Path, items: &[Item]) -> Result<(), IndexError> {
     }
 }
 
+fn delete_item(conn: &Connection, path: &str) -> rusqlite::Result<()> {
+    conn.execute("DELETE FROM paths WHERE path = ?1", [path])?;
+    conn.execute("DELETE FROM items WHERE path = ?1", [path])?;
+    conn.execute("DELETE FROM items_trigram WHERE path = ?1", [path])?;
+    Ok(())
+}
+
+/// Applies an incremental change (design 5.1: "only those files are
+/// hashed and re-indexed", M1-3) to the index at `dest`, without reading
+/// or re-inserting every unchanged item.
+///
+/// `dest` is still never written in place (CLAUDE.md hard rule): the
+/// current `index.db` is cloned into a fresh temp file with SQLite's own
+/// `VACUUM INTO` (a read of `dest`, not a write to it), the changes are
+/// applied to that copy, and the copy is renamed over `dest` on success.
+/// If `dest` doesn't exist yet, this builds a fresh index instead,
+/// equivalent to [`build_index`] with just `upserts`.
+///
+/// `VACUUM INTO` copies the whole file regardless of how many rows
+/// change, so this does not make the on-disk write itself proportional
+/// to the change count — what it avoids is the far more expensive part at
+/// realistic corpus scale: re-reading, re-parsing, and re-tokenizing every
+/// unchanged file's content, which is what made the old Python tool's
+/// `git hash-object`-every-file approach slow (design 5.1).
+///
+/// That said, `VACUUM INTO`'s file copy is itself not free at realistic
+/// scale: benchmarked at ~460ms for a 10-item change against a 50k-item
+/// corpus, well past design 4.3's incremental-index target. See
+/// `docs/adr/0002-incremental-index-write-mechanism.md` (status: proposed,
+/// not yet decided) for the options — including writing `dest` in place
+/// inside a SQLite transaction instead, which this function does not do
+/// today, deliberately, pending that decision.
+pub fn update_index(
+    dest: &Path,
+    upserts: &[Item],
+    deleted_paths: &[String],
+) -> Result<(), IndexError> {
+    let tmp_path = temp_path_for(dest);
+    let _ = std::fs::remove_file(&tmp_path);
+
+    let result = (|| -> Result<(), IndexError> {
+        if dest.exists() {
+            let src = wkp_sys::open(dest)?;
+            src.execute("VACUUM INTO ?1", [tmp_path.to_string_lossy().into_owned()])?;
+        } else {
+            let conn = wkp_sys::open(&tmp_path)?;
+            create_schema(&conn)?;
+        }
+
+        let conn = wkp_sys::open(&tmp_path)?;
+        for path in deleted_paths {
+            delete_item(&conn, path)?;
+        }
+        for item in upserts {
+            // An upsert on a path already present must replace, not
+            // duplicate, its row -- clear it first regardless of whether
+            // the caller classified it as "added" or "modified".
+            delete_item(&conn, &item.path)?;
+            insert_item(&conn, item)?;
+        }
+        Ok(())
+    })();
+
+    match result {
+        Ok(()) => {
+            std::fs::rename(&tmp_path, dest)?;
+            Ok(())
+        }
+        Err(e) => {
+            let _ = std::fs::remove_file(&tmp_path);
+            Err(e)
+        }
+    }
+}
+
 fn temp_path_for(dest: &Path) -> PathBuf {
     let file_name = dest
         .file_name()
@@ -204,6 +279,17 @@ fn temp_path_for(dest: &Path) -> PathBuf {
 /// build incrementally rather than through [`build_index`]).
 pub fn open_index(path: &Path) -> Result<Connection, IndexError> {
     Ok(wkp_sys::open(path)?)
+}
+
+/// Every path the index currently holds a row for. Lets a caller compute
+/// "added since the index last saw this store" (in the working tree but
+/// not here) and "deleted" (here but no longer in the working tree)
+/// without needing its own separate bookkeeping of what was indexed last
+/// time -- `index.db` already is that bookkeeping.
+pub fn known_paths(conn: &Connection) -> Result<std::collections::HashSet<String>, IndexError> {
+    let mut stmt = conn.prepare("SELECT path FROM paths")?;
+    let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+    Ok(rows.collect::<Result<_, _>>()?)
 }
 
 #[derive(Debug, Default, Clone)]
@@ -433,5 +519,126 @@ mod tests {
             .filter(|e| e.file_name().to_string_lossy().starts_with(&prefix))
             .collect();
         assert!(leftover.is_empty(), "leftover temp files: {leftover:?}");
+    }
+
+    #[test]
+    fn update_index_builds_fresh_when_dest_does_not_exist() {
+        let dir = temp_db_dir("update-fresh");
+        let dest = dir.path().join("index.db");
+        let items = vec![item("a.md", "A", "first version")];
+
+        update_index(&dest, &items, &[]).expect("update_index on missing dest");
+
+        let conn = open_index(&dest).expect("open index");
+        let hits = search(&conn, "first", &SearchFilter::default()).expect("search");
+        assert_eq!(hits.len(), 1);
+    }
+
+    #[test]
+    fn update_index_adds_modifies_and_deletes_without_touching_others() {
+        let dir = temp_db_dir("update-incremental");
+        let dest = dir.path().join("index.db");
+        let initial = vec![
+            item("keep.md", "Keep", "untouched content"),
+            item("edit.md", "Edit", "original content"),
+            item("remove.md", "Remove", "goes away"),
+        ];
+        build_index(&dest, &initial).expect("initial build");
+
+        let upserts = vec![
+            item("edit.md", "Edit", "updated content"),
+            item("new.md", "New", "brand new content"),
+        ];
+        update_index(&dest, &upserts, &["remove.md".to_string()]).expect("update_index");
+
+        let conn = open_index(&dest).expect("open index");
+
+        let all = search(&conn, "content", &SearchFilter::default()).expect("search");
+        let mut paths: Vec<&str> = all.iter().map(|h| h.path.as_str()).collect();
+        paths.sort_unstable();
+        assert_eq!(paths, vec!["edit.md", "keep.md", "new.md"]);
+
+        let updated = search(&conn, "updated", &SearchFilter::default()).expect("search");
+        assert_eq!(updated.len(), 1);
+        assert_eq!(updated[0].path, "edit.md");
+
+        let original = search(&conn, "original", &SearchFilter::default()).expect("search");
+        assert!(
+            original.is_empty(),
+            "stale content for a modified path must not remain queryable"
+        );
+    }
+
+    #[test]
+    fn update_index_upsert_on_existing_path_does_not_duplicate_rows() {
+        let dir = temp_db_dir("update-no-dup");
+        let dest = dir.path().join("index.db");
+        let initial = vec![item("a.md", "A", "version one")];
+        build_index(&dest, &initial).expect("initial build");
+
+        update_index(&dest, &[item("a.md", "A", "version two")], &[]).expect("update_index");
+
+        let conn = open_index(&dest).expect("open index");
+        let hits = search(&conn, "version", &SearchFilter::default()).expect("search");
+        assert_eq!(
+            hits.len(),
+            1,
+            "expected exactly one row for a.md, got {hits:?}"
+        );
+        assert_eq!(hits[0].path, "a.md");
+    }
+
+    #[test]
+    fn update_index_duplicate_path_within_one_batch_keeps_last_write() {
+        let dir = temp_db_dir("update-batch-dup");
+        let dest = dir.path().join("index.db");
+        build_index(&dest, &[]).expect("initial empty build");
+
+        // delete_item+insert_item per upsert means a path appearing twice
+        // in one batch is safe (last write wins), not a UNIQUE-constraint
+        // error -- worth locking down explicitly since it's a natural
+        // thing for a caller to hit (e.g. a file that shows up in both
+        // "modified" and "renamed-to" for the same underlying change).
+        let upserts = vec![
+            item("b.md", "B", "first write"),
+            item("b.md", "B", "second write"),
+        ];
+        update_index(&dest, &upserts, &[]).expect("update_index with a duplicate path");
+
+        let conn = open_index(&dest).expect("open index");
+        let hits = search(&conn, "write", &SearchFilter::default()).expect("search");
+        assert_eq!(
+            hits.len(),
+            1,
+            "expected exactly one row for b.md, got {hits:?}"
+        );
+        let second = search(&conn, "second", &SearchFilter::default()).expect("search");
+        assert_eq!(
+            second.len(),
+            1,
+            "last write in the batch should be the one that sticks"
+        );
+    }
+
+    #[test]
+    fn failed_update_leaves_previous_index_db_untouched() {
+        let dir = temp_db_dir("update-crash");
+        let dest = dir.path().join("index.db");
+        // A file that exists but isn't a valid SQLite database: VACUUM
+        // INTO's read of it as the update's source fails immediately,
+        // before the temp file is ever renamed over dest.
+        std::fs::write(&dest, b"not a sqlite database").expect("seed non-sqlite dest");
+
+        let result = update_index(&dest, &[item("c.md", "C", "content")], &[]);
+        assert!(
+            result.is_err(),
+            "expected VACUUM INTO to fail on a non-sqlite source"
+        );
+
+        let bytes_after = std::fs::read(&dest).expect("read dest after failed update");
+        assert_eq!(
+            bytes_after, b"not a sqlite database",
+            "a failed update must not modify or truncate the existing dest file"
+        );
     }
 }

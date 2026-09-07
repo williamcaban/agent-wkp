@@ -97,9 +97,81 @@ fn fixture_corpus_generate_50k(c: &mut Criterion) {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// M1-3: "incremental index check scales with changed-file count, not
+/// corpus size." Builds a 50k-item index once (outside the timed loop),
+/// then times [`wkp_core::index::update_index`] re-applying a small,
+/// fixed set of changed items against it -- the scenario `wkp index`
+/// hits on every run after the first: most of the corpus is untouched,
+/// a handful of files changed.
+///
+/// Honest caveat, documented rather than hidden: `update_index` still
+/// copies the whole `index.db` file via `VACUUM INTO` to honor the
+/// never-write-in-place rule (CLAUDE.md), so the on-disk I/O is
+/// proportional to corpus size, not change count. What *is* proportional
+/// to change count -- and was the actual cost the old Python tool paid
+/// per file on every run (design 5.1: "detects change by running
+/// `git hash-object` on every file") -- is the parsing/tokenizing work
+/// this benchmark's setup does once per changed item, not once per corpus
+/// item. See `crates/wkp-core/src/index.rs`'s `update_index` doc comment.
+///
+/// This benchmark measured 383-462ms mean on the 50k fixture across two
+/// separate ubuntu-latest CI runs (tmpfs, 20 samples) for a 10-item change
+/// -- design 4.3's incremental-index target (p50 < 30ms / p95 < 100ms) is
+/// missed by roughly an order of magnitude either way, because `VACUUM
+/// INTO`'s copy dominates. This is a real design-vs-reality conflict, not a
+/// bug: see
+/// `docs/adr/0002-incremental-index-write-mechanism.md` for the options and
+/// the (not yet made) decision. `benches/baseline.json`'s entry for this
+/// bench exists to catch a *further* regression on top of this
+/// already-known-slow path, not to imply the target is currently met.
+fn incremental_update_50k_corpus(c: &mut Criterion) {
+    let dir = bench_dir("incremental-50k");
+    let dest = dir.join("index.db");
+
+    let corpus_dir = bench_dir("incremental-50k-source");
+    support::generate_corpus(&corpus_dir, 50_000, 7).expect("generate 50k fixture corpus");
+    let initial: Vec<wkp_core::index::Item> =
+        (0..50_000).map(|i| corpus_item(&corpus_dir, i)).collect();
+    wkp_core::index::build_index(&dest, &initial).expect("build initial 50k index");
+
+    // A realistic incremental run: a handful of items changed, the other
+    // 49,990 untouched.
+    let changed: Vec<wkp_core::index::Item> = (0..10)
+        .map(|i| {
+            let mut item = corpus_item(&corpus_dir, i);
+            item.body.push_str("\nedited for the incremental bench\n");
+            item
+        })
+        .collect();
+
+    let mut group = c.benchmark_group("incremental_update_50k_corpus");
+    group.sample_size(20);
+    group.bench_function("10_changed", |b| {
+        b.iter(|| {
+            wkp_core::index::update_index(black_box(&dest), black_box(&changed), &[]).unwrap();
+        })
+    });
+    group.finish();
+
+    let _ = std::fs::remove_dir_all(&dir);
+    let _ = std::fs::remove_dir_all(&corpus_dir);
+}
+
+fn corpus_item(dir: &Path, i: usize) -> wkp_core::index::Item {
+    let path = format!("item-{i:06}.md");
+    let contents = std::fs::read_to_string(dir.join(&path)).expect("read fixture item");
+    let parsed = wkp_core::frontmatter::parse(&contents);
+    wkp_core::index::Item {
+        path,
+        frontmatter: parsed.frontmatter,
+        body: parsed.body,
+    }
+}
+
 criterion_group!(
     benches,
     fixture_corpus_generate_5k,
-    fixture_corpus_generate_50k
+    fixture_corpus_generate_50k,
+    incremental_update_50k_corpus
 );
 criterion_main!(benches);
