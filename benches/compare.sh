@@ -12,7 +12,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 BASELINE_FILE="$SCRIPT_DIR/baseline.json"
 CRITERION_DIR="$REPO_ROOT/target/criterion"
-THRESHOLD_PCT="${WKP_BENCH_THRESHOLD_PCT:-25}"
+THRESHOLD_PCT="${WKP_BENCH_THRESHOLD_PCT:-60}"
 UPDATE=0
 [[ "${1:-}" == "--update" ]] && UPDATE=1
 

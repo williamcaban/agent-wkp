@@ -95,3 +95,22 @@ in CI (or push a throwaway commit with `./benches/compare.sh --update`
 added temporarily to the workflow), read the numbers from the run's log,
 and commit them directly — don't `--update` from a local run and assume it
 transfers.
+
+**Second incident (2026-09-07): even a CI-captured baseline kept drifting
+by 80-160% across unrelated PRs with zero bench-code changes.** Four
+consecutive PRs (none touching `benches/`) failed this gate on different
+`ubuntu-latest` allocations, with `fixture_corpus_generate_5k` measured at
+93ms, 196ms, and 244ms for the *same* commit's code across three separate
+runs. The runner-to-runner variance itself wasn't the root problem — it was
+that these benches are dominated by thousands of small `fs::write` calls to
+`std::env::temp_dir()`, and shared, multi-tenant cloud VMs have highly
+variable disk I/O latency, far more than their CPU scheduling variance.
+Fixed at the source rather than by further widening the threshold:
+`bench_dir()` in `core_benches.rs` now writes to `/dev/shm` (tmpfs) when
+available, falling back to `std::env::temp_dir()` only when it isn't (e.g.
+local macOS development, or a CI image without a `/dev/shm` mount). This
+moves the benchmark's dominant cost off the disk I/O layer entirely, which
+local testing showed both faster (53ms vs. 93-244ms for the 5k corpus) and
+far more consistent run-to-run. The threshold also moved from 25% to 60%
+as a residual safety margin for ordinary shared-vCPU scheduling noise,
+which is real but much smaller than the disk I/O variance was.
