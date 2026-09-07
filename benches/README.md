@@ -1,0 +1,97 @@
+# Benchmarks
+
+Criterion benchmarks for `wkp-core`, per design 9.5 ("Criterion benchmarks
+for the operations in 4.3, with a regression threshold that fails the PR").
+
+## Current state (M0 task 5)
+
+Design 4.3 sets latency targets for cold `wkp search`, incremental index,
+`wkp remember`, and `wkp materialize`. None of that exists yet — it lands
+starting M1 (`docs/plan/milestones.md`). Benchmarking functions that don't
+exist would mean either stub numbers that mean nothing, or premature
+feature code that belongs in M1's own PRs, not this one.
+
+Instead, this harness benchmarks the one real, load-bearing operation
+available today: `support::generate_corpus` in
+`crates/wkp-core/benches/support.rs`, which deterministically writes N
+synthetic markdown+frontmatter files to disk. Every M1 bench (`wkp index`
+cold and incremental, `wkp search`, `wkp materialize`) will need a fixture
+corpus at realistic scale, so this is the actual shared dependency of all of
+them, not a placeholder invented to have something to measure. Two sizes,
+matching the "5k and 50k items" in the task:
+
+- `fixture_corpus_generate_5k`
+- `fixture_corpus_generate_50k` (fewer samples — `sample_size(10)` — since
+  50k files/iteration is expensive; see `core_benches.rs`)
+
+**When M1 lands real search/index/materialize functions**, add benches for
+them here alongside (not instead of) the fixture-generation ones, reusing
+the same corpora. Update `BENCHES` in `compare.sh` and re-run
+`--update` to seed their baselines.
+
+## Running
+
+```bash
+cargo bench -p wkp-core
+./benches/compare.sh              # compare the run above against baseline.json
+./benches/compare.sh --update     # rewrite baseline.json from the run above
+```
+
+`compare.sh` reads Criterion's `target/criterion/<bench>/new/estimates.json`
+(`mean.point_estimate`, nanoseconds) for each bench listed in its `BENCHES`
+map and compares it to the matching entry in `baseline.json`.
+
+## Regression threshold
+
+Default: **25%** over baseline, via `WKP_BENCH_THRESHOLD_PCT` (override for
+one run, e.g. `WKP_BENCH_THRESHOLD_PCT=10 ./benches/compare.sh`). This is a
+first cut, not a measured constant:
+
+- It's wide enough to absorb noise from shared CI runners (no dedicated
+  benchmark hardware yet), which the current fixture-generation benches
+  already show some variance on even locally (single-digit percent between
+  runs on this machine).
+- It has not been tuned against real regressions vs. real noise, because
+  there's no real operation to regress yet. **Revisit this number once M1's
+  search/index/materialize benches exist** and there's enough run-to-run
+  data to set it from evidence instead of a round number.
+
+A bench with no entry in `baseline.json` is reported `NEW` and does not
+fail the run — `--update` establishes a baseline for it once you're
+satisfied with the numbers.
+
+## Fixture corpus
+
+`crates/wkp-core/benches/support.rs` is deliberately dependency-free: a
+26-line inline xorshift PRNG instead of pulling in `rand`, and manual
+`std::env::temp_dir()` handling instead of `tempfile` — fixture generation
+for a benchmark harness doesn't need either, and CLAUDE.md requires
+justifying every new dependency. `criterion` itself (dev-dependency only,
+never shipped in the release binary) is the one new dependency this task
+adds; its transitive dependency tree is recorded in
+`supply-chain/config.toml` as `cargo vet` exemptions under the
+`safe-to-run` criteria (dev/build-time only, not `safe-to-deploy`).
+
+Corpus generation is deterministic for a given `(count, seed)` — reruns
+produce byte-identical files — so benchmark numbers reflect the operation
+being measured, not fixture-content variance.
+
+## CI
+
+`.github/workflows/rust-ci.yml`'s `bench` job runs `cargo bench -p wkp-core`
+then `./benches/compare.sh` on every push/PR to `main`/`v2-rust`. A shared
+GitHub-hosted runner is not dedicated benchmark hardware, so treat a
+borderline `FAIL` as a prompt to re-run before assuming a real regression,
+especially until M1's real operations replace these fixture-generation
+placeholders.
+
+**`baseline.json` must be captured on a GitHub-hosted runner, not a
+developer machine.** The first version of this file was generated locally
+and immediately failed CI: the GitHub-hosted `ubuntu-latest` runner was
+~70-90% slower than the local dev box for both benches, blowing well past
+even the generous 25% threshold — not a real regression, just different
+hardware. To regenerate the baseline correctly, run the `bench` job's steps
+in CI (or push a throwaway commit with `./benches/compare.sh --update`
+added temporarily to the workflow), read the numbers from the run's log,
+and commit them directly — don't `--update` from a local run and assume it
+transfers.

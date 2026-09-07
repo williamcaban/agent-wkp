@@ -10,3 +10,10 @@ repository.workspace = true
 
 [lib]
 name = "wkp_core"
+
+[dev-dependencies]
+criterion = { version = "0.5", default-features = false, features = ["cargo_bench_support"] }
+
+[[bench]]
+name = "core_benches"
+harness = false

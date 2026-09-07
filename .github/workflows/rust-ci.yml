@@ -60,6 +60,24 @@ jobs:
       - name: cargo vet check
         run: cargo vet check
 
+  bench:
+    name: bench (regression gate)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: dtolnay/rust-toolchain@d1031067263f94b142dd6c0ce24c5eb9d02d52a0 # master, 2026-09-03
+        with:
+          toolchain: "1.98.1" # keep in sync with rust-toolchain.toml
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+
+      - name: cargo bench -p wkp-core
+        run: cargo bench -p wkp-core
+
+      - name: compare against benches/baseline.json
+        run: ./benches/compare.sh
+
   semgrep:
     name: semgrep (rust ruleset)
     runs-on: ubuntu-latest
