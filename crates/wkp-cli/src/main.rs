@@ -1292,6 +1292,25 @@ mod tests {
         assert!(hits.is_empty());
     }
 
+    /// M2-1 acceptance criterion: `wkp init` wires up SSH commit signing --
+    /// the store carries an `allowed_signers` file (not gitignored, unlike
+    /// `.wkp/index.db`/`tier0.md`: this one needs to sync with the store)
+    /// and local git config points `gpg.ssh.allowedSignersFile` at it.
+    #[test]
+    fn run_init_wires_ssh_signing_config() {
+        let temp = temp_dir("run-init-ssh-signing");
+        let dir = temp.path();
+        test_init(dir).expect("run_init");
+
+        assert!(dir.join("allowed_signers").is_file());
+
+        let gitignore = std::fs::read_to_string(dir.join(".gitignore")).expect("read .gitignore");
+        assert!(
+            !gitignore.contains("allowed_signers"),
+            "allowed_signers must be tracked, not gitignored -- the store carries it"
+        );
+    }
+
     #[test]
     fn run_init_is_idempotent_and_preserves_existing_gitignore_entries() {
         let temp = temp_dir("run-init-idempotent");
