@@ -5,7 +5,9 @@
 //! see `docs/plan/milestones.md`. For now only `--version` is wired up.
 
 fn main() {
-    match std::env::args().nth(1).as_deref() {
+    // Dispatching on a CLI flag, not a security-sensitive use of argv.
+    let arg = std::env::args().nth(1); // nosemgrep: rust.lang.security.args.args
+    match arg.as_deref() {
         Some("--version" | "-V") => {
             println!("wkp {}", env!("CARGO_PKG_VERSION"));
         }
