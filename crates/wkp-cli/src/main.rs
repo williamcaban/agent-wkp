@@ -112,14 +112,16 @@ fn main() {
                 eprintln!("{msg}");
                 std::process::exit(1);
             }
-            let path = args
-                .next()
-                .map(PathBuf::from)
-                .unwrap_or_else(|| std::env::current_dir().expect("wkp: cannot read cwd"));
-            match run_index(&path) {
-                Ok(summary) => println!("{summary}"),
+            match parse_index_args(args) {
+                Ok(opts) => match run_index_cli(&opts) {
+                    Ok(summary) => println!("{summary}"),
+                    Err(msg) => {
+                        eprintln!("wkp: index failed: {msg}");
+                        std::process::exit(1);
+                    }
+                },
                 Err(msg) => {
-                    eprintln!("wkp: index failed: {msg}");
+                    eprintln!("wkp: {msg}");
                     std::process::exit(1);
                 }
             }
@@ -483,7 +485,27 @@ impl std::fmt::Display for IndexSummary {
 /// entries gives the full current path universe, compared against
 /// [`wkp_core::index::known_paths`] (what the index already has a row
 /// for) to find genuinely new and genuinely gone paths.
+/// Test-only convenience wrapper: every existing test predates M1-9's
+/// `--embed-url` trio and just wants plain, non-embedding indexing.
+#[cfg(test)]
 fn run_index(path: &Path) -> Result<IndexSummary, String> {
+    run_index_impl(path, None, None, None)
+}
+
+/// The actual body of `wkp index`, with the `--embed-url` trio injectable
+/// so every existing test calling the plain [`run_index`] (no embeddings
+/// involved) is unaffected by M1-9's addition. Embeddings, when
+/// requested, are computed and attached to each upserted [`wkp_core::index::Item`]
+/// *before* [`wkp_core::index::update_index`] runs -- landing in the same
+/// atomic temp-file-then-rename write as everything else, never as a
+/// separate write against the already-published `index.db` (CLAUDE.md's
+/// "never write a file a harness reads in place").
+fn run_index_impl(
+    path: &Path,
+    embed_url: Option<&str>,
+    embed_model: Option<&str>,
+    embed_key_file: Option<&Path>,
+) -> Result<IndexSummary, String> {
     let changes = wkp_git::detect_changes(path)?;
     let tracked = wkp_git::list_tracked_files(path)?;
     let is_markdown = |p: &Path| p.extension().is_some_and(|ext| ext == "md");
@@ -545,7 +567,12 @@ fn run_index(path: &Path) -> Result<IndexSummary, String> {
             path: (*relative).clone(),
             frontmatter: parsed.frontmatter,
             body: parsed.body,
+            embedding: None,
         });
+    }
+
+    if let Some(embed_url) = embed_url {
+        embed_upserts(&mut upserts, embed_url, embed_model, embed_key_file)?;
     }
 
     let summary = IndexSummary {
@@ -559,8 +586,190 @@ fn run_index(path: &Path) -> Result<IndexSummary, String> {
     Ok(summary)
 }
 
+/// Parses `wkp index [path] [--embed-url URL] [--embed-model NAME]
+/// [--embed-key-file PATH]`. The three `--embed-*` flags are always
+/// parsed regardless of whether this binary was built with the `embed`
+/// Cargo feature, so passing them to a non-`embed` build fails with a
+/// clear message from [`embed_upserts`] rather than "unrecognized
+/// argument".
+fn parse_index_args(mut args: impl Iterator<Item = String>) -> Result<IndexOptions, String> {
+    let mut path = std::env::current_dir().map_err(|e| e.to_string())?;
+    let mut embed_url = None;
+    let mut embed_model = None;
+    let mut embed_key_file = None;
+
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--embed-url" => {
+                embed_url = Some(args.next().ok_or("--embed-url requires a value")?);
+            }
+            "--embed-model" => {
+                embed_model = Some(args.next().ok_or("--embed-model requires a value")?);
+            }
+            "--embed-key-file" => {
+                embed_key_file = Some(PathBuf::from(
+                    args.next().ok_or("--embed-key-file requires a value")?,
+                ));
+            }
+            other if !other.starts_with('-') => path = PathBuf::from(other),
+            other => return Err(format!("unrecognized argument: {other}")),
+        }
+    }
+    Ok(IndexOptions {
+        path,
+        embed_url,
+        embed_model,
+        embed_key_file,
+    })
+}
+
+struct IndexOptions {
+    path: PathBuf,
+    embed_url: Option<String>,
+    embed_model: Option<String>,
+    embed_key_file: Option<PathBuf>,
+}
+
+fn run_index_cli(opts: &IndexOptions) -> Result<IndexSummary, String> {
+    run_index_impl(
+        &opts.path,
+        opts.embed_url.as_deref(),
+        opts.embed_model.as_deref(),
+        opts.embed_key_file.as_deref(),
+    )
+}
+
 fn path_to_store_string(p: &Path) -> String {
     p.to_string_lossy().into_owned()
+}
+
+/// Reads an embedding-endpoint API key from a file. CLAUDE.md's hard rule
+/// ("secrets never touch argv or environment variables") rules out both
+/// `--embed-api-key <key>` on argv and an env var like agent-wkp's
+/// `WKP_EMBED_API_KEY` -- a `0600` file (or, for a local no-auth endpoint
+/// like Ollama/llama.cpp, no key at all) is the only supported path.
+#[cfg(feature = "embed")]
+fn read_embed_key_file(path: &Path) -> Result<String, String> {
+    use std::os::unix::fs::PermissionsExt;
+    let meta =
+        std::fs::metadata(path).map_err(|e| format!("--embed-key-file {}: {e}", path.display()))?;
+    let mode = meta.permissions().mode() & 0o777;
+    if mode != 0o600 {
+        return Err(format!(
+            "--embed-key-file {} must be mode 0600 (found {mode:03o}); run `chmod 600 {}`",
+            path.display(),
+            path.display()
+        ));
+    }
+    let contents = std::fs::read_to_string(path)
+        .map_err(|e| format!("reading --embed-key-file {}: {e}", path.display()))?;
+    Ok(contents.trim().to_string())
+}
+
+#[cfg(feature = "embed")]
+fn build_embed_config(
+    embed_url: &str,
+    embed_model: Option<&str>,
+    embed_key_file: Option<&Path>,
+) -> Result<wkp_core::embed::EmbedConfig, String> {
+    let api_key = match embed_key_file {
+        Some(p) => Some(read_embed_key_file(p)?),
+        None => None,
+    };
+    Ok(wkp_core::embed::EmbedConfig {
+        url: embed_url.to_string(),
+        api_key,
+        model: embed_model.map(str::to_string),
+    })
+}
+
+/// Embeds `title\n\nbody` for every item in `items` via the configured
+/// endpoint (design 5.3, M1-9), in place. A single item's embedding
+/// failure is a warning on stderr, not a fatal error for the whole `wkp
+/// index` run -- one unreachable/misconfigured endpoint mid-run shouldn't
+/// stop the (already-working) plain text index from being updated.
+#[cfg(feature = "embed")]
+fn embed_upserts(
+    items: &mut [wkp_core::index::Item],
+    embed_url: &str,
+    embed_model: Option<&str>,
+    embed_key_file: Option<&Path>,
+) -> Result<(), String> {
+    let config = build_embed_config(embed_url, embed_model, embed_key_file)?;
+    for item in items.iter_mut() {
+        let text = format!(
+            "{}\n\n{}",
+            item.frontmatter.title.clone().unwrap_or_default(),
+            item.body
+        );
+        match wkp_core::embed::embed_remote(&text, &config) {
+            Ok(vector) => item.embedding = Some(vector),
+            Err(e) => eprintln!("wkp: warning: could not embed {}: {e}", item.path),
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(feature = "embed"))]
+fn embed_upserts(
+    _items: &mut [wkp_core::index::Item],
+    _embed_url: &str,
+    _embed_model: Option<&str>,
+    _embed_key_file: Option<&Path>,
+) -> Result<(), String> {
+    Err(
+        "this binary was built without hybrid search support (rebuild with `--features embed`); \
+         omit --embed-url to index without embeddings"
+            .to_string(),
+    )
+}
+
+/// Runs a hybrid (BM25 + vector similarity) search, falling back to plain
+/// BM25 with a stderr warning on any failure: a network error, or the
+/// embedding endpoint's vector dimension not matching what's stored in
+/// the index (design 5.3: "remains available... but only when the user
+/// configures an endpoint", never blocking the default search path).
+#[cfg(feature = "embed")]
+fn run_hybrid_or_fallback(
+    conn: &wkp_core::index::Connection,
+    query: &str,
+    embed_url: &str,
+    embed_model: Option<&str>,
+    embed_key_file: Option<&Path>,
+    filter: &wkp_core::index::SearchFilter,
+) -> Result<Vec<wkp_core::index::SearchHit>, String> {
+    let config = build_embed_config(embed_url, embed_model, embed_key_file)?;
+    let fallback_warning = |detail: &dyn std::fmt::Display| {
+        eprintln!(
+            "wkp: warning: semantic search unavailable ({detail}); falling back to BM25 keyword search."
+        );
+    };
+    match wkp_core::embed::embed_remote(query, &config) {
+        Ok(query_vector) => {
+            match wkp_core::index::hybrid_search(conn, query, &query_vector, filter) {
+                Ok(hits) => return Ok(hits),
+                Err(e) => fallback_warning(&e),
+            }
+        }
+        Err(e) => fallback_warning(&e),
+    }
+    wkp_core::index::search(conn, query, filter).map_err(|e| e.to_string())
+}
+
+#[cfg(not(feature = "embed"))]
+fn run_hybrid_or_fallback(
+    _conn: &wkp_core::index::Connection,
+    _query: &str,
+    _embed_url: &str,
+    _embed_model: Option<&str>,
+    _embed_key_file: Option<&Path>,
+    _filter: &wkp_core::index::SearchFilter,
+) -> Result<Vec<wkp_core::index::SearchHit>, String> {
+    Err(
+        "this binary was built without hybrid search support (rebuild with `--features embed`); \
+         omit --embed-url to use BM25 keyword search"
+            .to_string(),
+    )
 }
 
 struct MaterializeOptions {
@@ -701,6 +910,12 @@ struct SearchOptions {
     budget: Option<u32>,
     limit: Option<usize>,
     format: SearchFormat,
+    /// M1-9, `wkp search` only (`wkp context` rejects it -- see
+    /// `run_context`): opts into hybrid BM25+vector search against this
+    /// OpenAI-compatible embeddings endpoint.
+    embed_url: Option<String>,
+    embed_model: Option<String>,
+    embed_key_file: Option<PathBuf>,
 }
 
 /// Parses `wkp search <query> [--tier N] [--budget N] [-k/--limit N]
@@ -716,9 +931,23 @@ fn parse_search_args(mut args: impl Iterator<Item = String>) -> Result<SearchOpt
     let mut budget = None;
     let mut limit = None;
     let mut format = SearchFormat::Text;
+    let mut embed_url = None;
+    let mut embed_model = None;
+    let mut embed_key_file = None;
 
     while let Some(arg) = args.next() {
         match arg.as_str() {
+            "--embed-url" => {
+                embed_url = Some(args.next().ok_or("--embed-url requires a value")?);
+            }
+            "--embed-model" => {
+                embed_model = Some(args.next().ok_or("--embed-model requires a value")?);
+            }
+            "--embed-key-file" => {
+                embed_key_file = Some(PathBuf::from(
+                    args.next().ok_or("--embed-key-file requires a value")?,
+                ));
+            }
             "--tier" => {
                 let v = args.next().ok_or("--tier requires a value")?;
                 tier = Some(
@@ -772,12 +1001,18 @@ fn parse_search_args(mut args: impl Iterator<Item = String>) -> Result<SearchOpt
         budget,
         limit,
         format,
+        embed_url,
+        embed_model,
+        embed_key_file,
     })
 }
 
 /// `wkp search <query>`: BM25 full-text search over `index.db` (design
 /// 5.3), with tier and token-budget filters. Never touches the network
-/// (design 5.3 / CLAUDE.md: no embedding calls in the default search path).
+/// unless `--embed-url` is given (design 5.3 / CLAUDE.md: no embedding
+/// calls in the *default* search path) -- with it, hybrid search falls
+/// back to plain BM25 on any failure, so `wkp search` itself never fails
+/// just because an embedding endpoint is unreachable.
 fn run_search(opts: &SearchOptions) -> Result<String, String> {
     let index_path = opts.path.join(".wkp/index.db");
     let conn = wkp_core::index::open_index(&index_path).map_err(|e| e.to_string())?;
@@ -787,7 +1022,17 @@ fn run_search(opts: &SearchOptions) -> Result<String, String> {
         limit: opts.limit,
         ..Default::default()
     };
-    let hits = wkp_core::index::search(&conn, &opts.query, &filter).map_err(|e| e.to_string())?;
+    let hits = match &opts.embed_url {
+        Some(embed_url) => run_hybrid_or_fallback(
+            &conn,
+            &opts.query,
+            embed_url,
+            opts.embed_model.as_deref(),
+            opts.embed_key_file.as_deref(),
+            &filter,
+        )?,
+        None => wkp_core::index::search(&conn, &opts.query, &filter).map_err(|e| e.to_string())?,
+    };
     Ok(match opts.format {
         SearchFormat::Text => format_text(&hits),
         SearchFormat::Paths => format_paths(&hits),
@@ -799,8 +1044,17 @@ fn run_search(opts: &SearchOptions) -> Result<String, String> {
 /// hits (design 5.1/5.4, M1-5), combined under one token budget. Reuses
 /// `parse_search_args`/`SearchOptions` -- `context`'s "topic" plays the
 /// same positional-argument role as `search`'s "query", and both take the
-/// same `--tier`/`--budget`/`--format` flags.
+/// same `--tier`/`--budget`/`--format` flags. `--embed-url` is parsed (it's
+/// a `SearchOptions` field) but not supported here -- M1-9 scoped hybrid
+/// search to `wkp search` only; combining it with `context`'s own graph
+/// traversal is deliberately left to a later task rather than silently
+/// ignoring the flag.
 fn run_context(opts: &SearchOptions) -> Result<String, String> {
+    if opts.embed_url.is_some() {
+        return Err(
+            "--embed-url is not supported by `wkp context` yet (only `wkp search`)".to_string(),
+        );
+    }
     let index_path = opts.path.join(".wkp/index.db");
     let conn = wkp_core::index::open_index(&index_path).map_err(|e| e.to_string())?;
     let filter = wkp_core::index::SearchFilter {
@@ -1158,6 +1412,90 @@ mod tests {
         assert!(result.is_err());
     }
 
+    #[test]
+    fn parse_search_args_reads_embed_flags() {
+        let opts = parse_search_args(args(&[
+            "topic",
+            "--embed-url",
+            "http://localhost:11434/v1",
+            "--embed-model",
+            "nomic-embed-text",
+            "--embed-key-file",
+            "/tmp/key",
+        ]))
+        .expect("parse_search_args");
+        assert_eq!(opts.embed_url.as_deref(), Some("http://localhost:11434/v1"));
+        assert_eq!(opts.embed_model.as_deref(), Some("nomic-embed-text"));
+        assert_eq!(opts.embed_key_file, Some(PathBuf::from("/tmp/key")));
+    }
+
+    #[test]
+    fn parse_search_args_defaults_embed_flags_to_none() {
+        let opts = parse_search_args(args(&["topic"])).expect("parse_search_args");
+        assert_eq!(opts.embed_url, None);
+        assert_eq!(opts.embed_model, None);
+        assert_eq!(opts.embed_key_file, None);
+    }
+
+    #[test]
+    fn parse_index_args_reads_path_and_embed_flags() {
+        let opts = parse_index_args(args(&[
+            "/tmp/store",
+            "--embed-url",
+            "http://localhost:11434/v1",
+            "--embed-model",
+            "m",
+            "--embed-key-file",
+            "/tmp/key",
+        ]))
+        .expect("parse_index_args");
+        assert_eq!(opts.path, PathBuf::from("/tmp/store"));
+        assert_eq!(opts.embed_url.as_deref(), Some("http://localhost:11434/v1"));
+        assert_eq!(opts.embed_model.as_deref(), Some("m"));
+        assert_eq!(opts.embed_key_file, Some(PathBuf::from("/tmp/key")));
+    }
+
+    #[test]
+    fn parse_index_args_defaults_to_cwd_and_no_embed_flags() {
+        let opts = parse_index_args(args(&[])).expect("parse_index_args");
+        assert_eq!(opts.embed_url, None);
+        assert_eq!(opts.embed_model, None);
+        assert_eq!(opts.embed_key_file, None);
+    }
+
+    #[test]
+    fn run_context_rejects_embed_url() {
+        let temp = temp_dir("context-rejects-embed-url");
+        let dir = temp.path();
+        test_init(dir).expect("run_init");
+        let mut opts = search_opts(dir, "anything", SearchFormat::Text);
+        opts.embed_url = Some("http://localhost:11434/v1".to_string());
+        let result = run_context(&opts);
+        assert!(
+            result.is_err(),
+            "wkp context must reject --embed-url (M1-9 scoped hybrid search to wkp search only)"
+        );
+    }
+
+    /// The default (no `embed` feature) build must still parse and accept
+    /// `--embed-url` at the CLI-argument level -- it fails later, inside
+    /// `run_hybrid_or_fallback`/`embed_upserts`, with a clear message,
+    /// rather than at argument parsing with "unrecognized argument".
+    #[test]
+    #[cfg(not(feature = "embed"))]
+    fn run_search_with_embed_url_on_a_non_embed_build_fails_clearly_not_as_unrecognized_arg() {
+        let temp = temp_dir("search-embed-url-no-feature");
+        let dir = temp.path();
+        test_init(dir).expect("run_init");
+        let mut opts = search_opts(dir, "anything", SearchFormat::Text);
+        opts.embed_url = Some("http://localhost:11434/v1".to_string());
+        let err = run_search(&opts).expect_err("expected a clear feature-not-built error");
+        assert!(
+            err.contains("--features embed"),
+            "expected a rebuild-with-features message, got: {err}"
+        );
+    }
+
     fn search_opts(dir: &Path, query: &str, format: SearchFormat) -> SearchOptions {
         SearchOptions {
             path: dir.to_path_buf(),
@@ -1166,6 +1504,9 @@ mod tests {
             budget: None,
             limit: None,
             format,
+            embed_url: None,
+            embed_model: None,
+            embed_key_file: None,
         }
     }
 
@@ -1657,5 +1998,108 @@ mod tests {
 
         let hits = search_paths(dir, "predates");
         assert_eq!(hits, vec!["memory/old_style_note.md"]);
+    }
+
+    #[cfg(feature = "embed")]
+    #[test]
+    fn read_embed_key_file_rejects_a_world_readable_file() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = temp_dir("embed-key-file-perms");
+        let path = temp.path().join("key");
+        std::fs::write(&path, "secret\n").expect("write key file");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).expect("chmod 644");
+        let err = read_embed_key_file(&path).expect_err("expected a permission error");
+        assert!(err.contains("0600"), "expected a 0600 hint, got: {err}");
+    }
+
+    #[cfg(feature = "embed")]
+    #[test]
+    fn read_embed_key_file_reads_a_0600_file_and_trims_whitespace() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = temp_dir("embed-key-file-ok");
+        let path = temp.path().join("key");
+        std::fs::write(&path, "secret-key\n").expect("write key file");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).expect("chmod 600");
+        let key = read_embed_key_file(&path).expect("read_embed_key_file");
+        assert_eq!(key, "secret-key");
+    }
+
+    /// A minimal, hand-rolled HTTP/1.1 server on loopback that answers
+    /// `connections` requests with the same fixed embedding response, then
+    /// stops -- exercises `run_index_cli`/`run_search`'s real network path
+    /// end to end without a real network call or a mocking dependency.
+    #[cfg(feature = "embed")]
+    fn serve_fixed_embedding(response_json: &'static str, connections: usize) -> String {
+        use std::io::{BufRead, BufReader, Write};
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback listener");
+        let addr = listener.local_addr().expect("local_addr");
+        std::thread::spawn(move || {
+            for stream in listener.incoming().take(connections) {
+                let stream = stream.expect("accept connection");
+                let mut reader = BufReader::new(stream.try_clone().expect("clone stream"));
+                let mut request_line = String::new();
+                reader
+                    .read_line(&mut request_line)
+                    .expect("read request line");
+                loop {
+                    let mut line = String::new();
+                    reader.read_line(&mut line).expect("read header line");
+                    if line == "\r\n" || line.is_empty() {
+                        break;
+                    }
+                }
+                let mut stream = stream;
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    response_json.len(),
+                    response_json
+                );
+                stream
+                    .write_all(response.as_bytes())
+                    .expect("write response");
+            }
+        });
+        format!("http://{addr}")
+    }
+
+    /// End-to-end (M1-9): `wkp index --embed-url` stores an embedding as
+    /// part of the same atomic write as everything else, and `wkp search
+    /// --embed-url` then uses it via `hybrid_search` instead of falling
+    /// back to BM25 -- exercised through the same `run_index_cli`/
+    /// `run_search` entry points the CLI dispatch calls, against a real
+    /// (loopback) HTTP server, not just the pure-Rust fusion math already
+    /// covered in `wkp-core`.
+    #[cfg(feature = "embed")]
+    #[test]
+    fn end_to_end_index_and_search_with_embed_url_uses_hybrid_search() {
+        let temp = temp_dir("embed-end-to-end");
+        let dir = temp.path();
+        test_init(dir).expect("run_init");
+        std::fs::write(
+            dir.join("a.md"),
+            "---\ntitle: A\ntype: knowledge\n---\n\nfindable content\n",
+        )
+        .expect("write a.md");
+        wkp_git::commit_all(dir, "seed").expect("commit_all");
+
+        // One embedding request from `wkp index`, one more from `wkp
+        // search`'s own query embedding.
+        let url = serve_fixed_embedding(r#"{"data":[{"embedding":[1.0,0.0,0.0]}]}"#, 2);
+
+        let index_opts = IndexOptions {
+            path: dir.to_path_buf(),
+            embed_url: Some(url.clone()),
+            embed_model: None,
+            embed_key_file: None,
+        };
+        let summary = run_index_cli(&index_opts).expect("run_index_cli with --embed-url");
+        assert_eq!(summary.added, 1);
+
+        let mut search_options = search_opts(dir, "findable", SearchFormat::Paths);
+        search_options.embed_url = Some(url);
+        let output = run_search(&search_options).expect("run_search with --embed-url");
+        assert_eq!(output, "a.md");
     }
 }

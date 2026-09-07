@@ -18,3 +18,8 @@ wkp-git = { path = "../wkp-git" }
 
 [dev-dependencies]
 tempfile = "3.27.0"
+
+[features]
+# M1-9: forwards to wkp-core's own opt-in hybrid-search feature. See
+# crates/wkp-core/Cargo.toml and docs/adr/0003-hybrid-search-embed-feature-gate.md.
+embed = ["wkp-core/embed"]

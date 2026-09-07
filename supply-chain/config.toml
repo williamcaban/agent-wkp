@@ -25,9 +25,17 @@ criteria = "safe-to-run"
 version = "1.5.1"
 criteria = "safe-to-run"
 
+[[exemptions.base64]]
+version = "0.23.1"
+criteria = "safe-to-deploy"
+
+[[exemptions.bytes]]
+version = "1.12.1"
+criteria = "safe-to-deploy"
+
 [[exemptions.cfg-if]]
 version = "1.0.4"
-criteria = "safe-to-run"
+criteria = "safe-to-deploy"
 
 [[exemptions.clap]]
 version = "4.6.6"
@@ -66,6 +74,10 @@ version = "2.5.0"
 criteria = "safe-to-run"
 
 [[exemptions.getrandom]]
+version = "0.2.17"
+criteria = "safe-to-deploy"
+
+[[exemptions.getrandom]]
 version = "0.4.3"
 criteria = "safe-to-run"
 
@@ -77,17 +89,25 @@ criteria = "safe-to-run"
 version = "0.5.3"
 criteria = "safe-to-run"
 
+[[exemptions.http]]
+version = "1.5.0"
+criteria = "safe-to-deploy"
+
+[[exemptions.httparse]]
+version = "1.10.1"
+criteria = "safe-to-deploy"
+
 [[exemptions.is-terminal]]
 version = "0.4.17"
 criteria = "safe-to-run"
 
 [[exemptions.itoa]]
 version = "1.0.18"
-criteria = "safe-to-run"
+criteria = "safe-to-deploy"
 
 [[exemptions.libc]]
 version = "0.2.189"
-criteria = "safe-to-run"
+criteria = "safe-to-deploy"
 
 [[exemptions.libsqlite3-sys]]
 version = "0.38.2"
@@ -110,13 +130,17 @@ treated as durable.
 version = "0.12.1"
 criteria = "safe-to-run"
 
+[[exemptions.log]]
+version = "0.4.34"
+criteria = "safe-to-deploy"
+
 [[exemptions.memchr]]
 version = "2.8.3"
 criteria = "safe-to-run"
 
 [[exemptions.once_cell]]
 version = "1.21.4"
-criteria = "safe-to-run"
+criteria = "safe-to-deploy"
 
 [[exemptions.proc-macro2]]
 version = "1.0.107"
@@ -138,6 +162,10 @@ criteria = "safe-to-run"
 version = "0.8.11"
 criteria = "safe-to-run"
 
+[[exemptions.ring]]
+version = "0.17.14"
+criteria = "safe-to-deploy"
+
 [[exemptions.rusqlite]]
 version = "0.40.2"
 criteria = "safe-to-deploy"
@@ -157,6 +185,18 @@ reviewer before being treated as durable.
 version = "1.1.4"
 criteria = "safe-to-run"
 
+[[exemptions.rustls]]
+version = "0.23.44"
+criteria = "safe-to-deploy"
+
+[[exemptions.rustls-pki-types]]
+version = "1.15.1"
+criteria = "safe-to-deploy"
+
+[[exemptions.rustls-webpki]]
+version = "0.103.15"
+criteria = "safe-to-deploy"
+
 [[exemptions.serde]]
 version = "1.0.229"
 criteria = "safe-to-run"
@@ -173,6 +213,10 @@ criteria = "safe-to-run"
 version = "1.0.151"
 criteria = "safe-to-run"
 
+[[exemptions.subtle]]
+version = "2.6.1"
+criteria = "safe-to-deploy"
+
 [[exemptions.syn]]
 version = "2.0.119"
 criteria = "safe-to-run"
@@ -185,9 +229,33 @@ criteria = "safe-to-run"
 version = "1.0.24"
 criteria = "safe-to-run"
 
+[[exemptions.untrusted]]
+version = "0.9.0"
+criteria = "safe-to-deploy"
+
+[[exemptions.ureq]]
+version = "3.4.1"
+criteria = "safe-to-deploy"
+
+[[exemptions.ureq-proto]]
+version = "0.6.2"
+criteria = "safe-to-deploy"
+
+[[exemptions.utf8-zero]]
+version = "0.8.1"
+criteria = "safe-to-deploy"
+
 [[exemptions.walkdir]]
 version = "2.5.0"
 criteria = "safe-to-run"
+
+[[exemptions.wasi]]
+version = "0.11.1+wasi-snapshot-preview1"
+criteria = "safe-to-deploy"
+
+[[exemptions.webpki-roots]]
+version = "1.0.9"
+criteria = "safe-to-deploy"
 
 [[exemptions.winapi-util]]
 version = "0.1.11"
@@ -198,8 +266,48 @@ version = "0.2.1"
 criteria = "safe-to-run"
 
 [[exemptions.windows-sys]]
+version = "0.52.0"
+criteria = "safe-to-deploy"
+
+[[exemptions.windows-sys]]
 version = "0.61.2"
 criteria = "safe-to-run"
+
+[[exemptions.windows-targets]]
+version = "0.52.6"
+criteria = "safe-to-deploy"
+
+[[exemptions.windows_aarch64_gnullvm]]
+version = "0.52.6"
+criteria = "safe-to-deploy"
+
+[[exemptions.windows_aarch64_msvc]]
+version = "0.52.6"
+criteria = "safe-to-deploy"
+
+[[exemptions.windows_i686_gnu]]
+version = "0.52.6"
+criteria = "safe-to-deploy"
+
+[[exemptions.windows_i686_gnullvm]]
+version = "0.52.6"
+criteria = "safe-to-deploy"
+
+[[exemptions.windows_i686_msvc]]
+version = "0.52.6"
+criteria = "safe-to-deploy"
+
+[[exemptions.windows_x86_64_gnu]]
+version = "0.52.6"
+criteria = "safe-to-deploy"
+
+[[exemptions.windows_x86_64_gnullvm]]
+version = "0.52.6"
+criteria = "safe-to-deploy"
+
+[[exemptions.windows_x86_64_msvc]]
+version = "0.52.6"
+criteria = "safe-to-deploy"
 
 [[exemptions.zerocopy]]
 version = "0.8.56"
@@ -208,6 +316,10 @@ criteria = "safe-to-run"
 [[exemptions.zerocopy-derive]]
 version = "0.8.56"
 criteria = "safe-to-run"
+
+[[exemptions.zeroize]]
+version = "1.9.0"
+criteria = "safe-to-deploy"
 
 [[exemptions.zmij]]
 version = "1.0.23"

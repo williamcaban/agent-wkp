@@ -45,6 +45,10 @@ Use `--format paths` to get bare paths for Read tool calls:
 wkp search "guardrails nemo" --format paths -k 5
 ```
 
+#### Optional hybrid search
+
+`wkp search` (only `search`, not yet `context`) additionally supports `--embed-url URL [--embed-model NAME] [--embed-key-file PATH]`: Reciprocal Rank Fusion between BM25 and cosine similarity against an OpenAI-compatible embeddings endpoint (a local Ollama/llama.cpp server, or a hosted one). Falls back to plain BM25 with a stderr warning on any failure — an unreachable endpoint or an embedding-dimension mismatch never makes `wkp search` itself fail. Requires embeddings to already exist (`wkp index --embed-url ...`, same three flags, computed once per changed item) and a binary built with `cargo build --features wkp-cli/embed` — this is opt-in at build time as well as at the command line, so a plain `wkp` may not have it at all; if it doesn't, both commands fail with a message naming the rebuild flag rather than "unrecognized argument". Never call this from a session-start hook or any other default path — it's the one place `wkp` ever makes a network call, and only when a human has explicitly configured `--embed-url`.
+
 ### Assemble context for a topic
 
 ```bash
@@ -70,6 +74,8 @@ wkp index [path]
 Rescans the store rooted at `path` (default cwd) and updates `index.db` incrementally: uses git's own change detection to hash only files that are new, modified, or deleted since the last run — cost is proportional to what changed, not to corpus size. Only `.md` files are indexed. Safe to run at any time.
 
 There is no per-file re-index command — `wkp index` always operates on the whole store, but because it's incremental, running it after editing one file is cheap.
+
+Also takes the same optional `--embed-url URL [--embed-model NAME] [--embed-key-file PATH]` trio as `wkp search` (see below) — when given, computes and stores an embedding for each added/modified item, so a later `wkp search --embed-url ...` has something to compare against. A per-item embedding failure is a warning, not a fatal error for the run.
 
 ### Materialize a tier to disk
 
