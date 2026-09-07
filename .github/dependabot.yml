@@ -1,0 +1,51 @@
+# Dependabot config (design 9.3: "Renovate/Dependabot PRs with grouped,
+# auto-tested updates" against silent dependency drift). Two cargo entries
+# because `fuzz/` is a deliberately detached workspace (fuzz/Cargo.toml has
+# its own `[workspace]` table, see fuzz/Cargo.toml's comment) that
+# Dependabot cannot discover from the root manifest alone.
+#
+# Patch/minor bumps are grouped to cut PR noise; major bumps land as
+# individual PRs since those can change API or behavior and deserve their
+# own review, especially for wkp-sys's bundled-SQLite tree (rusqlite,
+# libsqlite3-sys) called out in PR #24's supply-chain notes.
+version: 2
+updates:
+  - package-ecosystem: "cargo"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 10
+    labels:
+      - "dependencies"
+    groups:
+      patch-and-minor:
+        update-types:
+          - "patch"
+          - "minor"
+    commit-message:
+      prefix: "deps"
+
+  - package-ecosystem: "cargo"
+    directory: "/fuzz"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 5
+    labels:
+      - "dependencies"
+    groups:
+      patch-and-minor:
+        update-types:
+          - "patch"
+          - "minor"
+    commit-message:
+      prefix: "deps(fuzz)"
+
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 5
+    labels:
+      - "dependencies"
+    commit-message:
+      prefix: "ci"
