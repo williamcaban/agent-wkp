@@ -57,6 +57,18 @@ criteria = "safe-to-run"
 version = "1.18.0"
 criteria = "safe-to-run"
 
+[[exemptions.errno]]
+version = "0.3.14"
+criteria = "safe-to-run"
+
+[[exemptions.fastrand]]
+version = "2.5.0"
+criteria = "safe-to-run"
+
+[[exemptions.getrandom]]
+version = "0.4.3"
+criteria = "safe-to-run"
+
 [[exemptions.half]]
 version = "2.7.1"
 criteria = "safe-to-run"
@@ -94,6 +106,10 @@ provenance/release process instead) by a human reviewer before being
 treated as durable.
 """
 
+[[exemptions.linux-raw-sys]]
+version = "0.12.1"
+criteria = "safe-to-run"
+
 [[exemptions.memchr]]
 version = "2.8.3"
 criteria = "safe-to-run"
@@ -104,6 +120,10 @@ criteria = "safe-to-run"
 
 [[exemptions.proc-macro2]]
 version = "1.0.107"
+criteria = "safe-to-run"
+
+[[exemptions.r-efi]]
+version = "6.0.0"
 criteria = "safe-to-run"
 
 [[exemptions.regex]]
@@ -132,6 +152,10 @@ unsafe code written in this workspace. This exemption substitutes for the
 changes and should be replaced with a real `cargo vet certify` by a human
 reviewer before being treated as durable.
 """
+
+[[exemptions.rustix]]
+version = "1.1.4"
+criteria = "safe-to-run"
 
 [[exemptions.serde]]
 version = "1.0.229"

@@ -5,6 +5,7 @@
 //! No `Command::new("git")` is allowed outside this crate (CLAUDE.md hard rule).
 //! Implementation lands starting in M2; see `docs/plan/milestones.md`.
 
+use std::path::Path;
 use std::process::Command;
 
 /// Minimum git version `wkp` requires. Decided in `docs/adr/0001-git-minimum-version.md`:
@@ -85,6 +86,62 @@ fn parse_git_version(raw: &str) -> Option<(u32, u32, u32)> {
     Some((major, minor, patch))
 }
 
+/// Git settings `wkp init` applies to a store repository (design 5.1):
+/// `protocol.version=2` (no full ref advertisement on fetch),
+/// `receive.fsckObjects`/`transfer.fsckObjects` (reject malformed objects),
+/// `core.untrackedCache` (faster status), and enabling the `commit-graph`
+/// maintenance task so `git log` stays fast on long audit histories.
+const INIT_CONFIG_SETTINGS: &[(&str, &str)] = &[
+    ("protocol.version", "2"),
+    ("receive.fsckObjects", "true"),
+    ("transfer.fsckObjects", "true"),
+    ("core.untrackedCache", "true"),
+    ("maintenance.commit-graph.enabled", "true"),
+];
+
+/// Ensures `path` exists and is a git repository, running `git init`
+/// (idempotent: re-running it against an existing repository is a no-op
+/// git already supports) if needed.
+pub fn init_repo(path: &Path) -> Result<(), String> {
+    std::fs::create_dir_all(path).map_err(|e| e.to_string())?;
+    run_git(path, &["init", "--quiet"])
+}
+
+/// Applies the design-5.1 git settings to the repository at `repo_dir`,
+/// then best-effort registers `git maintenance start`'s background
+/// schedule. Registration needs cron or systemd/launchd, which isn't
+/// available in every environment (containers, CI, sandboxes); a failure
+/// there is not fatal to `wkp init`, the same opportunistic posture ADR-0001
+/// takes for the builtin fsmonitor.
+///
+/// All config values here are static and known at compile time, not
+/// user input, but plumbing (`git config`, not the porcelain command) is
+/// used throughout per design 5.1: deterministic, non-interactive, and
+/// immune to a user's global hooks or aliases.
+pub fn apply_init_settings(repo_dir: &Path) -> Result<(), String> {
+    for (key, value) in INIT_CONFIG_SETTINGS {
+        run_git(repo_dir, &["config", "--local", key, value])
+            .map_err(|e| format!("wkp: failed to set git config {key}={value}: {e}"))?;
+    }
+    // Best-effort only; see doc comment above.
+    let _ = run_git(repo_dir, &["maintenance", "start"]);
+    Ok(())
+}
+
+fn run_git(repo_dir: &Path, args: &[&str]) -> Result<(), String> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(repo_dir)
+        .args(args)
+        .output()
+        .map_err(|e| e.to_string())?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(String::from_utf8_lossy(&output.stderr).trim().to_string())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -127,5 +184,98 @@ mod tests {
         // CI, the runner's git dropped below our floor, which is itself
         // worth knowing about.
         assert!(ensure_min_git_version().is_ok());
+    }
+
+    /// `tempfile` rather than `std::env::temp_dir()` + a predictable name:
+    /// the latter is flagged by this repo's semgrep gate as an
+    /// insecure-temp-file pattern (a shared temp directory with a
+    /// guessable name invites symlink/TOCTOU races).
+    struct TempGitRepo {
+        dir: tempfile::TempDir,
+    }
+
+    impl TempGitRepo {
+        fn new(name: &str) -> Self {
+            let dir = tempfile::Builder::new()
+                .prefix(&format!("wkp-git-test-{name}-"))
+                .tempdir()
+                .expect("create temp dir");
+            let status = Command::new("git")
+                .arg("-C")
+                .arg(dir.path())
+                .args(["init", "--quiet"])
+                .status()
+                .expect("run git init");
+            assert!(status.success(), "git init failed");
+            Self { dir }
+        }
+
+        fn path(&self) -> &Path {
+            self.dir.path()
+        }
+    }
+
+    fn git_config_get(repo: &Path, key: &str) -> Option<String> {
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(repo)
+            .args(["config", "--local", "--get", key])
+            .output()
+            .expect("run git config");
+        if output.status.success() {
+            Some(String::from_utf8_lossy(&output.stdout).trim().to_string())
+        } else {
+            None
+        }
+    }
+
+    #[test]
+    fn init_repo_creates_a_working_git_repository() {
+        let temp = tempfile::Builder::new()
+            .prefix("wkp-git-test-init-repo-")
+            .tempdir()
+            .expect("create temp dir");
+        // Point at a not-yet-existing subdirectory; init_repo must create it.
+        let dir = temp.path().join("store");
+        init_repo(&dir).expect("init_repo");
+        assert!(dir.join(".git").is_dir());
+        // Idempotent: a second call on the same path must not error.
+        init_repo(&dir).expect("init_repo again");
+    }
+
+    #[test]
+    fn apply_init_settings_writes_expected_git_config() {
+        let repo = TempGitRepo::new("init-settings");
+        apply_init_settings(repo.path()).expect("apply_init_settings");
+
+        for (key, expected) in INIT_CONFIG_SETTINGS {
+            assert_eq!(
+                git_config_get(repo.path(), key).as_deref(),
+                Some(*expected),
+                "unexpected value for {key}"
+            );
+        }
+    }
+
+    #[test]
+    fn apply_init_settings_is_idempotent() {
+        let repo = TempGitRepo::new("init-settings-idempotent");
+        apply_init_settings(repo.path()).expect("first apply");
+        apply_init_settings(repo.path()).expect("second apply");
+
+        for (key, expected) in INIT_CONFIG_SETTINGS {
+            assert_eq!(git_config_get(repo.path(), key).as_deref(), Some(*expected));
+        }
+    }
+
+    #[test]
+    fn apply_init_settings_fails_clearly_outside_a_git_repo() {
+        let dir = tempfile::Builder::new()
+            .prefix("wkp-git-test-not-a-repo-")
+            .tempdir()
+            .expect("create temp dir");
+
+        let result = apply_init_settings(dir.path());
+        assert!(result.is_err(), "expected an error outside a git repo");
     }
 }

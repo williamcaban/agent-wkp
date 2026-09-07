@@ -13,7 +13,11 @@ name = "wkp_core"
 
 [dev-dependencies]
 criterion = { version = "0.5", default-features = false, features = ["cargo_bench_support"] }
+tempfile = "3.27.0"
 
 [[bench]]
 name = "core_benches"
 harness = false
+
+[dependencies]
+wkp-sys = { version = "0.1.0", path = "../wkp-sys" }

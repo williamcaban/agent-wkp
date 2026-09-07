@@ -13,4 +13,8 @@ name = "wkp"
 path = "src/main.rs"
 
 [dependencies]
+wkp-core = { version = "0.1.0", path = "../wkp-core" }
 wkp-git = { path = "../wkp-git" }
+
+[dev-dependencies]
+tempfile = "3.27.0"
