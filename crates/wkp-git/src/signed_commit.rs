@@ -13,6 +13,8 @@
 
 use std::path::{Path, PathBuf};
 
+use crate::provenance::Provenance;
+
 /// The object ID (40-hex-char SHA-1, or 64-char SHA-256 on a
 /// `--object-format=sha256` repository) of a commit `signed_commit`
 /// produced.
@@ -35,6 +37,11 @@ pub struct CommitId(pub String);
 /// involved) or a public key file whose matching private half
 /// `ssh-agent` already holds.
 ///
+/// `subject` is the commit message's first line; `provenance`'s non-`None`
+/// fields (design 5.4, 7.4, M2-3) are appended as `Wkp-*` trailers via
+/// [`Provenance::format_message`] -- an all-`None` `Provenance` leaves
+/// `subject` unchanged, no empty trailer block.
+///
 /// All three of `gpg.format`, `user.signingkey`, `user.name`/`user.email`
 /// are passed as per-invocation `-c` overrides (matching `commit_all`'s
 /// existing pattern) rather than written to the repo's persisted config:
@@ -51,9 +58,10 @@ pub struct CommitId(pub String);
 pub fn signed_commit(
     repo_dir: &Path,
     paths: &[PathBuf],
-    message: &str,
+    subject: &str,
     principal: &str,
     signing_key_path: &Path,
+    provenance: &Provenance,
 ) -> Result<CommitId, String> {
     if paths.is_empty() {
         return Err("signed_commit: no paths given".to_string());
@@ -84,6 +92,8 @@ pub fn signed_commit(
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty());
 
+    let full_message = provenance.format_message(repo_dir, subject)?;
+
     let signing_key_str = signing_key_path.to_string_lossy();
     let user_name_arg = format!("user.name={principal}");
     let user_email_arg = format!("user.email={principal}");
@@ -101,7 +111,7 @@ pub fn signed_commit(
         "-S",
         tree,
         "-m",
-        message,
+        &full_message,
     ];
     if let Some(parent) = &parent {
         args.push("-p");
@@ -218,6 +228,7 @@ mod tests {
             "first commit",
             "human:alice",
             &key.private_path,
+            &Provenance::default(),
         )
         .expect("signed_commit");
 
@@ -237,6 +248,7 @@ mod tests {
             "a distinctive commit message",
             "human:alice",
             &key.private_path,
+            &Provenance::default(),
         )
         .expect("signed_commit");
 
@@ -262,6 +274,7 @@ mod tests {
             "first",
             "human:alice",
             &key.private_path,
+            &Provenance::default(),
         )
         .expect("first signed_commit");
 
@@ -272,6 +285,7 @@ mod tests {
             "second",
             "human:alice",
             &key.private_path,
+            &Provenance::default(),
         )
         .expect("second signed_commit");
 
@@ -294,6 +308,7 @@ mod tests {
             "should fail",
             "human:alice",
             &dir.join("does-not-exist-key"),
+            &Provenance::default(),
         );
 
         assert!(
@@ -313,7 +328,14 @@ mod tests {
         let dir = temp.path();
         let key = setup_signed_repo(dir, "human:alice");
 
-        let result = signed_commit(dir, &[], "empty", "human:alice", &key.private_path);
+        let result = signed_commit(
+            dir,
+            &[],
+            "empty",
+            "human:alice",
+            &key.private_path,
+            &Provenance::default(),
+        );
         assert!(result.is_err());
     }
 
@@ -333,5 +355,58 @@ mod tests {
 
         let result = verify_commit(dir, &CommitId(sha));
         assert!(result.is_err(), "an unsigned commit must not verify");
+    }
+
+    /// M2-3 acceptance criterion: a commit written via `signed_commit`
+    /// with real provenance round-trips exactly through
+    /// `read_provenance_trailers`.
+    #[test]
+    fn signed_commit_provenance_round_trips_through_read_provenance_trailers() {
+        let temp = temp_dir("signed-commit-provenance-roundtrip");
+        let dir = temp.path();
+        let key = setup_signed_repo(dir, "agent:claude-code@host");
+
+        std::fs::write(dir.join("a.md"), "hello\n").expect("write a.md");
+        let provenance = Provenance {
+            actor: Some("agent:claude-code@host".to_string()),
+            session: Some("7f3c".to_string()),
+            source: Some("conversation".to_string()),
+            confidence: Some("proposed".to_string()),
+        };
+        let commit = signed_commit(
+            dir,
+            &[PathBuf::from("a.md")],
+            "remembered something",
+            "agent:claude-code@host",
+            &key.private_path,
+            &provenance,
+        )
+        .expect("signed_commit");
+
+        let read_back = crate::provenance::read_provenance_trailers(dir, &commit)
+            .expect("read_provenance_trailers")
+            .expect("expected Some(Provenance), got None");
+        assert_eq!(read_back, provenance);
+    }
+
+    #[test]
+    fn signed_commit_with_default_provenance_round_trips_to_none() {
+        let temp = temp_dir("signed-commit-provenance-none");
+        let dir = temp.path();
+        let key = setup_signed_repo(dir, "human:alice");
+
+        std::fs::write(dir.join("a.md"), "hello\n").expect("write a.md");
+        let commit = signed_commit(
+            dir,
+            &[PathBuf::from("a.md")],
+            "no provenance here",
+            "human:alice",
+            &key.private_path,
+            &Provenance::default(),
+        )
+        .expect("signed_commit");
+
+        let read_back = crate::provenance::read_provenance_trailers(dir, &commit).expect("read");
+        assert_eq!(read_back, None);
     }
 }
