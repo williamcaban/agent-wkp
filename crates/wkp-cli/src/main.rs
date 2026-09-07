@@ -12,6 +12,10 @@ fn main() {
             println!("wkp {}", env!("CARGO_PKG_VERSION"));
         }
         _ => {
+            if let Err(msg) = wkp_git::ensure_min_git_version() {
+                eprintln!("{msg}");
+                std::process::exit(1);
+            }
             eprintln!("wkp: no subcommands implemented yet (see docs/plan/milestones.md)");
             std::process::exit(1);
         }

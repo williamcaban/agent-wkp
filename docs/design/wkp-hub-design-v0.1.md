@@ -7,6 +7,16 @@
 
 ---
 
+## Changelog
+
+- 2026-09-07: Resolved the `[unverified]` tag on the fsmonitor sentence in
+  5.1 (Linux builtin fsmonitor support is newer than macOS/Windows, and
+  specifically landed in git 2.55, not alongside the 2.37 daemon). Minimum
+  supported git version decided as 2.34.0, gated on SSH signing only,
+  fsmonitor kept opportunistic. See `docs/adr/0001-git-minimum-version.md`.
+
+---
+
 ## 0. How to read this document
 
 Each section states a decision, then the reasoning, then the trade-offs and the failure modes the decision accepts. Where a claim rests on a primary source, the source is linked inline. Where a claim is my judgment rather than something the literature or a spec establishes, it is labeled **[judgment]**. Where I lack a direct citation, it is labeled **[unverified]** and should be treated as a working assumption.
@@ -198,7 +208,7 @@ These are engineering targets, not measurements **[unverified]**. They should be
 
 **Why shell out to `git` rather than link libgit2 or gitoxide.** The brief prioritizes reusing native tools and a slim core. Git is present on effectively every developer machine and container base image, the plumbing interface is stable, and git is never on the search hot path (only on write and sync). The cost is a process spawn per write (well within the 50 ms target) and a hard dependency on `git ≥ 2.34` for SSH signing. **[judgment]** If profiling later shows write latency matters (bulk imports), a gitoxide backend can be added behind the same trait without changing the on-disk format.
 
-**Change detection: the index stat cache, not per-file hashing.** agent-wkp detects change by running `git hash-object` on every file. That is a full content read per file per scan. The replacement is git's own index: `git update-index --refresh` followed by `git status --porcelain=v2` (or `git diff-index --cached`) answers "which files changed" from cached stat metadata (size, mtime, inode), and only those files are hashed and re-indexed. Where the builtin fsmonitor daemon is available (`core.fsmonitor=true`, macOS and Windows since git 2.37; Linux builtin support is newer and must be verified against the release notes of the minimum supported git version **[unverified]**), even the stat walk is skipped. This is the same technique that makes Mutagen's scans fast, and it is the main lever for the 30 ms incremental-index target in 4.3.
+**Change detection: the index stat cache, not per-file hashing.** agent-wkp detects change by running `git hash-object` on every file. That is a full content read per file per scan. The replacement is git's own index: `git update-index --refresh` followed by `git status --porcelain=v2` (or `git diff-index --cached`) answers "which files changed" from cached stat metadata (size, mtime, inode), and only those files are hashed and re-indexed. Where the builtin fsmonitor daemon is available (`core.fsmonitor=true`, macOS and Windows since git 2.37; Linux's inotify backend for the same daemon did not land until git 2.55, per ADR-0001), even the stat walk is skipped. This is the same technique that makes Mutagen's scans fast, and it is the main lever for the 30 ms incremental-index target in 4.3.
 
 **Git settings applied by `wkp init`.** `protocol.version=2` (no full ref advertisement on fetch, [git protocol v2](https://git-scm.com/docs/protocol-v2)), `git maintenance start` with `commit-graph` enabled so `git log` on the audit path stays fast on long histories ([git-maintenance](https://git-scm.com/docs/git-maintenance)), `receive.fsckObjects` and `transfer.fsckObjects` on, `core.untrackedCache=true`.
 
