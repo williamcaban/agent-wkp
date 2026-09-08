@@ -448,6 +448,97 @@ pub fn remote_branch_exists(repo_dir: &Path, remote: &str, branch_name: &str) ->
     .is_ok()
 }
 
+/// Whether `repo_dir` has a *local* branch named `branch_name`
+/// (`refs/heads/<branch_name>`) -- [`remote_branch_exists`]'s counterpart
+/// for a ref this repo owns itself, e.g. checking for a local `main`
+/// before including it in a `wkp bundle export` (M3-5).
+pub fn local_branch_exists(repo_dir: &Path, branch_name: &str) -> bool {
+    run_git(
+        repo_dir,
+        &[
+            "rev-parse",
+            "--verify",
+            "-q",
+            &format!("refs/heads/{branch_name}"),
+        ],
+    )
+    .is_ok()
+}
+
+/// Every ref whose name starts with `prefix` (e.g. `refs/remotes/bundle/`),
+/// as full ref names via `git for-each-ref --format=%(refname)`. General
+/// enough for `wkp bundle import` (M3-5) to enumerate whatever a bundle's
+/// refspec happened to land under, without hardcoding branch names.
+pub fn refs_matching(repo_dir: &Path, prefix: &str) -> Result<Vec<String>, String> {
+    let stdout = run_git_stdout(repo_dir, &["for-each-ref", "--format=%(refname)", prefix])?;
+    Ok(stdout
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(String::from)
+        .collect())
+}
+
+/// Creates a git bundle at `bundle_path` containing everything reachable
+/// from `refs` (e.g. the local device branch, and `main` if it exists) --
+/// design 6.1's "air-gapped sync is `git bundle`" (M3-5). `since` scopes
+/// it to an incremental range (`<since>..<ref>` for each of `refs`)
+/// instead of each ref's complete history.
+pub fn bundle_create(
+    repo_dir: &Path,
+    bundle_path: &Path,
+    refs: &[&str],
+    since: Option<&str>,
+) -> Result<(), String> {
+    let mut args: Vec<String> = vec![
+        "bundle".to_string(),
+        "create".to_string(),
+        bundle_path.to_string_lossy().into_owned(),
+    ];
+    for r in refs {
+        args.push(match since {
+            Some(since_ref) => format!("{since_ref}..{r}"),
+            None => (*r).to_string(),
+        });
+    }
+    let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
+    run_git(repo_dir, &arg_refs)
+}
+
+/// Verifies `bundle_path` is a well-formed bundle whose prerequisites (if
+/// it's an incremental bundle) are satisfiable in `repo_dir`, returning a
+/// clear `Err` otherwise -- `wkp bundle import` (M3-5) calls this before
+/// ever fetching from a bundle, so a corrupted or incompatible file is
+/// refused up front rather than partially imported.
+pub fn bundle_verify(repo_dir: &Path, bundle_path: &Path) -> Result<(), String> {
+    run_git(
+        repo_dir,
+        &[
+            "bundle",
+            "verify",
+            "--quiet",
+            &bundle_path.to_string_lossy(),
+        ],
+    )
+}
+
+/// Fetches every `refs/heads/*` ref a bundle contains into `repo_dir`'s
+/// `refs/remotes/bundle/*` remote-tracking namespace -- git treats a
+/// bundle file path exactly like any other fetch source, no persistent
+/// remote configuration needed. `wkp bundle import` (M3-5) calls this
+/// only after [`bundle_verify`] has already accepted the file.
+pub fn bundle_fetch(repo_dir: &Path, bundle_path: &Path) -> Result<(), String> {
+    run_git(
+        repo_dir,
+        &[
+            "fetch",
+            "--quiet",
+            &bundle_path.to_string_lossy(),
+            "refs/heads/*:refs/remotes/bundle/*",
+        ],
+    )
+}
+
 /// Detects which tracked or untracked files changed in `repo_dir`'s working
 /// tree, using git's own stat cache rather than reading every file's
 /// content (design 5.1). `git update-index --refresh` updates that cache
@@ -716,13 +807,12 @@ mod tests {
                 .prefix(&format!("wkp-git-test-{name}-"))
                 .tempdir()
                 .expect("create temp dir");
-            let status = Command::new("git")
-                .arg("-C")
-                .arg(dir.path())
-                .args(["init", "--quiet"])
-                .status()
-                .expect("run git init");
-            assert!(status.success(), "git init failed");
+            // `init_repo` itself, not a raw `git init` -- found the hard
+            // way (a bundle test failed with a `main`/`master` mismatch)
+            // that this helper predates `init_repo`'s `--initial-branch=main`
+            // fix and had drifted from it by duplicating the plumbing
+            // instead of calling it.
+            init_repo(dir.path()).expect("init_repo");
             Self { dir }
         }
 
@@ -1288,5 +1378,122 @@ mod tests {
             run_git(repo.path(), &["rev-parse", "--verify", "-q", "MERGE_HEAD"]).is_err(),
             "MERGE_HEAD must be cleared once the merge commit lands"
         );
+    }
+
+    #[test]
+    fn local_branch_exists_reflects_real_local_branches_only() {
+        let repo = TempGitRepo::new("local-branch-exists");
+        repo.write("item.md", "hello\n");
+        repo.commit_all("initial");
+        assert!(local_branch_exists(repo.path(), &repo.current_branch()));
+        assert!(!local_branch_exists(repo.path(), "no-such-branch"));
+    }
+
+    #[test]
+    fn bundle_create_and_verify_round_trip_in_a_fresh_unrelated_repo() {
+        let publisher = TempGitRepo::new("bundle-publisher");
+        publisher.write("item.md", "hello\n");
+        publisher.commit_all("initial");
+        let main = publisher.current_branch();
+
+        let bundle_path = tempfile::Builder::new()
+            .prefix("wkp-git-test-bundle-")
+            .suffix(".bundle")
+            .tempfile()
+            .expect("create temp bundle file")
+            .path()
+            .to_path_buf();
+        bundle_create(publisher.path(), &bundle_path, &[&main], None).expect("bundle_create");
+
+        // A full (non-incremental) bundle carries its own complete
+        // history, so it must verify cleanly even in a repo that never
+        // shared a single commit with the publisher.
+        let subscriber = TempGitRepo::new("bundle-subscriber");
+        bundle_verify(subscriber.path(), &bundle_path).expect("bundle_verify");
+    }
+
+    #[test]
+    fn bundle_verify_rejects_a_corrupted_file_with_a_clear_error() {
+        let repo = TempGitRepo::new("bundle-verify-corrupt");
+        repo.write("item.md", "hello\n");
+        repo.commit_all("initial");
+
+        let bad_bundle = tempfile::Builder::new()
+            .prefix("wkp-git-test-bad-bundle-")
+            .suffix(".bundle")
+            .tempfile()
+            .expect("create temp bundle file");
+        std::fs::write(bad_bundle.path(), "not a bundle\n").expect("write bad bundle");
+
+        let result = bundle_verify(repo.path(), bad_bundle.path());
+        assert!(result.is_err(), "expected a clear error, not Ok");
+    }
+
+    #[test]
+    fn bundle_fetch_populates_the_bundle_remote_tracking_namespace() {
+        let publisher = TempGitRepo::new("bundle-fetch-publisher");
+        publisher.write("item.md", "hello\n");
+        publisher.commit_all("initial");
+        let main = publisher.current_branch();
+
+        let bundle_path = tempfile::Builder::new()
+            .prefix("wkp-git-test-bundle-fetch-")
+            .suffix(".bundle")
+            .tempfile()
+            .expect("create temp bundle file")
+            .path()
+            .to_path_buf();
+        bundle_create(publisher.path(), &bundle_path, &[&main], None).expect("bundle_create");
+
+        let subscriber = TempGitRepo::new("bundle-fetch-subscriber");
+        bundle_verify(subscriber.path(), &bundle_path).expect("bundle_verify");
+        bundle_fetch(subscriber.path(), &bundle_path).expect("bundle_fetch");
+
+        let refs = refs_matching(subscriber.path(), "refs/remotes/bundle/").expect("refs_matching");
+        assert_eq!(refs, vec![format!("refs/remotes/bundle/{main}")]);
+
+        let has_it = run_git_stdout(
+            subscriber.path(),
+            &[
+                "cat-file",
+                "-e",
+                &format!("refs/remotes/bundle/{main}:item.md"),
+            ],
+        )
+        .is_ok();
+        assert!(
+            has_it,
+            "expected item.md reachable from the fetched bundle ref"
+        );
+    }
+
+    #[test]
+    fn bundle_create_with_since_produces_an_incremental_bundle() {
+        let publisher = TempGitRepo::new("bundle-incremental-publisher");
+        publisher.write("item.md", "base\n");
+        publisher.commit_all("base");
+        let base_sha = run_git_stdout(publisher.path(), &["rev-parse", "HEAD"])
+            .expect("rev-parse HEAD")
+            .trim()
+            .to_string();
+        publisher.write("item.md", "updated\n");
+        publisher.commit_all("update");
+        let main = publisher.current_branch();
+
+        let bundle_path = tempfile::Builder::new()
+            .prefix("wkp-git-test-bundle-incremental-")
+            .suffix(".bundle")
+            .tempfile()
+            .expect("create temp bundle file")
+            .path()
+            .to_path_buf();
+        bundle_create(publisher.path(), &bundle_path, &[&main], Some(&base_sha))
+            .expect("bundle_create with --since");
+
+        // An incremental bundle records a prerequisite, not a complete
+        // history -- verifying it against the very repo whose history it
+        // was cut from (which already has that prerequisite commit) must
+        // still succeed.
+        bundle_verify(publisher.path(), &bundle_path).expect("bundle_verify (incremental)");
     }
 }
