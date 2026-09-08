@@ -26,7 +26,13 @@ pub enum SignerRole {
 }
 
 impl SignerRole {
-    fn from_principal(principal: &str) -> Self {
+    /// Classifies a principal string by its `human:`/`agent:` prefix
+    /// (design 5.4/7.3's convention) -- `pub` because callers outside
+    /// this module need the same classification for their *own* calling
+    /// identity, not just for a signer resolved from a commit (`wkp
+    /// promote`, M2-7: "refuse unless the calling identity is
+    /// `role: human`").
+    pub fn from_principal(principal: &str) -> Self {
         if principal.starts_with("human:") {
             SignerRole::Human
         } else if principal.starts_with("agent:") {

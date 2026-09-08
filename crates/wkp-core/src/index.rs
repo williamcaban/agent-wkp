@@ -18,7 +18,7 @@
 use std::fmt;
 use std::path::{Path, PathBuf};
 
-use crate::frontmatter::{Confidence, Frontmatter, ItemType};
+use crate::frontmatter::{Frontmatter, ItemType};
 // `wkp-core` never depends on `rusqlite` directly: `wkp-sys` owns bundled
 // SQLite (design 3.3) and re-exports it, so this is the one place the
 // dependency is named.
@@ -149,9 +149,6 @@ fn create_schema(conn: &Connection) -> rusqlite::Result<()> {
 ///   because a human could otherwise directly commit a file under
 ///   `inbox/` without ever going through `wkp promote` (M2-7), which is
 ///   what this store's audit trail is supposed to require.
-/// - `confidence` is not `inferred`/`proposed` -- an item can be
-///   human-signed and still self-report as unreviewed; both signals must
-///   agree, not either alone.
 /// - `expires` (if set) has not passed (design 5.4: "the indexer excludes
 ///   expired items from Tier 0 and Tier 1 automatically" -- stored since
 ///   M1-1 but never actually checked until now).
@@ -166,6 +163,25 @@ fn create_schema(conn: &Connection) -> rusqlite::Result<()> {
 /// Otherwise: `project-state`/(scoped) `instruction` -> 0,
 /// `feedback`/`knowledge` -> 1, everything else -> 2.
 ///
+/// **Deliberately does not consult `confidence`.** An earlier version of
+/// this gate treated `confidence: inferred`/`proposed` as a second,
+/// independent "not yet reviewed" signal -- reasonable-looking while
+/// `human_signed` didn't exist yet (the M1-4 placeholder used
+/// `confidence` as its only proxy for "reviewed" at all), but wrong once
+/// real signing landed: `wkp promote` (M2-7) explicitly moves an item
+/// into the durable tree with a human-signed commit *without* rewriting
+/// its `confidence`/`provenance` frontmatter (promotion is about the
+/// commit's signer, not a content rewrite), so a promoted
+/// `confidence: proposed` item would otherwise be permanently stuck at
+/// tier 2 no matter who signs it -- caught by M2-7's own end-to-end
+/// integration test actually promoting something, not by reasoning about
+/// it in the abstract. Design 5.4 also never ties `confidence` to the
+/// tier gate: it "mirrors the 'did the user say it' test," an epistemic
+/// property of the *fact* (did the user state it, or did the agent infer
+/// or propose it), orthogonal to whether the *item* has been reviewed and
+/// signed. `human_signed` plus the `inbox/` check are design 7.4's actual,
+/// complete gate.
+///
 /// Deliberately does **not** verify commits arriving via sync/fetch from
 /// another machine (`wkp verify`) -- that's M3's "unsigned or
 /// unknown-signer commits are excluded from Tier 0 and 1" exit-criterion
@@ -176,12 +192,6 @@ fn compute_tier(path: &str, fm: &Frontmatter, human_signed: bool) -> u8 {
         return 2;
     }
     if !human_signed {
-        return 2;
-    }
-    if matches!(
-        fm.confidence,
-        Some(Confidence::Inferred | Confidence::Proposed)
-    ) {
         return 2;
     }
     if fm.expires.as_deref().is_some_and(is_expired) {
@@ -1012,7 +1022,7 @@ pub fn materialize(conn: &Connection, tier: u8) -> Result<String, IndexError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::frontmatter::{ItemType, Visibility};
+    use crate::frontmatter::{Confidence, ItemType, Visibility};
 
     /// `human_signed: true` by default: every existing test in this
     /// module predates M2-6's signing gate and is testing something else
@@ -1091,7 +1101,7 @@ mod tests {
     }
 
     #[test]
-    fn compute_tier_reflects_type_and_confidence_when_human_signed() {
+    fn compute_tier_reflects_type_when_human_signed() {
         let mut fm = Frontmatter {
             item_type: Some(ItemType::ProjectState),
             ..Default::default()
@@ -1103,12 +1113,33 @@ mod tests {
 
         fm.item_type = Some(ItemType::Reference);
         assert_eq!(compute_tier("a.md", &fm, true), 2);
+    }
 
-        // A human-signed commit alone isn't enough: confidence must also
-        // agree that the content has been reviewed.
-        fm.item_type = Some(ItemType::ProjectState);
-        fm.confidence = Some(Confidence::Proposed);
-        assert_eq!(compute_tier("a.md", &fm, true), 2);
+    /// M2-7 found this the hard way (an end-to-end `wkp promote` test
+    /// failed until this was fixed): `wkp promote` explicitly never
+    /// rewrites `confidence`, so a promoted item human-signs into the
+    /// durable tree while still carrying `confidence: proposed` from
+    /// when it was written. Tier eligibility must not depend on
+    /// `confidence` at all -- only on `human_signed` and not being under
+    /// `inbox/` (design 7.4's actual gate).
+    #[test]
+    fn compute_tier_ignores_confidence_once_human_signed_and_out_of_inbox() {
+        let mut fm = Frontmatter {
+            item_type: Some(ItemType::ProjectState),
+            confidence: Some(Confidence::Proposed),
+            ..Default::default()
+        };
+        assert_eq!(
+            compute_tier("projects/wkp/promoted.md", &fm, true),
+            0,
+            "a human-signed, promoted item must reach tier 0 even with confidence: proposed"
+        );
+
+        fm.confidence = Some(Confidence::Inferred);
+        assert_eq!(compute_tier("projects/wkp/promoted.md", &fm, true), 0);
+
+        fm.confidence = Some(Confidence::Stated);
+        assert_eq!(compute_tier("projects/wkp/promoted.md", &fm, true), 0);
     }
 
     /// M2-6's actual gate (design 7.4): the check the M1-4 placeholder

@@ -347,6 +347,20 @@ pub fn list_tracked_files(repo_dir: &Path) -> Result<Vec<PathBuf>, String> {
     Ok(stdout.lines().map(PathBuf::from).collect())
 }
 
+/// Removes `path` from `repo_dir`'s git index (`git update-index
+/// --remove -- <path>`), without touching the working tree itself --
+/// `wkp promote` (M2-7, design 7.4) uses this to stage the "old"
+/// half of a move (the caller deletes the file on disk first; `--remove`
+/// is what makes `update-index` accept a path that no longer exists
+/// there, rather than erroring on a missing file). Followed by
+/// [`signed_commit::signed_commit`] for the "new" half, so both halves
+/// of the move land in one commit -- `write-tree` inside that call
+/// serializes whatever the index holds at that point, picking up this
+/// removal and the new path's addition together.
+pub fn remove_from_index(repo_dir: &Path, path: &str) -> Result<(), String> {
+    run_git(repo_dir, &["update-index", "--remove", "--", path])
+}
+
 /// Whether `core.fsmonitor` is enabled for `repo_dir`. Purely
 /// informational (e.g. for tests or diagnostics): [`detect_changes`]
 /// behaves identically either way, since `git status` consults fsmonitor
@@ -577,6 +591,38 @@ mod tests {
         assert!(dir.join(".git").is_dir());
         // Idempotent: a second call on the same path must not error.
         init_repo(&dir).expect("init_repo again");
+    }
+
+    /// `remove_from_index` staged alone (no accompanying commit) is
+    /// still observable via `write-tree`: the path disappears from the
+    /// tree it produces. The real "one commit for both halves of a
+    /// move" behavior is exercised by `wkp-cli`'s own `run_promote`
+    /// tests, the actual consumer of this function.
+    #[test]
+    fn remove_from_index_drops_a_path_from_the_next_write_tree() {
+        let temp = tempfile::Builder::new()
+            .prefix("wkp-git-test-remove-from-index-")
+            .tempdir()
+            .expect("create temp dir");
+        let dir = temp.path();
+        init_repo(dir).expect("init_repo");
+        std::fs::write(dir.join("a.md"), "hello\n").expect("write a.md");
+        run_git(dir, &["add", "a.md"]).expect("git add");
+        let tree_with = run_git_stdout(dir, &["write-tree"]).expect("write-tree with a.md");
+        assert!(!tree_with.trim().is_empty());
+
+        std::fs::remove_file(dir.join("a.md")).expect("delete a.md from disk");
+        remove_from_index(dir, "a.md").expect("remove_from_index");
+        let tree_without = run_git_stdout(dir, &["write-tree"]).expect("write-tree without a.md");
+
+        assert_ne!(
+            tree_with.trim(),
+            tree_without.trim(),
+            "the tree must change once a.md is removed from the index"
+        );
+        let ls_tree = run_git_stdout(dir, &["ls-tree", "-r", "--name-only", tree_without.trim()])
+            .expect("ls-tree");
+        assert!(!ls_tree.contains("a.md"));
     }
 
     #[test]
