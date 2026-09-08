@@ -10,3 +10,9 @@ repository.workspace = true
 
 [lib]
 name = "wkp_crypto"
+
+[dependencies]
+# design 7.2: "implemented in-process with the `rage` crate" -- the
+# str4d/rage project's library crate is published to crates.io as `age`
+# (the `rage` name on crates.io is the CLI binary from the same project).
+age = "0.12.1"
