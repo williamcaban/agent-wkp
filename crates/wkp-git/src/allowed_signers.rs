@@ -63,6 +63,24 @@ impl SignerRole {
 pub fn last_signer_for_path(repo_dir: &Path, path: &str) -> Option<(String, SignerRole)> {
     let output =
         super::run_git_stdout(repo_dir, &["log", "-1", "--format=%G?%x09%GS", "--", path]).ok()?;
+    parse_signer_line(&output)
+}
+
+/// Like [`last_signer_for_path`], but for one specific `commit` rather
+/// than "whichever commit last touched a path" -- M3-7's fetch-time
+/// reporting needs the signer of each newly-arrived commit itself, not
+/// which path it happened to touch. `None` covers every case that isn't
+/// a valid signature from a principal in this repo's own
+/// `allowed_signers` (design 7.3): no signature at all (`%G?` = `N`), a
+/// signature from a key that file doesn't recognize (`U`), or anything
+/// else short of `G`.
+pub fn signer_for_commit(repo_dir: &Path, commit: &str) -> Option<(String, SignerRole)> {
+    let output =
+        super::run_git_stdout(repo_dir, &["log", "-1", "--format=%G?%x09%GS", commit]).ok()?;
+    parse_signer_line(&output)
+}
+
+fn parse_signer_line(output: &str) -> Option<(String, SignerRole)> {
     let mut fields = output.trim_end_matches('\n').splitn(2, '\t');
     let validity = fields.next().unwrap_or("");
     let signer = fields.next().unwrap_or("");
@@ -517,5 +535,89 @@ mod tests {
         crate::init_repo(repo).expect("init_repo");
 
         assert_eq!(last_signer_for_path(repo, "a.md"), None);
+    }
+
+    #[test]
+    fn signer_for_commit_resolves_an_agent_signed_commit() {
+        let dir = temp_dir("signer-for-commit-agent");
+        let repo = dir.path();
+        crate::init_repo(repo).expect("init_repo");
+        configure_ssh_signing(repo).expect("configure_ssh_signing");
+        let key = generate_and_register_test_key(repo, "agent:claude-code@host");
+
+        std::fs::write(repo.join("a.md"), "hello\n").expect("write a.md");
+        let commit = crate::signed_commit::signed_commit(
+            repo,
+            &[PathBuf::from("a.md")],
+            "seed",
+            "agent:claude-code@host",
+            &key,
+            &crate::provenance::Provenance::default(),
+        )
+        .expect("signed_commit");
+
+        let (principal, role) =
+            signer_for_commit(repo, &commit.0).expect("expected a resolved signer");
+        assert_eq!(principal, "agent:claude-code@host");
+        assert_eq!(role, SignerRole::Agent);
+    }
+
+    #[test]
+    fn signer_for_commit_returns_none_for_an_unsigned_commit() {
+        let dir = temp_dir("signer-for-commit-unsigned");
+        let repo = dir.path();
+        crate::init_repo(repo).expect("init_repo");
+        configure_ssh_signing(repo).expect("configure_ssh_signing");
+
+        std::fs::write(repo.join("a.md"), "hello\n").expect("write a.md");
+        crate::commit_all(repo, "unsigned").expect("commit_all");
+        let commit = crate::run_git_stdout(repo, &["rev-parse", "HEAD"])
+            .expect("rev-parse HEAD")
+            .trim()
+            .to_string();
+
+        assert_eq!(signer_for_commit(repo, &commit), None);
+    }
+
+    #[test]
+    fn signer_for_commit_returns_none_for_a_signature_from_an_unregistered_key() {
+        let dir = temp_dir("signer-for-commit-unregistered");
+        let repo = dir.path();
+        crate::init_repo(repo).expect("init_repo");
+        // A different repo's `allowed_signers` never learns about this
+        // key -- signing still succeeds (git only needs a private key to
+        // sign), but nothing here recognizes the result as any known
+        // principal, the same as a real "wrong/unknown signer" commit
+        // arriving via a fetch would look.
+        configure_ssh_signing(repo).expect("configure_ssh_signing");
+        let unregistered_key = dir.path().join("unregistered-key");
+        let status = std::process::Command::new("ssh-keygen")
+            .args([
+                "-t",
+                "ed25519",
+                "-N",
+                "",
+                "-C",
+                "test",
+                "-f",
+                &unregistered_key.to_string_lossy(),
+                "-q",
+            ])
+            .status()
+            .expect("run ssh-keygen");
+        assert!(status.success(), "ssh-keygen failed");
+
+        std::fs::write(repo.join("a.md"), "hello\n").expect("write a.md");
+        let commit = crate::signed_commit::signed_commit(
+            repo,
+            &[PathBuf::from("a.md")],
+            "seed",
+            "agent:claude-code@host",
+            &unregistered_key,
+            &crate::provenance::Provenance::default(),
+        )
+        .expect("signed_commit");
+
+        assert_eq!(signer_for_commit(repo, &commit.0), None);
     }
 }

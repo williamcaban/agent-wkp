@@ -35,10 +35,11 @@ pub use conflicts::{
     conflicts, modify_delete_conflicts, stage_path, Conflict, ConflictKind, DeletedBy,
     ModifyDeleteConflict,
 };
-pub use init::{apply_init_settings, commit_all, init_bare_repo, init_repo};
+pub use init::{apply_init_settings, commit_all, commit_staged, init_bare_repo, init_repo};
 pub use remote::{
-    checkout_branch, current_branch, fetch, finish_merge, local_branch_exists, merge_branch,
-    other_device_sync_refs, push_branch, refs_matching, remote_branch_exists,
+    checkout_branch, commits_between, current_branch, current_commit, fetch, finish_merge,
+    is_merge_commit, local_branch_exists, merge_branch, other_device_sync_refs, push_branch,
+    refs_matching, remote_branch_exists,
 };
 pub use version::{check_git_version, ensure_min_git_version, GitVersionCheck, MIN_GIT_VERSION};
 

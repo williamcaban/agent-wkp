@@ -59,6 +59,16 @@ pub fn init_bare_repo(path: &Path) -> Result<(), String> {
 /// through this rather than shelling out themselves.
 pub fn commit_all(repo_dir: &Path, message: &str) -> Result<(), String> {
     run_git(repo_dir, &["add", "-A"])?;
+    commit_staged(repo_dir, message)
+}
+
+/// Commits whatever is currently staged in `repo_dir`'s index, without
+/// first running `git add -A` -- for a caller that already staged
+/// exactly the path(s) it wants (e.g. via [`stage_path`]) and needs a
+/// plain, unsigned commit without also sweeping in every other untracked
+/// change sitting in the working tree the way [`commit_all`] does. Same
+/// per-call identity override, for the same reason.
+pub fn commit_staged(repo_dir: &Path, message: &str) -> Result<(), String> {
     run_git(
         repo_dir,
         &[
@@ -184,5 +194,25 @@ mod tests {
 
         let result = apply_init_settings(dir.path());
         assert!(result.is_err(), "expected an error outside a git repo");
+    }
+
+    #[test]
+    fn commit_staged_commits_only_what_was_explicitly_staged() {
+        let repo = TempGitRepo::new("commit-staged");
+        repo.write("item.md", "hello\n");
+        repo.commit_all("initial");
+        repo.write("staged.md", "staged\n");
+        repo.write("not-staged.md", "not staged\n");
+        crate::conflicts::stage_path(repo.path(), "staged.md").expect("stage_path");
+
+        commit_staged(repo.path(), "only the staged file").expect("commit_staged");
+
+        assert!(crate::plumbing::run_git_stdout(repo.path(), &["cat-file", "-e", "HEAD:staged.md"])
+            .is_ok());
+        assert!(crate::plumbing::run_git_stdout(
+            repo.path(),
+            &["cat-file", "-e", "HEAD:not-staged.md"]
+        )
+        .is_err());
     }
 }

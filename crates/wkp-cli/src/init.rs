@@ -31,7 +31,15 @@ pub(crate) fn run_init_with_claude_home(
     // what `wkp index`'s change detection treats as ordinary store
     // content, so it would get indexed as if it were a real item. A glob
     // covers any future tier's materialized file, not just today's two.
-    ensure_gitignored(path, &[".wkp/index.db", ".wkp/tier*.md"])?;
+    //
+    // Another real bug found the same way while building M3-7:
+    // `.wkp/device-id` (M3-1) was never added here either -- its own doc
+    // comment (`wkp_git::sync::device_id`) says it "must never be
+    // committed at all" (cloning onto a second device must not inherit
+    // the first device's ID), but nothing enforced that, so a plain `git
+    // add -A` anywhere in this store's history would silently sweep it
+    // into a real commit.
+    ensure_gitignored(path, &[".wkp/index.db", ".wkp/tier*.md", ".wkp/device-id"])?;
 
     // An empty index at this point; `wkp index` (M1-3) populates it from
     // the store's markdown files.
