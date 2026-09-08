@@ -37,6 +37,36 @@ impl SignerRole {
     }
 }
 
+/// Resolves the principal (and its [`SignerRole`]) that signed the most
+/// recent commit to touch `path` in `repo_dir`'s history (design 7.4,
+/// M2-6's provenance gate): `git log -1 --format=%G?%x09%GS -- <path>`
+/// gives both the signature's validity (`%G?`) and, when it's `G` (a good
+/// signature from a principal `gpg.ssh.allowedSignersFile` recognizes),
+/// the principal itself (`%GS`) in one call -- no separate
+/// `git verify-commit` needed.
+///
+/// `None` covers every case that isn't "a good signature from a known
+/// principal": `path` has no commit history yet (never committed, or the
+/// store has no commits at all), an unsigned commit, a signature from a
+/// key not in `allowed_signers` (validity `U`), or an otherwise-bad
+/// signature (`B`/`X`/`Y`/`E`/`R`). The tier gate this feeds
+/// ([`crate`]'s consumers in `wkp-core`) treats all of those identically
+/// -- none of them is "signed by a recognized human", which is the only
+/// thing that matters here -- so this deliberately does not distinguish
+/// *why* a signature failed to resolve.
+pub fn last_signer_for_path(repo_dir: &Path, path: &str) -> Option<(String, SignerRole)> {
+    let output =
+        super::run_git_stdout(repo_dir, &["log", "-1", "--format=%G?%x09%GS", "--", path]).ok()?;
+    let mut fields = output.trim_end_matches('\n').splitn(2, '\t');
+    let validity = fields.next().unwrap_or("");
+    let signer = fields.next().unwrap_or("");
+    if validity == "G" && !signer.is_empty() {
+        Some((signer.to_string(), SignerRole::from_principal(signer)))
+    } else {
+        None
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SignerEntry {
     pub principal: String,
@@ -167,6 +197,7 @@ pub fn configure_ssh_signing(repo_dir: &Path) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
 
     fn temp_dir(name: &str) -> tempfile::TempDir {
         tempfile::Builder::new()
@@ -353,5 +384,132 @@ mod tests {
             first_contents, second_contents,
             "re-running configure_ssh_signing must not rewrite an existing file"
         );
+    }
+
+    /// A throwaway, passphrase-less ed25519 keypair for tests, registered
+    /// in `dir`'s `allowed_signers` under `principal` -- same approach
+    /// `signed_commit`'s own tests use, duplicated here (no shared
+    /// test-utility module in this crate yet) since `last_signer_for_path`
+    /// needs a real signed commit to resolve anything meaningful.
+    fn generate_and_register_test_key(dir: &Path, principal: &str) -> PathBuf {
+        let private_path = dir.join("test-key");
+        let status = std::process::Command::new("ssh-keygen")
+            .args([
+                "-t",
+                "ed25519",
+                "-N",
+                "",
+                "-C",
+                "test",
+                "-f",
+                &private_path.to_string_lossy(),
+                "-q",
+            ])
+            .status()
+            .expect("run ssh-keygen");
+        assert!(status.success(), "ssh-keygen failed");
+        let public_line = std::fs::read_to_string(dir.join("test-key.pub"))
+            .expect("read generated public key")
+            .trim()
+            .to_string();
+        let mut fields = public_line.split_whitespace();
+        let key_type = fields.next().expect("key type field").to_string();
+        let key_base64 = fields.next().expect("base64 field").to_string();
+
+        append(
+            &dir.join("allowed_signers"),
+            &SignerEntry {
+                principal: principal.to_string(),
+                role: SignerRole::from_principal(principal),
+                key_type,
+                key_base64,
+            },
+        )
+        .expect("append signer entry");
+        private_path
+    }
+
+    #[test]
+    fn last_signer_for_path_resolves_a_human_signed_commit() {
+        let dir = temp_dir("last-signer-human");
+        let repo = dir.path();
+        crate::init_repo(repo).expect("init_repo");
+        configure_ssh_signing(repo).expect("configure_ssh_signing");
+        let key = generate_and_register_test_key(repo, "human:alice");
+
+        std::fs::write(repo.join("a.md"), "hello\n").expect("write a.md");
+        crate::signed_commit::signed_commit(
+            repo,
+            &[PathBuf::from("a.md")],
+            "seed",
+            "human:alice",
+            &key,
+            &crate::provenance::Provenance::default(),
+        )
+        .expect("signed_commit");
+
+        let (principal, role) =
+            last_signer_for_path(repo, "a.md").expect("expected a resolved signer");
+        assert_eq!(principal, "human:alice");
+        assert_eq!(role, SignerRole::Human);
+    }
+
+    #[test]
+    fn last_signer_for_path_resolves_an_agent_signed_commit() {
+        let dir = temp_dir("last-signer-agent");
+        let repo = dir.path();
+        crate::init_repo(repo).expect("init_repo");
+        configure_ssh_signing(repo).expect("configure_ssh_signing");
+        let key = generate_and_register_test_key(repo, "agent:claude-code@host");
+
+        std::fs::write(repo.join("a.md"), "hello\n").expect("write a.md");
+        crate::signed_commit::signed_commit(
+            repo,
+            &[PathBuf::from("a.md")],
+            "seed",
+            "agent:claude-code@host",
+            &key,
+            &crate::provenance::Provenance::default(),
+        )
+        .expect("signed_commit");
+
+        let (_principal, role) =
+            last_signer_for_path(repo, "a.md").expect("expected a resolved signer");
+        assert_eq!(role, SignerRole::Agent);
+    }
+
+    #[test]
+    fn last_signer_for_path_returns_none_for_an_unsigned_commit() {
+        let dir = temp_dir("last-signer-unsigned");
+        let repo = dir.path();
+        crate::init_repo(repo).expect("init_repo");
+        configure_ssh_signing(repo).expect("configure_ssh_signing");
+
+        std::fs::write(repo.join("a.md"), "hello\n").expect("write a.md");
+        crate::commit_all(repo, "unsigned").expect("commit_all");
+
+        assert_eq!(last_signer_for_path(repo, "a.md"), None);
+    }
+
+    #[test]
+    fn last_signer_for_path_returns_none_for_a_path_never_committed() {
+        let dir = temp_dir("last-signer-never-committed");
+        let repo = dir.path();
+        crate::init_repo(repo).expect("init_repo");
+        configure_ssh_signing(repo).expect("configure_ssh_signing");
+
+        std::fs::write(repo.join("a.md"), "hello\n").expect("write a.md");
+        crate::commit_all(repo, "seed").expect("commit_all");
+
+        assert_eq!(last_signer_for_path(repo, "never-committed.md"), None);
+    }
+
+    #[test]
+    fn last_signer_for_path_returns_none_when_the_repo_has_no_commits_at_all() {
+        let dir = temp_dir("last-signer-empty-repo");
+        let repo = dir.path();
+        crate::init_repo(repo).expect("init_repo");
+
+        assert_eq!(last_signer_for_path(repo, "a.md"), None);
     }
 }

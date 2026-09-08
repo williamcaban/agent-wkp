@@ -166,6 +166,7 @@ fn corpus_item(dir: &Path, i: usize) -> wkp_core::index::Item {
         frontmatter: parsed.frontmatter,
         body: parsed.body,
         embedding: None,
+        human_signed: true,
     }
 }
 
@@ -224,6 +225,7 @@ fn synthetic_item(i: usize, distinctive_content: bool) -> wkp_core::index::Item 
         frontmatter: wkp_core::frontmatter::Frontmatter::default(),
         body,
         embedding: None,
+        human_signed: true,
     }
 }
 

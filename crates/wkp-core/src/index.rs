@@ -42,6 +42,14 @@ pub struct Item {
     /// fact, which would violate CLAUDE.md's "never write a file a
     /// harness reads in place" for `index.db` itself.
     pub embedding: Option<Vec<f32>>,
+    /// Whether this item's latest commit is signed by a `role: human`
+    /// principal (design 7.3/7.4, M2-6) -- resolved by the caller via
+    /// `wkp_git::allowed_signers::last_signer_for_path`, since `wkp-core`
+    /// has no git dependency and stays that way (design 3.3's crate
+    /// layout: `wkp-core` and `wkp-git` are siblings, neither depends on
+    /// the other). [`compute_tier`] is the real, non-placeholder consumer
+    /// of this field.
+    pub human_signed: bool,
 }
 
 #[derive(Debug)]
@@ -127,28 +135,47 @@ fn create_schema(conn: &Connection) -> rusqlite::Result<()> {
     conn.execute_batch(SCHEMA)
 }
 
-/// A provisional, type/confidence-based tier heuristic -- **not** the real
-/// gate. Design 7.4's actual tier assignment depends on whether an item's
-/// latest commit is signed by a human key, which doesn't exist until M2
-/// (signing). Until then, this is what `--tier` filters on, documented
-/// here so nobody mistakes it for a security boundary: an agent-written
-/// item cannot promote itself to tier 0 just by setting `type:
-/// project-state` in its own frontmatter today, but it will be able to
-/// once M2's provenance gate replaces this function.
+/// The real, provenance-gated tier rule (design 7.4, M2-6) -- replaces
+/// the M1-4 placeholder (a type/confidence-only heuristic; see the
+/// milestone's own doc history) now that signed commits (M2-2) and the
+/// `allowed_signers` identity model (M2-1) exist to check against. Tier
+/// 0/1 requires *all* of:
 ///
-/// - Agent-written, not yet human-reviewed (`confidence: inferred` or
-///   `proposed`) is always tier 2, regardless of `type`.
-/// - Otherwise: `project-state`/`instruction` -> 0, `feedback`/`knowledge`
-///   -> 1, everything else (`reference`, `skill`, `memory`, unrecognized
-///   types, or no type at all) -> 2.
-/// - Anything under `inbox/` (design 5.4: "agent-written, unreviewed
-///   memory (Tier 2 only until promoted)") is always tier 2, regardless of
-///   `type` or `confidence` -- `wkp promote` (M2) is what's meant to move
-///   an item out of `inbox/` once it's reviewed, and this heuristic must
-///   not let an item promote itself just by claiming `type: project-state`
-///   while still sitting in `inbox/`.
-fn compute_tier(path: &str, fm: &Frontmatter) -> u8 {
+/// - `human_signed`: the item's latest commit is signed by a `role:
+///   human` principal. This alone is the actual design-7.4 gate; every
+///   check below is an additional, independent guard on top of it.
+/// - not under `inbox/` (design 5.4: "agent-written, unreviewed memory,
+///   Tier 2 only until promoted") -- independent of `human_signed`,
+///   because a human could otherwise directly commit a file under
+///   `inbox/` without ever going through `wkp promote` (M2-7), which is
+///   what this store's audit trail is supposed to require.
+/// - `confidence` is not `inferred`/`proposed` -- an item can be
+///   human-signed and still self-report as unreviewed; both signals must
+///   agree, not either alone.
+/// - `expires` (if set) has not passed (design 5.4: "the indexer excludes
+///   expired items from Tier 0 and Tier 1 automatically" -- stored since
+///   M1-1 but never actually checked until now).
+/// - `type: instruction` additionally requires the path to be under
+///   `user/` or anywhere under a `projects/<name>/` directory (design
+///   7.4's extra scoping for instruction-like content). **Simplification**:
+///   this checks "any `projects/*/`", not "the *current* project"
+///   specifically -- tier is a property of the stored item computed at
+///   index-build time, with no per-session "current project" context
+///   available here; revisit if that distinction becomes load-bearing.
+///
+/// Otherwise: `project-state`/(scoped) `instruction` -> 0,
+/// `feedback`/`knowledge` -> 1, everything else -> 2.
+///
+/// Deliberately does **not** verify commits arriving via sync/fetch from
+/// another machine (`wkp verify`) -- that's M3's "unsigned or
+/// unknown-signer commits are excluded from Tier 0 and 1" exit-criterion
+/// line, not this function's; `human_signed` here reflects whatever the
+/// caller resolved regardless of a commit's origin.
+fn compute_tier(path: &str, fm: &Frontmatter, human_signed: bool) -> u8 {
     if path.starts_with("inbox/") || path.contains("/inbox/") {
+        return 2;
+    }
+    if !human_signed {
         return 2;
     }
     if matches!(
@@ -157,11 +184,68 @@ fn compute_tier(path: &str, fm: &Frontmatter) -> u8 {
     ) {
         return 2;
     }
+    if fm.expires.as_deref().is_some_and(is_expired) {
+        return 2;
+    }
     match fm.item_type {
-        Some(ItemType::ProjectState | ItemType::Instruction) => 0,
+        Some(ItemType::Instruction) => {
+            if path.starts_with("user/") || path.contains("projects/") {
+                0
+            } else {
+                2
+            }
+        }
+        Some(ItemType::ProjectState) => 0,
         Some(ItemType::Feedback | ItemType::Knowledge) => 1,
         _ => 2,
     }
+}
+
+/// Whether `expires` (design 5.4's optional ISO date, e.g. `2026-01-01`)
+/// is in the past, by lexicographic comparison against today's date in
+/// the same `YYYY-MM-DD` format -- correct because zero-padded ISO 8601
+/// dates sort identically as strings and as calendar dates, so no date
+/// parsing/arithmetic is needed for the comparison itself. A value that
+/// doesn't look like `YYYY-MM-DD` (too short) is treated as unparseable
+/// and therefore not expired -- fail open, matching this parser's
+/// tolerant posture elsewhere (`wkp-core::frontmatter`), rather than
+/// accidentally demoting an item over a malformed date.
+fn is_expired(expires: &str) -> bool {
+    if expires.len() < 10 {
+        return false;
+    }
+    expires[..10] < *today_iso_date()
+}
+
+/// Today's date as `YYYY-MM-DD`, computed from the system clock without a
+/// calendar/date crate dependency (CLAUDE.md's slim-core rule): Howard
+/// Hinnant's `civil_from_days` algorithm
+/// (<http://howardhinnant.github.io/date_algorithms.html#civil_from_days>),
+/// a well-known, allocation-free, leap-year-correct conversion from a day
+/// count to a proleptic Gregorian calendar date. Verified against known
+/// reference dates (including a leap day and a pre-epoch day) in this
+/// module's tests, not merely transcribed and trusted.
+fn today_iso_date() -> String {
+    let days_since_epoch = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| (d.as_secs() / 86_400) as i64)
+        .unwrap_or(0);
+    let (year, month, day) = civil_from_days(days_since_epoch);
+    format!("{year:04}-{month:02}-{day:02}")
+}
+
+fn civil_from_days(z: i64) -> (i64, u32, u32) {
+    let z = z + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = (z - era * 146_097) as u64; // [0, 146096]
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146_096) / 365; // [0, 399]
+    let y = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100); // [0, 365]
+    let mp = (5 * doy + 2) / 153; // [0, 11]
+    let d = (doy - (153 * mp + 2) / 5 + 1) as u32; // [1, 31]
+    let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32; // [1, 12]
+    let y = if m <= 2 { y + 1 } else { y };
+    (y, m, d)
 }
 
 /// Falls back to roughly 4 characters per token (a common rough estimate
@@ -175,7 +259,7 @@ fn estimate_tokens(fm: &Frontmatter, body: &str) -> u32 {
 
 fn insert_item(conn: &Connection, item: &Item) -> rusqlite::Result<()> {
     let fm = &item.frontmatter;
-    let tier = compute_tier(&item.path, fm);
+    let tier = compute_tier(&item.path, fm, item.human_signed);
     let tokens_estimate = estimate_tokens(fm, &item.body);
     conn.execute("INSERT INTO paths (path) VALUES (?1)", [&item.path])?;
     let embedding_bytes = item
@@ -930,6 +1014,12 @@ mod tests {
     use super::*;
     use crate::frontmatter::{ItemType, Visibility};
 
+    /// `human_signed: true` by default: every existing test in this
+    /// module predates M2-6's signing gate and is testing something else
+    /// entirely (search ranking, traversal, materialize output shape,
+    /// ...) -- defaulting to "properly reviewed" here means none of them
+    /// needed individual updates for M2-6, only the tests that
+    /// specifically exercise the gate itself (below) override it.
     fn item(path: &str, title: &str, body: &str) -> Item {
         let fm = Frontmatter {
             title: Some(title.to_string()),
@@ -940,6 +1030,7 @@ mod tests {
             frontmatter: fm,
             body: body.to_string(),
             embedding: None,
+            human_signed: true,
         }
     }
 
@@ -1000,25 +1091,44 @@ mod tests {
     }
 
     #[test]
-    fn compute_tier_reflects_type_and_confidence() {
+    fn compute_tier_reflects_type_and_confidence_when_human_signed() {
         let mut fm = Frontmatter {
             item_type: Some(ItemType::ProjectState),
             ..Default::default()
         };
-        assert_eq!(compute_tier("a.md", &fm), 0);
+        assert_eq!(compute_tier("a.md", &fm, true), 0);
 
         fm.item_type = Some(ItemType::Feedback);
-        assert_eq!(compute_tier("a.md", &fm), 1);
+        assert_eq!(compute_tier("a.md", &fm, true), 1);
 
         fm.item_type = Some(ItemType::Reference);
-        assert_eq!(compute_tier("a.md", &fm), 2);
+        assert_eq!(compute_tier("a.md", &fm, true), 2);
 
-        // Agent-written content is tier 2 regardless of type, until human
-        // review changes its confidence (design 7.4's real gate; this is
-        // the provisional stand-in -- see compute_tier's doc comment).
+        // A human-signed commit alone isn't enough: confidence must also
+        // agree that the content has been reviewed.
         fm.item_type = Some(ItemType::ProjectState);
         fm.confidence = Some(Confidence::Proposed);
-        assert_eq!(compute_tier("a.md", &fm), 2);
+        assert_eq!(compute_tier("a.md", &fm, true), 2);
+    }
+
+    /// M2-6's actual gate (design 7.4): the check the M1-4 placeholder
+    /// could not make, since signed commits didn't exist yet.
+    #[test]
+    fn compute_tier_requires_a_human_signed_commit_for_tier_0_or_1() {
+        let fm = Frontmatter {
+            item_type: Some(ItemType::ProjectState),
+            ..Default::default()
+        };
+        assert_eq!(
+            compute_tier("a.md", &fm, false),
+            2,
+            "type: project-state alone must not reach tier 0/1 without a human-signed commit"
+        );
+        assert_eq!(
+            compute_tier("a.md", &fm, true),
+            0,
+            "the same frontmatter with a human-signed commit does reach tier 0"
+        );
     }
 
     #[test]
@@ -1028,19 +1138,115 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(
-            compute_tier("inbox/import/claude-md.md", &fm),
+            compute_tier("inbox/import/claude-md.md", &fm, true),
             2,
-            "an inbox/ item must not self-promote to tier 0 via its type"
+            "an inbox/ item must not self-promote to tier 0 via its type, even if human-signed"
         );
         assert_eq!(
-            compute_tier("projects/wkp/inbox/note.md", &fm),
+            compute_tier("projects/wkp/inbox/note.md", &fm, true),
             2,
             "a nested inbox/ directory anywhere in the path must also be caught"
         );
         assert_eq!(
-            compute_tier("projects/wkp/decision.md", &fm),
+            compute_tier("projects/wkp/decision.md", &fm, true),
             0,
             "a normal path with the same frontmatter is unaffected"
+        );
+    }
+
+    #[test]
+    fn compute_tier_instruction_type_requires_user_or_projects_path_scoping() {
+        let fm = Frontmatter {
+            item_type: Some(ItemType::Instruction),
+            ..Default::default()
+        };
+        assert_eq!(
+            compute_tier("org/wide-policy.md", &fm, true),
+            2,
+            "type: instruction outside user/ or projects/ must not reach tier 0"
+        );
+        assert_eq!(compute_tier("user/preferences.md", &fm, true), 0);
+        assert_eq!(compute_tier("projects/wkp/agents.md", &fm, true), 0);
+    }
+
+    #[test]
+    fn compute_tier_expired_item_is_tier_2_regardless_of_type_and_signing() {
+        let mut fm = Frontmatter {
+            item_type: Some(ItemType::ProjectState),
+            ..Default::default()
+        };
+        fm.expires = Some("2000-01-01".to_string());
+        assert_eq!(
+            compute_tier("a.md", &fm, true),
+            2,
+            "an item past its expires date must not reach tier 0/1"
+        );
+
+        fm.expires = Some("9999-12-31".to_string());
+        assert_eq!(
+            compute_tier("a.md", &fm, true),
+            0,
+            "an item with a future expires date is unaffected"
+        );
+
+        fm.expires = None;
+        assert_eq!(
+            compute_tier("a.md", &fm, true),
+            0,
+            "no expires date at all is unaffected"
+        );
+    }
+
+    #[test]
+    fn is_expired_treats_a_too_short_value_as_unparseable_and_not_expired() {
+        assert!(!is_expired("2000"));
+        assert!(!is_expired(""));
+    }
+
+    #[test]
+    fn civil_from_days_matches_known_reference_dates() {
+        // Cross-checked against Python's datetime.date arithmetic,
+        // including a leap day and a pre-epoch (negative day count) date
+        // -- not just transcribed from the algorithm source and trusted.
+        for (days, expected) in [
+            (0i64, (1970, 1, 1)),
+            (11_017, (2000, 3, 1)),
+            (20_703, (2026, 9, 7)),
+            (19_782, (2024, 2, 29)),
+            (-1, (1969, 12, 31)),
+        ] {
+            assert_eq!(civil_from_days(days), expected, "days={days}");
+        }
+    }
+
+    /// End-to-end through `insert_item`/`search`, not just a direct
+    /// `compute_tier` call -- proves `Item::human_signed` actually flows
+    /// through the real index-build path, not only the standalone
+    /// function.
+    #[test]
+    fn unsigned_item_does_not_reach_tier_0_through_the_real_index_build_path() {
+        let mut signed = item("signed.md", "Signed", "shared distinctive vocabulary");
+        signed.frontmatter.item_type = Some(ItemType::ProjectState);
+        signed.human_signed = true;
+
+        let mut unsigned = item(
+            "unsigned.md",
+            "Unsigned",
+            "shared distinctive vocabulary too",
+        );
+        unsigned.frontmatter.item_type = Some(ItemType::ProjectState);
+        unsigned.human_signed = false;
+
+        let conn = build_in_memory(&[signed, unsigned]).expect("build in-memory index");
+        let filter = SearchFilter {
+            tier: Some(0),
+            ..Default::default()
+        };
+        let hits = search(&conn, "distinctive", &filter).expect("search");
+        assert_eq!(
+            hits.iter().map(|h| h.path.as_str()).collect::<Vec<_>>(),
+            vec!["signed.md"],
+            "the unsigned item must not appear in a tier-0 search despite matching type"
         );
     }
 
@@ -1352,7 +1558,11 @@ mod tests {
     fn materialize_tier0_output_is_locked_down() {
         let mut zebra = item("z.md", "Zebra Item", "zebra body");
         zebra.frontmatter.item_type = Some(ItemType::ProjectState);
-        let mut apple = item("a.md", "Apple Item", "apple body");
+        // Under user/ so type: instruction's M2-6 path-scoping rule
+        // still lets it reach tier 0 -- this test is about materialize's
+        // ordering/formatting, not the scoping rule itself (covered by
+        // its own test), so the fixture just needs to stay eligible.
+        let mut apple = item("user/a.md", "Apple Item", "apple body");
         apple.frontmatter.item_type = Some(ItemType::Instruction);
         let conn = build_in_memory(&[zebra, apple]).expect("build in-memory index");
 
@@ -1360,7 +1570,7 @@ mod tests {
         assert_eq!(
             rendered,
             "<wkp-context tier=\"0\">\n\n\
-             ## Apple Item\n\n<!-- source: a.md -->\n\napple body\n\n\
+             ## Apple Item\n\n<!-- source: user/a.md -->\n\napple body\n\n\
              ## Zebra Item\n\n<!-- source: z.md -->\n\nzebra body\n\n\
              </wkp-context>\n",
             "materialize must order items by path and use this exact heading/comment shape"
