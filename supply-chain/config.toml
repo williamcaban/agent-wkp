@@ -13,10 +13,6 @@ url = "https://raw.githubusercontent.com/google/rust-crate-audits/main/audits.to
 [imports.mozilla]
 url = "https://raw.githubusercontent.com/mozilla/supply-chain/main/audits.toml"
 
-[[exemptions.aho-corasick]]
-version = "1.1.5"
-criteria = "safe-to-run"
-
 [[exemptions.anstyle]]
 version = "1.0.14"
 criteria = "safe-to-run"
@@ -134,10 +130,6 @@ criteria = "safe-to-run"
 version = "0.4.34"
 criteria = "safe-to-deploy"
 
-[[exemptions.memchr]]
-version = "2.8.3"
-criteria = "safe-to-run"
-
 [[exemptions.once_cell]]
 version = "1.21.4"
 criteria = "safe-to-deploy"
@@ -148,18 +140,6 @@ criteria = "safe-to-run"
 
 [[exemptions.r-efi]]
 version = "6.0.0"
-criteria = "safe-to-run"
-
-[[exemptions.regex]]
-version = "1.13.1"
-criteria = "safe-to-run"
-
-[[exemptions.regex-automata]]
-version = "0.4.18"
-criteria = "safe-to-run"
-
-[[exemptions.regex-syntax]]
-version = "0.8.11"
 criteria = "safe-to-run"
 
 [[exemptions.ring]]
@@ -245,10 +225,6 @@ criteria = "safe-to-deploy"
 version = "0.8.1"
 criteria = "safe-to-deploy"
 
-[[exemptions.walkdir]]
-version = "2.5.0"
-criteria = "safe-to-run"
-
 [[exemptions.wasi]]
 version = "0.11.1+wasi-snapshot-preview1"
 criteria = "safe-to-deploy"
@@ -256,10 +232,6 @@ criteria = "safe-to-deploy"
 [[exemptions.webpki-roots]]
 version = "1.0.9"
 criteria = "safe-to-deploy"
-
-[[exemptions.winapi-util]]
-version = "0.1.11"
-criteria = "safe-to-run"
 
 [[exemptions.windows-link]]
 version = "0.2.1"

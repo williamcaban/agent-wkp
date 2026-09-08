@@ -7,3 +7,4 @@ pub mod embed;
 pub mod frontmatter;
 pub mod graph;
 pub mod index;
+pub mod secrets;
