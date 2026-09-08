@@ -122,6 +122,15 @@ fn restore_ref(repo_dir: &Path, previous: &PreviousRef) -> Result<(), String> {
 /// call survives the checkout untouched. This is not a general
 /// "move arbitrary already-committed content to another branch"
 /// primitive.
+///
+/// Handles the store's very first commit specially: [`ensure_device_branch`]
+/// needs an existing commit to point a branch at, and there is no
+/// previous branch worth restoring either (an unborn branch -- whatever
+/// `git init`/`init.defaultBranch` happened to name it -- never held
+/// anything). Retargeting `HEAD`'s symbolic ref directly at the device
+/// branch before that first commit means every write a fresh store ever
+/// makes lands on its device branch from the start, not just the second
+/// one onward.
 pub fn commit_to_device_branch(
     repo_dir: &Path,
     device_id: &str,
@@ -132,6 +141,23 @@ pub fn commit_to_device_branch(
     provenance: &Provenance,
 ) -> Result<CommitId, String> {
     let branch = device_branch_name(device_id);
+    let has_any_commit = super::run_git(repo_dir, &["rev-parse", "--verify", "-q", "HEAD"]).is_ok();
+
+    if !has_any_commit {
+        super::run_git(
+            repo_dir,
+            &["symbolic-ref", "HEAD", &format!("refs/heads/{branch}")],
+        )?;
+        return signed_commit::signed_commit(
+            repo_dir,
+            paths,
+            subject,
+            principal,
+            signing_key_path,
+            provenance,
+        );
+    }
+
     ensure_device_branch(repo_dir, device_id)?;
 
     let previous = capture_current_ref(repo_dir)?;
@@ -320,5 +346,43 @@ mod tests {
             device_branch_has_it,
             "the new item must be committed on the device branch"
         );
+    }
+
+    #[test]
+    fn commit_to_device_branch_bootstraps_a_fresh_stores_very_first_commit_onto_the_device_branch()
+    {
+        let dir = temp_dir("commit-device-branch-bootstrap");
+        let repo = dir.path();
+        crate::init_repo(repo).expect("init_repo");
+        crate::allowed_signers::configure_ssh_signing(repo).expect("configure_ssh_signing");
+        let key = generate_test_key(repo, "agent:claude-code@host");
+
+        std::fs::create_dir_all(repo.join("inbox")).expect("create inbox dir");
+        std::fs::write(repo.join("inbox/first-item.md"), "first content\n")
+            .expect("write first inbox item");
+
+        commit_to_device_branch(
+            repo,
+            "device-a",
+            &[PathBuf::from("inbox/first-item.md")],
+            "remember: first item",
+            "agent:claude-code@host",
+            &key,
+            &Provenance::default(),
+        )
+        .expect("commit_to_device_branch on an empty store");
+
+        let current_branch = crate::run_git_stdout(repo, &["symbolic-ref", "--short", "HEAD"])
+            .expect("current branch")
+            .trim()
+            .to_string();
+        assert_eq!(
+            current_branch, "sync/device-a",
+            "the store's very first commit must land directly on the device branch"
+        );
+
+        let has_it =
+            crate::run_git_stdout(repo, &["cat-file", "-e", "HEAD:inbox/first-item.md"]).is_ok();
+        assert!(has_it);
     }
 }

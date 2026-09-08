@@ -248,6 +248,25 @@ fn main() {
                 }
             }
         }
+        Some("sync") => {
+            if let Err(msg) = wkp_git::ensure_min_git_version() {
+                eprintln!("{msg}");
+                std::process::exit(1);
+            }
+            match parse_sync_args(args) {
+                Ok(opts) => match run_sync(&opts) {
+                    Ok(summary) => println!("{summary}"),
+                    Err(msg) => {
+                        eprintln!("wkp: sync failed: {msg}");
+                        std::process::exit(1);
+                    }
+                },
+                Err(msg) => {
+                    eprintln!("wkp: {msg}");
+                    std::process::exit(1);
+                }
+            }
+        }
         _ => {
             if let Err(msg) = wkp_git::ensure_min_git_version() {
                 eprintln!("{msg}");
@@ -579,8 +598,10 @@ impl std::fmt::Display for RememberSummary {
 /// `wkp remember`: the write path (design 7.4, 7.6, M2-5) -- reads the
 /// body from stdin, refuses (no partial file, no commit) on a
 /// [`wkp_core::secrets::scan`] hit, otherwise writes `inbox/<slug>.md`
-/// atomically and commits it via [`wkp_git::signed_commit::signed_commit`]
-/// with [`wkp_git::provenance::Provenance`] trailers -- this is
+/// atomically and commits it via [`wkp_git::sync::commit_to_device_branch`]
+/// (M3-4: onto this device's own `sync/<device-id>` branch, design 6.2
+/// point 1's "avoid" layer -- two devices then never contend for the same
+/// ref) with [`wkp_git::provenance::Provenance`] trailers -- this is
 /// CLAUDE.md's "agent-written memory lands in inbox/ with confidence:
 /// proposed" hard rule made real, not just a frontmatter convention: the
 /// commit itself is signed by the calling agent's own key, never a human
@@ -642,8 +663,10 @@ fn run_remember_with_body(opts: &RememberOptions, body: &str) -> Result<Remember
         confidence: Some("proposed".to_string()),
     };
     let subject = format!("remember: {title}");
-    let commit = wkp_git::signed_commit::signed_commit(
+    let device_id = wkp_git::sync::device_id(&opts.path)?;
+    let commit = wkp_git::sync::commit_to_device_branch(
         &opts.path,
+        &device_id,
         &[PathBuf::from(&relative_path)],
         &subject,
         &opts.principal,
@@ -1468,6 +1491,112 @@ fn parse_resolve_conflicts_args(args: impl Iterator<Item = String>) -> Result<Pa
         }
     }
     Ok(path)
+}
+
+struct SyncOptions {
+    path: PathBuf,
+    remote: String,
+}
+
+/// `wkp sync [--path <dir>] [--remote <name>]` (default remote: `origin`).
+fn parse_sync_args(mut args: impl Iterator<Item = String>) -> Result<SyncOptions, String> {
+    let mut path = std::env::current_dir().map_err(|e| e.to_string())?;
+    let mut remote = "origin".to_string();
+
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--remote" => {
+                remote = args.next().ok_or("--remote requires a value")?;
+            }
+            "--path" => {
+                path = PathBuf::from(args.next().ok_or("--path requires a value")?);
+            }
+            other => return Err(format!("unrecognized argument: {other}")),
+        }
+    }
+
+    Ok(SyncOptions { path, remote })
+}
+
+/// A one-line summary of what `wkp sync` did, for the CLI's stdout.
+struct SyncSummary {
+    remote: String,
+    merged: Vec<String>,
+    pushed_branch: String,
+}
+
+impl std::fmt::Display for SyncSummary {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.merged.is_empty() {
+            write!(
+                f,
+                "wkp: nothing new from {} (pushed {})",
+                self.remote, self.pushed_branch
+            )
+        } else {
+            write!(
+                f,
+                "wkp: merged {} into {}, pushed {}",
+                self.merged.join(", "),
+                self.remote,
+                self.pushed_branch
+            )
+        }
+    }
+}
+
+/// `wkp sync`: the actual "two machines... stay in sync" mechanic (design
+/// 6.1, 6.2, 6.4; M3-4) -- synchronous and on-demand, no daemon (this
+/// milestone's own scope note in `docs/plan/milestones.md`). `git fetch`,
+/// then merge every other device's `sync/*` branch, plus `main` if the
+/// remote has one, into this device's own `sync/<device-id>` branch --
+/// M3-2's `wkp merge-driver` auto-resolves every content-mergeable class
+/// as part of each merge itself, and M3-3's
+/// [`resolve_modify_delete_conflicts`] handles whatever's left (always
+/// exactly the modify/delete class, never anything else -- verified by
+/// `wkp-git`'s own test that the merge driver is never invoked for that
+/// class) before [`wkp_git::finish_merge`] completes the merge commit.
+/// Finally pushes the local device branch -- never `main` directly, never
+/// force: landing content on `main` still needs a human-signed commit or
+/// `wkp promote` (M2-6/M2-7's provenance rules apply unchanged; an
+/// auto-merge commit here is never signed, so `compute_tier` keeps
+/// whatever it touches out of tier 0/1 regardless of which branch it's
+/// on).
+fn run_sync(opts: &SyncOptions) -> Result<SyncSummary, String> {
+    wkp_git::fetch(&opts.path, &opts.remote)?;
+
+    let device_id = wkp_git::sync::device_id(&opts.path)?;
+    wkp_git::sync::ensure_device_branch(&opts.path, &device_id)?;
+    let own_branch = wkp_git::sync::device_branch_name(&device_id);
+    wkp_git::checkout_branch(&opts.path, &own_branch, false)?;
+
+    let mut refs_to_merge = Vec::new();
+    if wkp_git::remote_branch_exists(&opts.path, &opts.remote, "main") {
+        refs_to_merge.push(format!("{}/main", opts.remote));
+    }
+    refs_to_merge.extend(wkp_git::other_device_sync_refs(
+        &opts.path,
+        &opts.remote,
+        &device_id,
+    )?);
+
+    let mut merged = Vec::new();
+    for git_ref in refs_to_merge {
+        let clean = wkp_git::merge_branch(&opts.path, &git_ref)?;
+        if !clean {
+            resolve_modify_delete_conflicts(&opts.path)?;
+            wkp_git::finish_merge(&opts.path)?;
+        }
+        merged.push(git_ref);
+    }
+
+    wkp_git::push_branch(&opts.path, &opts.remote, &own_branch)?;
+
+    Ok(SyncSummary {
+        remote: opts.remote.clone(),
+        merged,
+        pushed_branch: own_branch,
+    })
 }
 
 /// `wkp hooks --framework claude_code`: prints the exact Claude Code
@@ -3475,5 +3604,155 @@ mod tests {
         assert!(inbox_content.contains("confidence: proposed"));
         assert!(inbox_content.contains("item.md"));
         assert!(inbox_content.to_lowercase().contains("delet"));
+    }
+
+    /// Registers the same signer entry (one real keypair, generated once)
+    /// in two separate stores' `allowed_signers` files. M3-4's sync test
+    /// needs two genuinely independent `wkp init`s (never sharing a single
+    /// commit) to reconcile cleanly on their very first cross-device
+    /// merge: `allowed_signers` is tracked, non-`.md` content, so
+    /// `wkp merge-driver`'s `.gitattributes` scoping does not apply to it
+    /// and an add/add divergence there would leave real conflict markers.
+    /// Giving both stores byte-identical `allowed_signers` content up
+    /// front (the same header, the same one entry) sidesteps that
+    /// entirely -- a realistic stand-in for "the org already distributed
+    /// a shared signer roster before either device made its first
+    /// commit", not a workaround for a real gap.
+    fn generate_test_key_and_register_in_both(
+        dir_a: &Path,
+        dir_b: &Path,
+        principal: &str,
+    ) -> TestKey {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let key_name = format!("test-key-{}-{nanos}", slugify(principal));
+        let private_path = dir_a.join(&key_name);
+        let status = std::process::Command::new("ssh-keygen")
+            .args([
+                "-t",
+                "ed25519",
+                "-N",
+                "",
+                "-C",
+                "test",
+                "-f",
+                &private_path.to_string_lossy(),
+                "-q",
+            ])
+            .status()
+            .expect("run ssh-keygen");
+        assert!(status.success(), "ssh-keygen failed");
+        let public_line = std::fs::read_to_string(dir_a.join(format!("{key_name}.pub")))
+            .expect("read generated public key")
+            .trim()
+            .to_string();
+        let mut fields = public_line.split_whitespace();
+        let key_type = fields.next().expect("key type field").to_string();
+        let key_base64 = fields.next().expect("base64 field").to_string();
+
+        for dir in [dir_a, dir_b] {
+            wkp_git::allowed_signers::append(
+                &dir.join("allowed_signers"),
+                &wkp_git::allowed_signers::SignerEntry {
+                    principal: principal.to_string(),
+                    role: wkp_git::allowed_signers::SignerRole::from_principal(principal),
+                    key_type: key_type.clone(),
+                    key_base64: key_base64.clone(),
+                },
+            )
+            .expect("append signer entry");
+        }
+
+        TestKey { private_path }
+    }
+
+    /// M3-4's own acceptance criterion, end to end: two genuinely
+    /// independent local stores (never sharing a commit until they sync
+    /// through a shared remote), each `wkp remember`-writing a different
+    /// item, each `wkp sync`-ing -- both must end up with *both* items in
+    /// their own device branch, and neither's own item is ever lost.
+    #[test]
+    fn wkp_sync_converges_two_independent_devices_through_a_shared_bare_remote() {
+        let remote = temp_dir("sync-bare-remote");
+        wkp_git::init_bare_repo(remote.path()).expect("init_bare_repo");
+
+        let device_a = temp_dir("sync-device-a");
+        let device_b = temp_dir("sync-device-b");
+        test_init(device_a.path()).expect("run_init a");
+        test_init(device_b.path()).expect("run_init b");
+
+        let key = generate_test_key_and_register_in_both(
+            device_a.path(),
+            device_b.path(),
+            "agent:claude-code@host",
+        );
+
+        for dir in [device_a.path(), device_b.path()] {
+            wkp_git::set_local_config(dir, "remote.origin.url", &remote.path().to_string_lossy())
+                .expect("set remote url");
+            wkp_git::set_local_config(
+                dir,
+                "remote.origin.fetch",
+                "+refs/heads/*:refs/remotes/origin/*",
+            )
+            .expect("set remote fetch refspec");
+        }
+
+        let opts_a = remember_opts(device_a.path(), &key, "knowledge", "Item from device A");
+        run_remember_with_body(&opts_a, "content from device A").expect("remember on A");
+        let opts_b = remember_opts(device_b.path(), &key, "knowledge", "Item from device B");
+        run_remember_with_body(&opts_b, "content from device B").expect("remember on B");
+
+        let sync_opts_a = SyncOptions {
+            path: device_a.path().to_path_buf(),
+            remote: "origin".to_string(),
+        };
+        let sync_opts_b = SyncOptions {
+            path: device_b.path().to_path_buf(),
+            remote: "origin".to_string(),
+        };
+
+        // A pushes first (remote is empty; nothing to merge yet).
+        run_sync(&sync_opts_a).expect("first sync on A");
+        // B fetches A's now-published branch and merges it in (their very
+        // first shared commit ever, via --allow-unrelated-histories) --
+        // B's device branch now holds both items.
+        run_sync(&sync_opts_b).expect("first sync on B");
+        // A fetches B's updated branch back; by now B's history contains
+        // A's own original commit, so this is an ordinary, already-related
+        // merge -- A's device branch also ends up with both items.
+        run_sync(&sync_opts_a).expect("second sync on A");
+
+        let device_id_a = wkp_git::sync::device_id(device_a.path()).expect("device_id a");
+        let device_id_b = wkp_git::sync::device_id(device_b.path()).expect("device_id b");
+
+        for (dir, device_id, label) in [
+            (device_a.path(), &device_id_a, "A"),
+            (device_b.path(), &device_id_b, "B"),
+        ] {
+            let branch = wkp_git::sync::device_branch_name(device_id);
+            assert_eq!(
+                wkp_git::current_branch(dir).expect("current_branch"),
+                branch,
+                "device {label} should be left on its own device branch"
+            );
+
+            let inbox_dir = dir.join("inbox");
+            let mut all_content = String::new();
+            for entry in std::fs::read_dir(&inbox_dir).expect("read inbox dir") {
+                let path = entry.expect("dir entry").path();
+                all_content.push_str(&std::fs::read_to_string(&path).expect("read inbox item"));
+            }
+            assert!(
+                all_content.contains("content from device A"),
+                "device {label} lost device A's item: {all_content}"
+            );
+            assert!(
+                all_content.contains("content from device B"),
+                "device {label} lost device B's item: {all_content}"
+            );
+        }
     }
 }
