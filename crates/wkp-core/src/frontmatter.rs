@@ -286,6 +286,68 @@ pub fn parse(input: &str) -> ParseResult {
     }
 }
 
+/// Serializes `fm` back into the `---\nkey: value\n---\n` block [`parse`]
+/// reads -- for a write path that computed frontmatter rather than read
+/// it verbatim off disk (M3-2's merge driver is the first consumer).
+/// Only ever writes a field that is `Some`/non-empty; a field this
+/// parser already tolerates being entirely absent stays absent here
+/// too, rather than writing an explicit `null`.
+pub fn render(fm: &Frontmatter) -> String {
+    let mut block = String::from("---\n");
+    if let Some(title) = &fm.title {
+        block.push_str(&format!("title: {title:?}\n"));
+    }
+    if let Some(item_type) = &fm.item_type {
+        block.push_str(&format!("type: {item_type}\n"));
+    }
+    if let Some(scope) = &fm.scope {
+        block.push_str(&format!("scope: {scope}\n"));
+    }
+    if let Some(workspace) = &fm.workspace {
+        block.push_str(&format!("workspace: {workspace}\n"));
+    }
+    if let Some(visibility) = &fm.visibility {
+        block.push_str(&format!("visibility: {visibility}\n"));
+    }
+    let has_provenance = fm.provenance.actor.is_some()
+        || fm.provenance.session.is_some()
+        || fm.provenance.source.is_some();
+    if has_provenance {
+        block.push_str("provenance:\n");
+        if let Some(actor) = &fm.provenance.actor {
+            block.push_str(&format!("  actor: {actor:?}\n"));
+        }
+        if let Some(session) = &fm.provenance.session {
+            block.push_str(&format!("  session: {session:?}\n"));
+        }
+        if let Some(source) = &fm.provenance.source {
+            block.push_str(&format!("  source: {source}\n"));
+        }
+    }
+    if let Some(confidence) = &fm.confidence {
+        block.push_str(&format!("confidence: {confidence}\n"));
+    }
+    if let Some(expires) = &fm.expires {
+        block.push_str(&format!("expires: {expires:?}\n"));
+    }
+    if let Some(tokens_raw) = &fm.tokens_raw {
+        block.push_str(&format!("tokens: {tokens_raw}\n"));
+    } else if let Some(tokens) = fm.tokens {
+        block.push_str(&format!("tokens: {tokens}\n"));
+    }
+    if !fm.tags.is_empty() {
+        block.push_str(&format!("tags: [{}]\n", fm.tags.join(", ")));
+    }
+    if !fm.refs.is_empty() {
+        block.push_str(&format!("refs: [{}]\n", fm.refs.join(", ")));
+    }
+    if let Some(updated) = &fm.updated {
+        block.push_str(&format!("updated: {updated:?}\n"));
+    }
+    block.push_str("---\n");
+    block
+}
+
 /// If `input` opens with a `---` delimiter line, returns the remainder
 /// after that line. A delimiter line is exactly `---`, optionally
 /// surrounded by trailing whitespace/CR.
@@ -589,6 +651,23 @@ Body text follows.
         assert!(fm.refs.is_empty());
         assert_eq!(fm.updated.as_deref(), Some("2026-09-05"));
         assert_eq!(result.body, "Body text follows.\n");
+    }
+
+    /// M3-2's merge driver is the first consumer of [`render`]; this
+    /// confirms `parse(render(fm)).frontmatter == fm` for a fully
+    /// populated value, not just that `render` compiles.
+    #[test]
+    fn render_round_trips_through_parse_for_a_full_frontmatter() {
+        let original = parse(FULL_EXAMPLE).frontmatter;
+        let rendered = render(&original);
+        let reparsed = parse(&rendered).frontmatter;
+        assert_eq!(original, reparsed, "rendered block:\n{rendered}");
+    }
+
+    #[test]
+    fn render_of_default_frontmatter_omits_every_field() {
+        let rendered = render(&Frontmatter::default());
+        assert_eq!(rendered, "---\n---\n");
     }
 
     #[test]

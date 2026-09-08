@@ -200,6 +200,28 @@ fn main() {
                 std::process::exit(1);
             }
         },
+        // Deliberately no `ensure_min_git_version` check: git itself
+        // invokes this (per its own merge-driver protocol), not a human
+        // typing `wkp`, and it only reads/writes the three plain temp
+        // files git hands it -- no repo access, no `wkp-git` call at all.
+        Some("merge-driver") => {
+            let mut positional = args;
+            let (Some(ancestor), Some(ours), Some(theirs)) =
+                (positional.next(), positional.next(), positional.next())
+            else {
+                eprintln!(
+                    "wkp: merge-driver requires three paths: <ancestor> <ours> <theirs> \
+                     (git supplies these itself per its merge-driver protocol)"
+                );
+                std::process::exit(1);
+            };
+            if let Err(msg) =
+                run_merge_driver(Path::new(&ancestor), Path::new(&ours), Path::new(&theirs))
+            {
+                eprintln!("wkp: merge-driver failed: {msg}");
+                std::process::exit(1);
+            }
+        }
         _ => {
             if let Err(msg) = wkp_git::ensure_min_git_version() {
                 eprintln!("{msg}");
@@ -226,6 +248,7 @@ fn run_init(path: &Path) -> Result<(), String> {
 fn run_init_with_claude_home(path: &Path, claude_home: Option<&Path>) -> Result<(), String> {
     wkp_git::init_repo(path)?;
     wkp_git::apply_init_settings(path)?;
+    configure_merge_driver(path)?;
 
     let wkp_dir = path.join(".wkp");
     std::fs::create_dir_all(&wkp_dir).map_err(|e| e.to_string())?;
@@ -1440,6 +1463,29 @@ const CLAUDE_CODE_HOOK: &str = r#"{
   }
 }"#;
 
+/// `wkp merge-driver <ancestor> <ours> <theirs>` (design 6.2, M3-2): git's
+/// own merge-driver protocol (`gitattributes(5)`, "defining a custom
+/// merge driver") -- git substitutes `%O %A %B` with these three temp
+/// file paths before invoking the configured driver command, and treats
+/// whatever is left in the `%A` (`ours`) file afterward as the merge
+/// result. `wkp_core::merge::merge` always succeeds (see its own doc
+/// comment on why there is no conflicted-exit-code case left for this
+/// driver), so the only way this returns `Err` is a real I/O failure
+/// reading the three inputs or writing the result back.
+fn run_merge_driver(ancestor: &Path, ours: &Path, theirs: &Path) -> Result<(), String> {
+    let base_content = std::fs::read_to_string(ancestor)
+        .map_err(|e| format!("reading ancestor file {}: {e}", ancestor.display()))?;
+    let ours_content = std::fs::read_to_string(ours)
+        .map_err(|e| format!("reading ours file {}: {e}", ours.display()))?;
+    let theirs_content = std::fs::read_to_string(theirs)
+        .map_err(|e| format!("reading theirs file {}: {e}", theirs.display()))?;
+
+    let merged = wkp_core::merge::merge(&base_content, &ours_content, &theirs_content);
+
+    std::fs::write(ours, merged)
+        .map_err(|e| format!("writing merged result to {}: {e}", ours.display()))
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SearchFormat {
     Text,
@@ -1763,11 +1809,19 @@ fn json_string(s: &str) -> String {
 /// artifacts a harness reads (CLAUDE.md: written via temp-file-then-rename,
 /// never synced) and must never be committed to the store.
 fn ensure_gitignored(path: &Path, patterns: &[&str]) -> Result<(), String> {
-    let gitignore_path = path.join(".gitignore");
-    let existing = std::fs::read_to_string(&gitignore_path).unwrap_or_default();
+    ensure_lines_present(&path.join(".gitignore"), patterns)
+}
+
+/// Appends any of `lines` not already present verbatim in `file_path`,
+/// creating the file if it doesn't exist. Idempotent (a line already
+/// there is left alone, never duplicated) -- the shared implementation
+/// behind [`ensure_gitignored`] and [`configure_merge_driver`]'s
+/// `.gitattributes` entry.
+fn ensure_lines_present(file_path: &Path, lines: &[&str]) -> Result<(), String> {
+    let existing = std::fs::read_to_string(file_path).unwrap_or_default();
     let existing_lines: std::collections::HashSet<&str> = existing.lines().collect();
 
-    let missing: Vec<&&str> = patterns
+    let missing: Vec<&&str> = lines
         .iter()
         .filter(|p| !existing_lines.contains(*p))
         .collect();
@@ -1779,11 +1833,42 @@ fn ensure_gitignored(path: &Path, patterns: &[&str]) -> Result<(), String> {
     if !updated.is_empty() && !updated.ends_with('\n') {
         updated.push('\n');
     }
-    for pattern in missing {
-        updated.push_str(pattern);
+    for line in missing {
+        updated.push_str(line);
         updated.push('\n');
     }
-    std::fs::write(&gitignore_path, updated).map_err(|e| e.to_string())
+    std::fs::write(file_path, updated).map_err(|e| e.to_string())
+}
+
+/// `wkp init`'s merge-driver wiring (design 6.2, M3-2): `.gitattributes`
+/// (`*.md merge=wkp`, tracked -- declares *which* driver `*.md` files use)
+/// plus local git config (`merge.wkp.name`/`merge.wkp.driver`, not
+/// tracked -- git deliberately never reads the driver *command* itself
+/// from repo content, since a merge driver runs arbitrary code; each
+/// clone configures that part for itself, the same reasoning
+/// `apply_init_settings`'s other settings already follow). The driver
+/// command uses this process's own absolute path
+/// (`std::env::current_exe`) rather than a bare `wkp`, so it works
+/// correctly even when the binary running `wkp init` isn't the one a
+/// later `git merge` would find first on `PATH` (as in this crate's own
+/// tests, which run `target/debug/wkp`, not an installed copy).
+fn configure_merge_driver(path: &Path) -> Result<(), String> {
+    ensure_lines_present(&path.join(".gitattributes"), &["*.md merge=wkp"])?;
+
+    let wkp_exe = std::env::current_exe()
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_else(|_| "wkp".to_string());
+    wkp_git::set_local_config(
+        path,
+        "merge.wkp.name",
+        "wkp OKF frontmatter merge driver (design 6.2)",
+    )?;
+    wkp_git::set_local_config(
+        path,
+        "merge.wkp.driver",
+        &format!("{wkp_exe} merge-driver %O %A %B"),
+    )?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -3191,5 +3276,52 @@ mod tests {
         );
         assert!(moved.contains("confidence: proposed"));
         assert!(moved.contains("provenance:"));
+    }
+
+    #[test]
+    fn run_merge_driver_writes_the_merged_result_to_the_ours_path() {
+        let temp = temp_dir("merge-driver-file-io");
+        let dir = temp.path();
+        let ancestor = dir.join("ancestor.md");
+        let ours = dir.join("ours.md");
+        let theirs = dir.join("theirs.md");
+        std::fs::write(&ancestor, "---\ntags: []\n---\n\nbody\n").expect("write ancestor");
+        std::fs::write(&ours, "---\ntags: [a]\n---\n\nbody\n").expect("write ours");
+        std::fs::write(&theirs, "---\ntags: [b]\n---\n\nbody\n").expect("write theirs");
+
+        run_merge_driver(&ancestor, &ours, &theirs).expect("run_merge_driver");
+
+        let merged = std::fs::read_to_string(&ours).expect("read merged ours file");
+        let fm = wkp_core::frontmatter::parse(&merged).frontmatter;
+        assert_eq!(fm.tags, vec!["a", "b"]);
+    }
+
+    #[test]
+    fn configure_merge_driver_writes_gitattributes_and_git_config() {
+        let temp = temp_dir("configure-merge-driver");
+        let dir = temp.path();
+        test_init(dir).expect("run_init");
+
+        let gitattributes =
+            std::fs::read_to_string(dir.join(".gitattributes")).expect("read .gitattributes");
+        assert!(gitattributes.contains("*.md merge=wkp"));
+
+        let driver = wkp_git::get_local_config(dir, "merge.wkp.driver")
+            .expect("merge.wkp.driver config must be set");
+        assert!(driver.contains("merge-driver %O %A %B"));
+    }
+
+    #[test]
+    fn configure_merge_driver_is_idempotent() {
+        let temp = temp_dir("configure-merge-driver-idempotent");
+        let dir = temp.path();
+        test_init(dir).expect("first run_init");
+        let first = std::fs::read_to_string(dir.join(".gitattributes")).expect("read first");
+        test_init(dir).expect("second run_init");
+        let second = std::fs::read_to_string(dir.join(".gitattributes")).expect("read second");
+        assert_eq!(
+            first, second,
+            "re-running init must not duplicate the .gitattributes entry"
+        );
     }
 }
