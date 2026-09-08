@@ -15,6 +15,7 @@ use std::fmt;
 use std::io::{Read, Write};
 
 pub mod device_identity;
+pub mod recipients;
 
 /// An X25519 decryption identity (a device's private key).
 pub struct Identity(age::x25519::Identity);
