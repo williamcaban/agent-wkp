@@ -143,6 +143,16 @@ pub fn init_bare_repo(path: &Path) -> Result<(), String> {
 /// through this rather than shelling out themselves.
 pub fn commit_all(repo_dir: &Path, message: &str) -> Result<(), String> {
     run_git(repo_dir, &["add", "-A"])?;
+    commit_staged(repo_dir, message)
+}
+
+/// Commits whatever is currently staged in `repo_dir`'s index, without
+/// first running `git add -A` -- for a caller that already staged
+/// exactly the path(s) it wants (e.g. via [`stage_path`]) and needs a
+/// plain, unsigned commit without also sweeping in every other untracked
+/// change sitting in the working tree the way [`commit_all`] does. Same
+/// per-call identity override, for the same reason.
+pub fn commit_staged(repo_dir: &Path, message: &str) -> Result<(), String> {
     run_git(
         repo_dir,
         &[
@@ -375,6 +385,49 @@ pub fn checkout_branch(repo_dir: &Path, branch_name: &str, create: bool) -> Resu
 /// `main`/`master`.
 pub fn current_branch(repo_dir: &Path) -> Result<String, String> {
     run_git_stdout(repo_dir, &["symbolic-ref", "--short", "HEAD"]).map(|s| s.trim().to_string())
+}
+
+/// The full commit SHA `HEAD` currently resolves to. `wkp sync` (M3-4/M3-7)
+/// records this right before merging anything in, so it can later ask "what
+/// landed between then and now" via [`commits_between`].
+pub fn current_commit(repo_dir: &Path) -> Result<String, String> {
+    run_git_stdout(repo_dir, &["rev-parse", "HEAD"]).map(|s| s.trim().to_string())
+}
+
+/// Every commit reachable from `until` but not from `since`
+/// (`git log <since>..<until>`), as `(full sha, subject)` pairs -- the
+/// "what did this sync actually bring in" query M3-7's fetch-time
+/// signature reporting needs. Newest-first (`git log`'s own default
+/// order); a summary report doesn't need any particular order.
+pub fn commits_between(
+    repo_dir: &Path,
+    since: &str,
+    until: &str,
+) -> Result<Vec<(String, String)>, String> {
+    let stdout = run_git_stdout(
+        repo_dir,
+        &["log", "--format=%H%x09%s", &format!("{since}..{until}")],
+    )?;
+    Ok(stdout
+        .lines()
+        .filter_map(|line| {
+            let mut parts = line.splitn(2, '\t');
+            let sha = parts.next()?.to_string();
+            let subject = parts.next().unwrap_or("").to_string();
+            Some((sha, subject))
+        })
+        .collect())
+}
+
+/// Whether `commit` has more than one parent -- a real merge commit, not
+/// a regular content commit. `wkp sync`'s own merge commits (M3-4) are
+/// never signed by design (they carry no real provenance either way; see
+/// [`merge_branch`]'s doc comment), so M3-7's fetch-time signature report
+/// uses this to skip them rather than flagging one on every single sync
+/// that needed a real (non-fast-forward) merge.
+pub fn is_merge_commit(repo_dir: &Path, commit: &str) -> Result<bool, String> {
+    let stdout = run_git_stdout(repo_dir, &["rev-list", "--parents", "-n", "1", commit])?;
+    Ok(stdout.split_whitespace().count() > 2)
 }
 
 /// Merges `branch_name` into `repo_dir`'s current branch (`git merge
@@ -1631,5 +1684,83 @@ mod tests {
                 },
             }]
         );
+    }
+
+    #[test]
+    fn current_commit_matches_rev_parse_head() {
+        let repo = TempGitRepo::new("current-commit");
+        repo.write("item.md", "hello\n");
+        repo.commit_all("initial");
+        let expected = run_git_stdout(repo.path(), &["rev-parse", "HEAD"])
+            .expect("rev-parse HEAD")
+            .trim()
+            .to_string();
+        assert_eq!(
+            current_commit(repo.path()).expect("current_commit"),
+            expected
+        );
+    }
+
+    #[test]
+    fn commits_between_reports_only_the_new_commits_in_order() {
+        let repo = TempGitRepo::new("commits-between");
+        repo.write("item.md", "one\n");
+        repo.commit_all("first");
+        let since = current_commit(repo.path()).expect("current_commit");
+        repo.write("item.md", "two\n");
+        repo.commit_all("second");
+        repo.write("item.md", "three\n");
+        repo.commit_all("third");
+        let until = current_commit(repo.path()).expect("current_commit");
+
+        let commits = commits_between(repo.path(), &since, &until).expect("commits_between");
+        let subjects: Vec<&str> = commits.iter().map(|(_, s)| s.as_str()).collect();
+        assert_eq!(subjects, vec!["third", "second"]);
+    }
+
+    #[test]
+    fn commits_between_is_empty_when_nothing_new_landed() {
+        let repo = TempGitRepo::new("commits-between-empty");
+        repo.write("item.md", "hello\n");
+        repo.commit_all("initial");
+        let sha = current_commit(repo.path()).expect("current_commit");
+        assert!(commits_between(repo.path(), &sha, &sha)
+            .expect("commits_between")
+            .is_empty());
+    }
+
+    #[test]
+    fn commit_staged_commits_only_what_was_explicitly_staged() {
+        let repo = TempGitRepo::new("commit-staged");
+        repo.write("item.md", "hello\n");
+        repo.commit_all("initial");
+        repo.write("staged.md", "staged\n");
+        repo.write("not-staged.md", "not staged\n");
+        stage_path(repo.path(), "staged.md").expect("stage_path");
+
+        commit_staged(repo.path(), "only the staged file").expect("commit_staged");
+
+        assert!(run_git_stdout(repo.path(), &["cat-file", "-e", "HEAD:staged.md"]).is_ok());
+        assert!(run_git_stdout(repo.path(), &["cat-file", "-e", "HEAD:not-staged.md"]).is_err());
+    }
+
+    #[test]
+    fn is_merge_commit_distinguishes_a_real_merge_from_a_regular_commit() {
+        let repo = TempGitRepo::new("is-merge-commit");
+        let main = repo.current_branch();
+        repo.write("item.md", "base\n");
+        repo.commit_all("base");
+        let regular_commit = current_commit(repo.path()).expect("current_commit");
+        repo.checkout_new_branch("feature");
+        repo.write("other.md", "feature\n");
+        repo.commit_all("feature adds a file");
+        repo.checkout(&main);
+        repo.write("main.md", "main\n");
+        repo.commit_all("main adds a file");
+        assert!(repo.merge("feature"));
+        let merge_commit = current_commit(repo.path()).expect("current_commit");
+
+        assert!(!is_merge_commit(repo.path(), &regular_commit).expect("is_merge_commit"));
+        assert!(is_merge_commit(repo.path(), &merge_commit).expect("is_merge_commit"));
     }
 }
