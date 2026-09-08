@@ -237,22 +237,49 @@ pub struct ModifyDeleteConflict {
     pub deleted_by: DeletedBy,
 }
 
-/// Scans `repo_dir` (expected to be mid-merge, i.e. `MERGE_HEAD` present
-/// and some paths left unmerged) for modify/delete conflicts specifically
-/// -- design 6.2's "a deletion always loses to a modification" needs its
-/// own detection step because git's own three-way merge machinery stops
-/// with `CONFLICT (modify/delete)` for this class *without* ever invoking
-/// a content merge driver (there is no "theirs" -- or "ours" -- content to
-/// hand one). This is why `wkp merge-driver` (M3-2) never sees these
-/// paths: they never reach that protocol at all.
-///
-/// Every other unmerged class (`AA`/`DD`/`AU`/`UA`/`UU`) is out of this
-/// function's scope and left alone rather than misclassified --
-/// `wkp merge-driver`'s `.gitattributes` wiring already resolves add/add
-/// and modify/modify frontmatter conflicts, and (per `wkp_core::merge`'s
-/// own doc comment) that driver always succeeds, so those classes never
-/// remain unmerged after a `git merge` returns in the first place.
-pub fn modify_delete_conflicts(repo_dir: &Path) -> Result<Vec<ModifyDeleteConflict>, String> {
+/// Which class of unmerged entry `git status --porcelain=v2` reports a
+/// path as (M3-6, `wkp sync status`'s "ask" layer of design 6.2's
+/// strategy: report whatever `wkp merge-driver` (M3-2) and
+/// [`modify_delete_conflicts`] (M3-3) didn't already auto-resolve, rather
+/// than assume only the modify/delete class can ever remain -- a content
+/// conflict on a path `.gitattributes` doesn't scope to the custom driver
+/// (e.g. any non-`.md` path) genuinely can stay unresolved this way).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConflictKind {
+    /// `UD`/`DU`: design 6.2's "deletion always loses to a modification"
+    /// class -- `wkp sync`/`wkp bundle import` already resolve this
+    /// automatically via [`modify_delete_conflicts`]; seeing it here means
+    /// something interrupted that resolution before it finished.
+    ModifyDelete { deleted_by: DeletedBy },
+    /// `UU`: both sides modified the path's content. Auto-resolved by
+    /// `wkp merge-driver` for any `*.md` path; a real, still-open conflict
+    /// here means the path is outside that scope.
+    Content,
+    /// `AA`: both sides independently created the path.
+    AddAdd,
+    /// `DD`: both sides deleted the path (nothing to keep either way).
+    BothDeleted,
+    /// `AU`/`UA`: added on one side only, alongside an unrelated change
+    /// that still needs reconciling on the other -- rare in practice, not
+    /// one of the named classes above.
+    Other,
+}
+
+/// One path currently left in an unmerged (conflicted) state.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Conflict {
+    pub path: PathBuf,
+    pub kind: ConflictKind,
+}
+
+/// Scans `repo_dir` for every path `git status --porcelain=v2` currently
+/// reports as unmerged, classified by [`ConflictKind`] -- the general
+/// form [`modify_delete_conflicts`] is now built on. `wkp sync status`
+/// (M3-6, design 6.2 point 3's "ask") calls this directly to report
+/// *anything* left open, not just the modify/delete class; `wkp
+/// sync`/`wkp bundle import`'s own merge loop only ever needs the
+/// modify/delete-scoped view.
+pub fn conflicts(repo_dir: &Path) -> Result<Vec<Conflict>, String> {
     let stdout = run_git_stdout(repo_dir, &["status", "--porcelain=v2"])?;
     let mut conflicts = Vec::new();
     for line in stdout.lines() {
@@ -267,17 +294,54 @@ pub fn modify_delete_conflicts(repo_dir: &Path) -> Result<Vec<ModifyDeleteConfli
         let (Some(xy), Some(path)) = (fields.first(), fields.get(9)) else {
             continue;
         };
-        let deleted_by = match *xy {
-            "DU" => DeletedBy::Ours,
-            "UD" => DeletedBy::Theirs,
-            _ => continue,
+        let kind = match *xy {
+            "DU" => ConflictKind::ModifyDelete {
+                deleted_by: DeletedBy::Ours,
+            },
+            "UD" => ConflictKind::ModifyDelete {
+                deleted_by: DeletedBy::Theirs,
+            },
+            "UU" => ConflictKind::Content,
+            "AA" => ConflictKind::AddAdd,
+            "DD" => ConflictKind::BothDeleted,
+            _ => ConflictKind::Other,
         };
-        conflicts.push(ModifyDeleteConflict {
+        conflicts.push(Conflict {
             path: PathBuf::from(*path),
-            deleted_by,
+            kind,
         });
     }
     Ok(conflicts)
+}
+
+/// Scans `repo_dir` (expected to be mid-merge, i.e. `MERGE_HEAD` present
+/// and some paths left unmerged) for modify/delete conflicts specifically
+/// -- design 6.2's "a deletion always loses to a modification" needs its
+/// own detection step because git's own three-way merge machinery stops
+/// with `CONFLICT (modify/delete)` for this class *without* ever invoking
+/// a content merge driver (there is no "theirs" -- or "ours" -- content to
+/// hand one). This is why `wkp merge-driver` (M3-2) never sees these
+/// paths: they never reach that protocol at all.
+///
+/// Every other unmerged class (`AA`/`DD`/`AU`/`UA`/`UU`) is out of this
+/// function's scope and left alone rather than misclassified --
+/// `wkp merge-driver`'s `.gitattributes` wiring already resolves add/add
+/// and modify/modify frontmatter conflicts, and (per `wkp_core::merge`'s
+/// own doc comment) that driver always succeeds, so those classes never
+/// remain unmerged after a `git merge` returns in the first place. See
+/// [`conflicts`] for the general form covering every class, used by `wkp
+/// sync status` (M3-6).
+pub fn modify_delete_conflicts(repo_dir: &Path) -> Result<Vec<ModifyDeleteConflict>, String> {
+    Ok(conflicts(repo_dir)?
+        .into_iter()
+        .filter_map(|c| match c.kind {
+            ConflictKind::ModifyDelete { deleted_by } => Some(ModifyDeleteConflict {
+                path: c.path,
+                deleted_by,
+            }),
+            _ => None,
+        })
+        .collect())
 }
 
 /// Stages `path` at whatever content is currently in the working tree
@@ -1495,5 +1559,77 @@ mod tests {
         // was cut from (which already has that prerequisite commit) must
         // still succeed.
         bundle_verify(publisher.path(), &bundle_path).expect("bundle_verify (incremental)");
+    }
+
+    #[test]
+    fn conflicts_is_empty_on_a_clean_repo() {
+        let repo = TempGitRepo::new("conflicts-clean");
+        repo.write("item.md", "hello\n");
+        repo.commit_all("initial");
+        assert!(conflicts(repo.path()).expect("conflicts").is_empty());
+    }
+
+    #[test]
+    fn conflicts_reports_a_real_content_conflict_on_a_non_md_path() {
+        // `.gitattributes: *.md merge=wkp` only scopes the custom driver
+        // to `.md` paths (M3-2) -- a plain text file that both branches
+        // genuinely change differently is exactly the class `wkp merge
+        // -driver` can't touch and `modify_delete_conflicts` doesn't
+        // cover either, so it must stay unmerged for `wkp sync status`
+        // (M3-6) to have something real to report.
+        let repo = TempGitRepo::new("conflicts-content");
+        repo.write(".gitattributes", "*.md merge=wkp\n");
+        set_local_config(repo.path(), "merge.wkp.name", "test driver").expect("set config");
+        set_local_config(repo.path(), "merge.wkp.driver", "true %A").expect("set config");
+        let main = repo.current_branch();
+        repo.write("notes.txt", "base\n");
+        repo.commit_all("base");
+        repo.checkout_new_branch("feature");
+        repo.checkout(&main);
+        repo.write("notes.txt", "changed by main\n");
+        repo.commit_all("main changes");
+        repo.checkout("feature");
+        repo.write("notes.txt", "changed by feature\n");
+        repo.commit_all("feature changes");
+        repo.checkout(&main);
+
+        assert!(!repo.merge("feature"), "expected a real content conflict");
+
+        let found = conflicts(repo.path()).expect("conflicts");
+        assert_eq!(
+            found,
+            vec![Conflict {
+                path: PathBuf::from("notes.txt"),
+                kind: ConflictKind::Content,
+            }]
+        );
+    }
+
+    #[test]
+    fn conflicts_still_reports_modify_delete_paths_alongside_the_general_view() {
+        let repo = TempGitRepo::new("conflicts-modify-delete");
+        let main = repo.current_branch();
+        repo.write("item.md", "base content\n");
+        repo.commit_all("base");
+        repo.checkout_new_branch("feature");
+        repo.checkout(&main);
+        repo.write("item.md", "modified by main\n");
+        repo.commit_all("main modifies");
+        repo.checkout("feature");
+        repo.remove_and_commit("item.md", "feature deletes");
+        repo.checkout(&main);
+
+        assert!(!repo.merge("feature"));
+
+        let found = conflicts(repo.path()).expect("conflicts");
+        assert_eq!(
+            found,
+            vec![Conflict {
+                path: PathBuf::from("item.md"),
+                kind: ConflictKind::ModifyDelete {
+                    deleted_by: DeletedBy::Theirs
+                },
+            }]
+        );
     }
 }
