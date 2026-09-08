@@ -14,6 +14,8 @@ use age::secrecy::ExposeSecret;
 use std::fmt;
 use std::io::{Read, Write};
 
+pub mod device_identity;
+
 /// An X25519 decryption identity (a device's private key).
 pub struct Identity(age::x25519::Identity);
 
@@ -38,8 +40,13 @@ pub enum Error {
     /// original recipients).
     Decrypt(age::DecryptError),
     /// An I/O error while streaming plaintext/ciphertext through age's
-    /// `Read`/`Write` adapters.
+    /// `Read`/`Write` adapters, or while reading/writing the file-fallback
+    /// identity in [`device_identity`].
     Io(std::io::Error),
+    /// The OS keystore (macOS Keychain / Linux secret-service) rejected the
+    /// operation, or -- far more commonly in practice -- is not reachable
+    /// at all (no D-Bus session, no Keychain). See [`device_identity`].
+    Keystore(keyring_core::Error),
 }
 
 impl fmt::Display for Error {
@@ -51,6 +58,7 @@ impl fmt::Display for Error {
             Error::Encrypt(e) => write!(f, "age encryption failed: {e}"),
             Error::Decrypt(e) => write!(f, "age decryption failed: {e}"),
             Error::Io(e) => write!(f, "I/O error during age streaming: {e}"),
+            Error::Keystore(e) => write!(f, "OS keystore error: {e}"),
         }
     }
 }
