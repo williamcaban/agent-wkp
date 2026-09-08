@@ -362,6 +362,26 @@ pub fn remove_from_index(repo_dir: &Path, path: &str) -> Result<(), String> {
     run_git(repo_dir, &["update-index", "--remove", "--", path])
 }
 
+/// Sets a single local (per-repository, not global) git config key.
+/// `apply_init_settings`/`allowed_signers::configure_ssh_signing` already
+/// set config this same way internally; this is the generic, public
+/// version other crates need for a one-off key -- the merge-driver
+/// wiring (M3-2: `merge.wkp.name`/`merge.wkp.driver`), so far the only
+/// external caller.
+pub fn set_local_config(repo_dir: &Path, key: &str, value: &str) -> Result<(), String> {
+    run_git(repo_dir, &["config", "--local", key, value])
+}
+
+/// Reads a single local git config key, `None` if it isn't set at all
+/// (not an error -- an absent key is a completely normal, expected
+/// state for optional configuration like the merge driver's own
+/// settings before `wkp init` has run).
+pub fn get_local_config(repo_dir: &Path, key: &str) -> Option<String> {
+    run_git_stdout(repo_dir, &["config", "--local", "--get", key])
+        .ok()
+        .map(|s| s.trim().to_string())
+}
+
 /// Whether `core.fsmonitor` is enabled for `repo_dir`. Purely
 /// informational (e.g. for tests or diagnostics): [`detect_changes`]
 /// behaves identically either way, since `git status` consults fsmonitor
