@@ -61,13 +61,13 @@ criteria = "safe-to-run"
 version = "1.18.0"
 criteria = "safe-to-run"
 
-[[exemptions.errno]]
-version = "0.3.14"
-criteria = "safe-to-run"
-
 [[exemptions.fastrand]]
 version = "2.5.0"
 criteria = "safe-to-run"
+
+[[exemptions.fsevent-sys]]
+version = "4.1.0"
+criteria = "safe-to-deploy"
 
 [[exemptions.getrandom]]
 version = "0.2.17"
@@ -93,12 +93,28 @@ criteria = "safe-to-deploy"
 version = "1.10.1"
 criteria = "safe-to-deploy"
 
+[[exemptions.inotify]]
+version = "0.11.5"
+criteria = "safe-to-deploy"
+
+[[exemptions.inotify-sys]]
+version = "0.1.8"
+criteria = "safe-to-deploy"
+
 [[exemptions.is-terminal]]
 version = "0.4.17"
 criteria = "safe-to-run"
 
 [[exemptions.itoa]]
 version = "1.0.18"
+criteria = "safe-to-deploy"
+
+[[exemptions.kqueue]]
+version = "1.2.1"
+criteria = "safe-to-deploy"
+
+[[exemptions.kqueue-sys]]
+version = "1.1.2"
 criteria = "safe-to-deploy"
 
 [[exemptions.libc]]
@@ -122,12 +138,12 @@ provenance/release process instead) by a human reviewer before being
 treated as durable.
 """
 
-[[exemptions.linux-raw-sys]]
-version = "0.12.1"
-criteria = "safe-to-run"
-
 [[exemptions.log]]
 version = "0.4.34"
+criteria = "safe-to-deploy"
+
+[[exemptions.notify]]
+version = "8.2.0"
 criteria = "safe-to-deploy"
 
 [[exemptions.once_cell]]
@@ -160,10 +176,6 @@ unsafe code written in this workspace. This exemption substitutes for the
 changes and should be replaced with a real `cargo vet certify` by a human
 reviewer before being treated as durable.
 """
-
-[[exemptions.rustix]]
-version = "1.1.4"
-criteria = "safe-to-run"
 
 [[exemptions.rustls]]
 version = "0.23.44"
@@ -231,54 +243,6 @@ criteria = "safe-to-deploy"
 
 [[exemptions.webpki-roots]]
 version = "1.0.9"
-criteria = "safe-to-deploy"
-
-[[exemptions.windows-link]]
-version = "0.2.1"
-criteria = "safe-to-run"
-
-[[exemptions.windows-sys]]
-version = "0.52.0"
-criteria = "safe-to-deploy"
-
-[[exemptions.windows-sys]]
-version = "0.61.2"
-criteria = "safe-to-run"
-
-[[exemptions.windows-targets]]
-version = "0.52.6"
-criteria = "safe-to-deploy"
-
-[[exemptions.windows_aarch64_gnullvm]]
-version = "0.52.6"
-criteria = "safe-to-deploy"
-
-[[exemptions.windows_aarch64_msvc]]
-version = "0.52.6"
-criteria = "safe-to-deploy"
-
-[[exemptions.windows_i686_gnu]]
-version = "0.52.6"
-criteria = "safe-to-deploy"
-
-[[exemptions.windows_i686_gnullvm]]
-version = "0.52.6"
-criteria = "safe-to-deploy"
-
-[[exemptions.windows_i686_msvc]]
-version = "0.52.6"
-criteria = "safe-to-deploy"
-
-[[exemptions.windows_x86_64_gnu]]
-version = "0.52.6"
-criteria = "safe-to-deploy"
-
-[[exemptions.windows_x86_64_gnullvm]]
-version = "0.52.6"
-criteria = "safe-to-deploy"
-
-[[exemptions.windows_x86_64_msvc]]
-version = "0.52.6"
 criteria = "safe-to-deploy"
 
 [[exemptions.zerocopy]]

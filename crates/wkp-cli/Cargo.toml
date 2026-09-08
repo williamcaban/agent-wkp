@@ -15,6 +15,13 @@ path = "src/main.rs"
 [dependencies]
 wkp-core = { version = "0.1.0", path = "../wkp-core" }
 wkp-git = { path = "../wkp-git" }
+# M3-8 (wkpd): file-watch cycle. Named explicitly by design 4.2.
+notify = "8"
+# M3-8 (wkpd): safe UDS peer-credential verification without `unsafe` in
+# this crate. See docs/adr/0004-wkpd-peer-credential-verification.md.
+# Already a transitive dependency (via `tempfile`) before this; promoted
+# to direct here, no new supply-chain surface.
+rustix = { version = "1.1.4", default-features = false, features = ["net", "process", "std"] }
 
 [dev-dependencies]
 tempfile = "3.27.0"

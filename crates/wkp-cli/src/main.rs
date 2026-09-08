@@ -19,6 +19,7 @@ mod remember;
 mod resolve_conflicts;
 mod search;
 mod sync_cmd;
+mod wkpd;
 
 #[cfg(test)]
 mod test_support;
@@ -348,6 +349,24 @@ fn main() {
                     eprintln!(
                         "wkp: bundle requires a subcommand: export or import (got {other:?})"
                     );
+                    std::process::exit(1);
+                }
+            }
+        }
+        Some("wkpd") => {
+            if let Err(msg) = wkp_git::ensure_min_git_version() {
+                eprintln!("{msg}");
+                std::process::exit(1);
+            }
+            match wkpd::parse_wkpd_args(args) {
+                Ok(opts) => {
+                    if let Err(msg) = wkpd::run_wkpd(&opts) {
+                        eprintln!("wkp: wkpd failed: {msg}");
+                        std::process::exit(1);
+                    }
+                }
+                Err(msg) => {
+                    eprintln!("wkp: {msg}");
                     std::process::exit(1);
                 }
             }
