@@ -22,7 +22,6 @@
 //! (or a manual `wkp` write) captures it too. Not silently lossy, just a
 //! deliberately narrow first version.
 
-use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
@@ -108,6 +107,8 @@ fn socket_path_for(opts: &WkpdOptions) -> PathBuf {
 /// Linux-only -- see the module doc comment and ADR-0004.
 #[cfg(target_os = "linux")]
 fn bind_socket(path: &Path) -> Result<UnixListener, String> {
+    use std::os::unix::fs::PermissionsExt;
+
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
     }
@@ -143,6 +144,17 @@ fn peer_is_self(stream: &UnixStream) -> bool {
         rustix::net::sockopt::socket_peercred(stream.as_fd()),
         Ok(cred) if cred.uid == my_uid
     )
+}
+
+/// Unreachable in practice on any platform other than Linux: [`bind_socket`]
+/// already refuses to bind the control socket at all there, so
+/// [`serve_control_socket`] is never actually entered with a connection to
+/// check. Still needs to exist so the crate compiles for every target this
+/// workspace cross-compiles for -- `false` is the fail-closed answer if it
+/// were ever somehow reached.
+#[cfg(not(target_os = "linux"))]
+fn peer_is_self(_stream: &UnixStream) -> bool {
+    false
 }
 
 /// Accepts connections on `listener` forever, verifying each peer before
@@ -316,6 +328,8 @@ mod tests {
 
     #[test]
     fn bind_socket_creates_a_mode_0600_socket_file() {
+        use std::os::unix::fs::PermissionsExt;
+
         let temp = temp_dir("wkpd-bind-socket");
         let socket_path = temp.path().join("wkpd.sock");
         let _listener = bind_socket(&socket_path).expect("bind_socket");
