@@ -253,17 +253,41 @@ fn main() {
                 eprintln!("{msg}");
                 std::process::exit(1);
             }
-            match parse_sync_args(args) {
-                Ok(opts) => match run_sync(&opts) {
-                    Ok(summary) => println!("{summary}"),
+            // `wkp sync status` is a sub-subcommand; anything else (or
+            // nothing at all) falls through to the ordinary `wkp sync
+            // [--remote <name>] [--path <dir>]` flow, so the peeked token
+            // has to be put back for `parse_sync_args` when it isn't
+            // "status".
+            let mut args = args;
+            let first = args.next();
+            if first.as_deref() == Some("status") {
+                match parse_sync_status_args(args) {
+                    Ok(path) => match run_sync_status(&path) {
+                        Ok(conflicts) => println!("{}", SyncStatusSummary { conflicts }),
+                        Err(msg) => {
+                            eprintln!("wkp: sync status failed: {msg}");
+                            std::process::exit(1);
+                        }
+                    },
                     Err(msg) => {
-                        eprintln!("wkp: sync failed: {msg}");
+                        eprintln!("wkp: {msg}");
                         std::process::exit(1);
                     }
-                },
-                Err(msg) => {
-                    eprintln!("wkp: {msg}");
-                    std::process::exit(1);
+                }
+            } else {
+                let rebuilt = first.into_iter().chain(args);
+                match parse_sync_args(rebuilt) {
+                    Ok(opts) => match run_sync(&opts) {
+                        Ok(summary) => println!("{summary}"),
+                        Err(msg) => {
+                            eprintln!("wkp: sync failed: {msg}");
+                            std::process::exit(1);
+                        }
+                    },
+                    Err(msg) => {
+                        eprintln!("wkp: {msg}");
+                        std::process::exit(1);
+                    }
                 }
             }
         }
@@ -1656,6 +1680,71 @@ fn merge_refs_into_current_branch(
         merged.push(git_ref);
     }
     Ok(merged)
+}
+
+/// `wkp sync status [--path <dir>]`: only flag is an optional store path
+/// (default: cwd), matching `wkp index`/`wkp materialize`'s convention.
+fn parse_sync_status_args(mut args: impl Iterator<Item = String>) -> Result<PathBuf, String> {
+    let mut path = std::env::current_dir().map_err(|e| e.to_string())?;
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--path" => path = PathBuf::from(args.next().ok_or("--path requires a value")?),
+            other => return Err(format!("unrecognized argument: {other}")),
+        }
+    }
+    Ok(path)
+}
+
+/// `wkp sync status`: design 6.2 point 3's "ask" -- surfaces whatever
+/// `wkp merge-driver` (M3-2) and `wkp sync`/`wkp bundle import`'s own
+/// modify/delete handling (M3-3) didn't already auto-resolve, as an
+/// explicit, harness-actionable report (M3-6). Reports an empty list on a
+/// clean repo, not an error -- a conflict is not required for this to run
+/// successfully. Deliberately read-only: resolving a reported conflict is
+/// a normal editing task for whoever (human or agent) reads this report,
+/// using `wkp`'s existing write commands, not something this command does
+/// itself.
+fn run_sync_status(path: &Path) -> Result<Vec<wkp_git::Conflict>, String> {
+    wkp_git::conflicts(path)
+}
+
+/// A one-line-per-conflict summary of `wkp sync status`'s output, for the
+/// CLI's stdout.
+struct SyncStatusSummary {
+    conflicts: Vec<wkp_git::Conflict>,
+}
+
+impl std::fmt::Display for SyncStatusSummary {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.conflicts.is_empty() {
+            return write!(f, "wkp: clean, nothing to resolve");
+        }
+        write!(f, "wkp: {} conflict(s):", self.conflicts.len())?;
+        for conflict in &self.conflicts {
+            write!(
+                f,
+                "\n  {}\t{}",
+                describe_conflict_kind(conflict.kind),
+                conflict.path.display()
+            )?;
+        }
+        Ok(())
+    }
+}
+
+fn describe_conflict_kind(kind: wkp_git::ConflictKind) -> &'static str {
+    match kind {
+        wkp_git::ConflictKind::ModifyDelete {
+            deleted_by: wkp_git::DeletedBy::Ours,
+        } => "modify/delete (deleted by us)",
+        wkp_git::ConflictKind::ModifyDelete {
+            deleted_by: wkp_git::DeletedBy::Theirs,
+        } => "modify/delete (deleted by them)",
+        wkp_git::ConflictKind::Content => "content",
+        wkp_git::ConflictKind::AddAdd => "add/add",
+        wkp_git::ConflictKind::BothDeleted => "both deleted",
+        wkp_git::ConflictKind::Other => "other",
+    }
 }
 
 struct BundleExportOptions {
@@ -4122,5 +4211,73 @@ mod tests {
                 "tier {tier} must not include a bundle-imported, still agent-signed item: {content}"
             );
         }
+    }
+
+    #[test]
+    fn parse_sync_status_args_reads_path() {
+        let path = parse_sync_status_args(args(&["--path", "/tmp/store"]))
+            .expect("parse_sync_status_args");
+        assert_eq!(path, PathBuf::from("/tmp/store"));
+    }
+
+    #[test]
+    fn run_sync_status_reports_clean_on_a_repo_with_no_conflicts() {
+        let temp = temp_dir("sync-status-clean");
+        let dir = temp.path();
+        test_init(dir).expect("run_init");
+        std::fs::write(dir.join("item.md"), "hello\n").expect("write item.md");
+        wkp_git::commit_all(dir, "initial").expect("commit_all");
+
+        let conflicts = run_sync_status(dir).expect("run_sync_status");
+        assert!(conflicts.is_empty(), "{conflicts:?}");
+        assert_eq!(
+            SyncStatusSummary { conflicts }.to_string(),
+            "wkp: clean, nothing to resolve"
+        );
+    }
+
+    /// M3-6's own acceptance criterion, end to end: force a real
+    /// unresolved conflict that `wkp merge-driver` (M3-2, scoped to
+    /// `*.md` paths only) and `resolve_modify_delete_conflicts` (M3-3,
+    /// scoped to the modify/delete class only) cannot touch -- two
+    /// branches genuinely changing the same non-`.md` path's content
+    /// differently -- and confirm `wkp sync status` reports it.
+    #[test]
+    fn run_sync_status_reports_a_real_unresolved_content_conflict() {
+        let temp = temp_dir("sync-status-content-conflict");
+        let dir = temp.path();
+        test_init(dir).expect("run_init");
+        let main = wkp_git::current_branch(dir).expect("current_branch");
+
+        std::fs::write(dir.join("notes.txt"), "base\n").expect("write notes.txt");
+        wkp_git::commit_all(dir, "base").expect("commit_all");
+        wkp_git::checkout_branch(dir, "feature", true).expect("branch feature");
+
+        wkp_git::checkout_branch(dir, &main, false).expect("checkout main");
+        std::fs::write(dir.join("notes.txt"), "changed by main\n").expect("write main change");
+        wkp_git::commit_all(dir, "main changes").expect("commit_all");
+
+        wkp_git::checkout_branch(dir, "feature", false).expect("checkout feature");
+        std::fs::write(dir.join("notes.txt"), "changed by feature\n")
+            .expect("write feature change");
+        wkp_git::commit_all(dir, "feature changes").expect("commit_all");
+
+        wkp_git::checkout_branch(dir, &main, false).expect("checkout main");
+        let clean = wkp_git::merge_branch(dir, "feature").expect("merge_branch");
+        assert!(!clean, "expected a real content conflict");
+
+        let conflicts = run_sync_status(dir).expect("run_sync_status");
+        assert_eq!(
+            conflicts,
+            vec![wkp_git::Conflict {
+                path: PathBuf::from("notes.txt"),
+                kind: wkp_git::ConflictKind::Content,
+            }]
+        );
+
+        let summary = SyncStatusSummary { conflicts }.to_string();
+        assert!(summary.contains("1 conflict"));
+        assert!(summary.contains("content"));
+        assert!(summary.contains("notes.txt"));
     }
 }
