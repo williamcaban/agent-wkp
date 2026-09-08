@@ -197,6 +197,121 @@ impl ChangeSet {
     }
 }
 
+/// Which side deleted a path in a `CONFLICT (modify/delete)` (design 6.2,
+/// M3-3). The *other* side's content is what a stopped `git merge` already
+/// left in the working tree at that path -- confirmed against a real merge
+/// in both directions before writing this function: git never leaves the
+/// deleted side's (i.e. nothing's) content there.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeletedBy {
+    /// `git status --porcelain=v2` reports `DU` for this path: our side
+    /// (`HEAD`) deleted it, the side being merged in modified it.
+    Ours,
+    /// `git status --porcelain=v2` reports `UD` for this path: the side
+    /// being merged in deleted it, our side (`HEAD`) modified it.
+    Theirs,
+}
+
+/// One path a stopped `git merge` left as an unmerged modify/delete
+/// conflict.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModifyDeleteConflict {
+    pub path: PathBuf,
+    pub deleted_by: DeletedBy,
+}
+
+/// Scans `repo_dir` (expected to be mid-merge, i.e. `MERGE_HEAD` present
+/// and some paths left unmerged) for modify/delete conflicts specifically
+/// -- design 6.2's "a deletion always loses to a modification" needs its
+/// own detection step because git's own three-way merge machinery stops
+/// with `CONFLICT (modify/delete)` for this class *without* ever invoking
+/// a content merge driver (there is no "theirs" -- or "ours" -- content to
+/// hand one). This is why `wkp merge-driver` (M3-2) never sees these
+/// paths: they never reach that protocol at all.
+///
+/// Every other unmerged class (`AA`/`DD`/`AU`/`UA`/`UU`) is out of this
+/// function's scope and left alone rather than misclassified --
+/// `wkp merge-driver`'s `.gitattributes` wiring already resolves add/add
+/// and modify/modify frontmatter conflicts, and (per `wkp_core::merge`'s
+/// own doc comment) that driver always succeeds, so those classes never
+/// remain unmerged after a `git merge` returns in the first place.
+pub fn modify_delete_conflicts(repo_dir: &Path) -> Result<Vec<ModifyDeleteConflict>, String> {
+    let stdout = run_git_stdout(repo_dir, &["status", "--porcelain=v2"])?;
+    let mut conflicts = Vec::new();
+    for line in stdout.lines() {
+        let Some((kind, rest)) = line.split_once(' ') else {
+            continue;
+        };
+        if kind != "u" {
+            continue;
+        }
+        // Unmerged entry: `<XY> <sub> <m1> <m2> <m3> <mW> <h1> <h2> <h3> <path>`.
+        let fields: Vec<&str> = rest.splitn(10, ' ').collect();
+        let (Some(xy), Some(path)) = (fields.first(), fields.get(9)) else {
+            continue;
+        };
+        let deleted_by = match *xy {
+            "DU" => DeletedBy::Ours,
+            "UD" => DeletedBy::Theirs,
+            _ => continue,
+        };
+        conflicts.push(ModifyDeleteConflict {
+            path: PathBuf::from(*path),
+            deleted_by,
+        });
+    }
+    Ok(conflicts)
+}
+
+/// Stages `path` at whatever content is currently in the working tree
+/// (`git add -- <path>`), resolving one [`ModifyDeleteConflict`] entry by
+/// keeping the modification, or staging a brand-new file (e.g. an
+/// inbox note re-proposing the deletion). Plain plumbing -- callers decide
+/// what "the modification" or "the new file" actually is; this function
+/// only touches the index.
+pub fn stage_path(repo_dir: &Path, path: &str) -> Result<(), String> {
+    run_git(repo_dir, &["add", "--", path])
+}
+
+/// Checks out `branch_name` in `repo_dir`, creating it from the current
+/// `HEAD` first if `create` is true. Thin plumbing -- `wkp sync` (M3-4)
+/// needs this to move onto each device/`main` branch it merges; M3-3's own
+/// tests need it to construct a real, two-branch modify/delete conflict to
+/// resolve rather than faking one.
+pub fn checkout_branch(repo_dir: &Path, branch_name: &str, create: bool) -> Result<(), String> {
+    if create {
+        run_git(repo_dir, &["checkout", "--quiet", "-b", branch_name])
+    } else {
+        run_git(repo_dir, &["checkout", "--quiet", branch_name])
+    }
+}
+
+/// The name of the branch `repo_dir`'s `HEAD` currently points to. Valid
+/// even before the first commit (`HEAD` is already a symbolic ref to
+/// whichever branch `git init`/`init.defaultBranch` chose) -- callers that
+/// need to return to "whatever branch we started on" after checking out
+/// others (as `wkp sync`, M3-4, will) read this rather than assuming
+/// `main`/`master`.
+pub fn current_branch(repo_dir: &Path) -> Result<String, String> {
+    run_git_stdout(repo_dir, &["symbolic-ref", "--short", "HEAD"]).map(|s| s.trim().to_string())
+}
+
+/// Merges `branch_name` into `repo_dir`'s current branch (`git merge
+/// --no-edit <branch_name>`), returning whether it completed cleanly.
+/// `Ok(false)` means git stopped with one or more conflicts left in the
+/// index/working tree (inspect with e.g. [`modify_delete_conflicts`]) --
+/// not an `Err`, since a conflicted merge is an expected, ordinary outcome
+/// a caller needs to detect and resolve, not a plumbing failure.
+pub fn merge_branch(repo_dir: &Path, branch_name: &str) -> Result<bool, String> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(repo_dir)
+        .args(["merge", "--no-edit", branch_name])
+        .output()
+        .map_err(|e| e.to_string())?;
+    Ok(output.status.success())
+}
+
 /// Detects which tracked or untracked files changed in `repo_dir`'s working
 /// tree, using git's own stat cache rather than reading every file's
 /// content (design 5.1). `git update-index --refresh` updates that cache
@@ -490,6 +605,43 @@ mod tests {
         fn commit_all(&self, message: &str) {
             commit_all(self.path(), message).expect("commit_all");
         }
+
+        /// The name of whichever branch `git init` chose (this environment's
+        /// `init.defaultBranch`) -- valid even before the first commit, since
+        /// `HEAD` is already a symbolic ref to it. Modify/delete tests need
+        /// two real, named branches to diverge and merge, so they read this
+        /// rather than assuming `main`/`master`.
+        fn current_branch(&self) -> String {
+            current_branch(self.path()).expect("current_branch")
+        }
+
+        fn checkout_new_branch(&self, name: &str) {
+            checkout_branch(self.path(), name, true).expect("checkout_branch (create)");
+        }
+
+        fn checkout(&self, name: &str) {
+            checkout_branch(self.path(), name, false).expect("checkout_branch");
+        }
+
+        fn remove_and_commit(&self, relative_path: &str, message: &str) {
+            let status = Command::new("git")
+                .arg("-C")
+                .arg(self.path())
+                .args(["rm", "--quiet", relative_path])
+                .status()
+                .expect("run git rm");
+            assert!(status.success(), "git rm {relative_path} failed");
+            self.commit_all(message);
+        }
+
+        /// Attempts to merge `branch` into this repo's current branch,
+        /// returning whether it succeeded -- for the modify/delete tests,
+        /// which need the merge to *stop* (a real `CONFLICT
+        /// (modify/delete)`, not silently auto-resolved) before they can
+        /// exercise the detection/resolution step.
+        fn merge(&self, branch: &str) -> bool {
+            merge_branch(self.path(), branch).expect("merge_branch")
+        }
     }
 
     #[test]
@@ -680,5 +832,156 @@ mod tests {
 
         let result = apply_init_settings(dir.path());
         assert!(result.is_err(), "expected an error outside a git repo");
+    }
+
+    /// Sets up two branches that both diverge from a shared base commit --
+    /// one modifies `item.md`, the other deletes it -- and merges the
+    /// second into the repo's current branch, which must stop with a real
+    /// `CONFLICT (modify/delete)` rather than auto-resolving. Shared setup
+    /// for both directions of the conflict, since only which branch does
+    /// which differs between them.
+    fn set_up_modify_delete_conflict(name: &str, main_deletes: bool) -> TempGitRepo {
+        let repo = TempGitRepo::new(name);
+        let main = repo.current_branch();
+        repo.write("item.md", "base content\n");
+        repo.commit_all("base");
+        repo.checkout_new_branch("feature");
+
+        if main_deletes {
+            repo.checkout(&main);
+            repo.remove_and_commit("item.md", "main deletes");
+            repo.checkout("feature");
+            repo.write("item.md", "modified by feature\n");
+            repo.commit_all("feature modifies");
+        } else {
+            repo.write("item.md", "modified by feature\n");
+            repo.commit_all("feature modifies");
+            repo.checkout(&main);
+            repo.remove_and_commit("item.md", "main deletes");
+        }
+
+        repo.checkout(&main);
+        assert!(
+            !repo.merge("feature"),
+            "a modify/delete conflict must stop the merge, not auto-resolve it"
+        );
+        repo
+    }
+
+    #[test]
+    fn modify_delete_conflicts_detects_deleted_by_theirs_and_leaves_the_modification_in_place() {
+        // main modifies, feature deletes, feature is merged in: from main's
+        // point of view the deletion came from "them".
+        let repo = TempGitRepo::new("modify-delete-theirs");
+        let main = repo.current_branch();
+        repo.write("item.md", "base content\n");
+        repo.commit_all("base");
+        repo.checkout_new_branch("feature");
+        repo.checkout(&main);
+        repo.write("item.md", "modified by main\n");
+        repo.commit_all("main modifies");
+        repo.checkout("feature");
+        repo.remove_and_commit("item.md", "feature deletes");
+        repo.checkout(&main);
+        assert!(!repo.merge("feature"));
+
+        let conflicts = modify_delete_conflicts(repo.path()).expect("modify_delete_conflicts");
+        assert_eq!(
+            conflicts,
+            vec![ModifyDeleteConflict {
+                path: PathBuf::from("item.md"),
+                deleted_by: DeletedBy::Theirs,
+            }]
+        );
+
+        let on_disk = std::fs::read_to_string(repo.path().join("item.md")).expect("read item.md");
+        assert_eq!(
+            on_disk, "modified by main\n",
+            "git itself already keeps the modification in the working tree"
+        );
+    }
+
+    #[test]
+    fn modify_delete_conflicts_detects_deleted_by_ours() {
+        // main deletes, feature modifies, feature is merged in: from main's
+        // point of view the deletion came from "us".
+        let repo = set_up_modify_delete_conflict("modify-delete-ours", true);
+
+        let conflicts = modify_delete_conflicts(repo.path()).expect("modify_delete_conflicts");
+        assert_eq!(
+            conflicts,
+            vec![ModifyDeleteConflict {
+                path: PathBuf::from("item.md"),
+                deleted_by: DeletedBy::Ours,
+            }]
+        );
+
+        let on_disk = std::fs::read_to_string(repo.path().join("item.md")).expect("read item.md");
+        assert_eq!(on_disk, "modified by feature\n");
+    }
+
+    #[test]
+    fn modify_delete_conflicts_is_empty_on_a_clean_repo() {
+        let repo = TempGitRepo::new("modify-delete-clean");
+        repo.write("item.md", "hello\n");
+        repo.commit_all("initial");
+
+        let conflicts = modify_delete_conflicts(repo.path()).expect("modify_delete_conflicts");
+        assert!(conflicts.is_empty(), "{conflicts:?}");
+    }
+
+    #[test]
+    fn stage_path_resolves_a_modify_delete_conflict() {
+        let repo = set_up_modify_delete_conflict("modify-delete-stage", false);
+
+        stage_path(repo.path(), "item.md").expect("stage_path");
+
+        let remaining = modify_delete_conflicts(repo.path()).expect("modify_delete_conflicts");
+        assert!(
+            remaining.is_empty(),
+            "item.md should no longer be unmerged after staging: {remaining:?}"
+        );
+    }
+
+    /// M3-2's `wkp merge-driver`/`.gitattributes` wiring never sees a
+    /// modify/delete conflict at all -- git's own merge machinery stops
+    /// before handing this class to any content driver. This test proves
+    /// that boundary rather than assuming it: `merge.wkp.driver` is
+    /// configured to a command that would leave a detectable side effect
+    /// if it ever actually ran, and after a real modify/delete merge stops,
+    /// that side effect must be absent.
+    #[test]
+    fn merge_driver_is_never_invoked_for_a_modify_delete_conflict() {
+        let repo = TempGitRepo::new("modify-delete-driver-boundary");
+        repo.write(".gitattributes", "*.md merge=wkp\n");
+        let sentinel = repo.path().join("driver-was-invoked");
+        set_local_config(repo.path(), "merge.wkp.name", "test sentinel driver")
+            .expect("set merge.wkp.name");
+        set_local_config(
+            repo.path(),
+            "merge.wkp.driver",
+            &format!("touch {}", sentinel.display()),
+        )
+        .expect("set merge.wkp.driver");
+
+        let main = repo.current_branch();
+        repo.write("item.md", "base content\n");
+        repo.commit_all("base");
+        repo.checkout_new_branch("feature");
+        repo.checkout(&main);
+        repo.write("item.md", "modified by main\n");
+        repo.commit_all("main modifies");
+        repo.checkout("feature");
+        repo.remove_and_commit("item.md", "feature deletes");
+        repo.checkout(&main);
+
+        assert!(!repo.merge("feature"));
+        assert!(
+            !sentinel.exists(),
+            "the configured merge driver must never run for a modify/delete conflict"
+        );
+
+        let conflicts = modify_delete_conflicts(repo.path()).expect("modify_delete_conflicts");
+        assert_eq!(conflicts.len(), 1);
     }
 }
