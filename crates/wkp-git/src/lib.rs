@@ -302,11 +302,31 @@ pub fn current_branch(repo_dir: &Path) -> Result<String, String> {
 /// index/working tree (inspect with e.g. [`modify_delete_conflicts`]) --
 /// not an `Err`, since a conflicted merge is an expected, ordinary outcome
 /// a caller needs to detect and resolve, not a plumbing failure.
+///
+/// Passes a placeholder `-c user.name`/`-c user.email` the same way
+/// [`commit_all`] does: found the hard way (a CI run failed where a local
+/// dev machine with a real global git identity configured did not) that
+/// `git merge` refuses to even *attempt* a merge -- conflicted or not --
+/// without a committer identity available from somewhere, since it has to
+/// be ready to write an auto-merge commit before it knows whether one will
+/// be needed. This identity is never what actually lands in history for a
+/// real device-branch sync: a clean auto-merge here still isn't a
+/// provenance-bearing commit (M3-4's job, layered on top, the same way a
+/// conflicted merge here produces no commit at all until a caller resolves
+/// and finishes it).
 pub fn merge_branch(repo_dir: &Path, branch_name: &str) -> Result<bool, String> {
     let output = Command::new("git")
         .arg("-C")
         .arg(repo_dir)
-        .args(["merge", "--no-edit", branch_name])
+        .args([
+            "-c",
+            "user.email=wkp@localhost",
+            "-c",
+            "user.name=wkp",
+            "merge",
+            "--no-edit",
+            branch_name,
+        ])
         .output()
         .map_err(|e| e.to_string())?;
     Ok(output.status.success())
