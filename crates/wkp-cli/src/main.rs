@@ -1855,7 +1855,7 @@ fn ensure_lines_present(file_path: &Path, lines: &[&str]) -> Result<(), String> 
 fn configure_merge_driver(path: &Path) -> Result<(), String> {
     ensure_lines_present(&path.join(".gitattributes"), &["*.md merge=wkp"])?;
 
-    let wkp_exe = std::env::current_exe()
+    let wkp_exe = std::env::current_exe() // nosemgrep: rust.lang.security.current-exe.current-exe -- not a security decision: this path is a same-user, same-process convenience written to *this clone's own* local git config, read back only by a later `git merge` run by that same user on that same machine; nothing crosses a trust boundary, and a hostile actor who could already redirect this process's own binary path controls the machine outright.
         .map(|p| p.to_string_lossy().into_owned())
         .unwrap_or_else(|_| "wkp".to_string());
     wkp_git::set_local_config(
