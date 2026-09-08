@@ -796,11 +796,29 @@ fn run_index_impl(
         let contents = std::fs::read_to_string(path.join(relative))
             .map_err(|e| format!("reading {relative}: {e}"))?;
         let parsed = wkp_core::frontmatter::parse(&contents);
+        // Design 7.4 / M2-6: `wkp-core` stays git-agnostic (design 3.3 --
+        // it and `wkp-git` are siblings, neither depends on the other),
+        // so this is where the real provenance gate's only external
+        // input gets resolved: one `git log` per changed path, proportional
+        // to change count (M1-3's own incremental-update cost model), not
+        // to corpus size for an ordinary `wkp remember` + `wkp index`
+        // cycle -- but a fresh clone's *first* `wkp index` run treats
+        // every item as "added", so that one run pays one subprocess per
+        // item. Not optimized in this task (a single batched `git log`
+        // walk resolving every path's signer in one process would avoid
+        // it); flagged here rather than silently absorbed, since M1-3/
+        // M1-4's own benches don't exercise this wkp-cli-level path at
+        // all and so can't catch a regression here.
+        let human_signed = matches!(
+            wkp_git::allowed_signers::last_signer_for_path(path, relative),
+            Some((_, wkp_git::allowed_signers::SignerRole::Human))
+        );
         upserts.push(wkp_core::index::Item {
             path: (*relative).clone(),
             frontmatter: parsed.frontmatter,
             body: parsed.body,
             embedding: None,
+            human_signed,
         });
     }
 
@@ -1967,7 +1985,19 @@ mod tests {
             "---\ntitle: B\ntype: feedback\n---\n\ntier one body\n",
         )
         .expect("write b.md");
-        wkp_git::commit_all(dir, "seed").expect("commit_all");
+        // M2-6: tier 0/1 now requires a human-signed commit, not just
+        // the right `type:` -- an unsigned `commit_all` would leave
+        // both items at tier 2 regardless of frontmatter.
+        let key = generate_test_key_and_register(dir, "human:alice");
+        wkp_git::signed_commit::signed_commit(
+            dir,
+            &[PathBuf::from("a.md"), PathBuf::from("b.md")],
+            "seed",
+            "human:alice",
+            &key.private_path,
+            &wkp_git::provenance::Provenance::default(),
+        )
+        .expect("signed_commit");
         run_index(dir).expect("run_index");
 
         run_materialize(&MaterializeOptions {
