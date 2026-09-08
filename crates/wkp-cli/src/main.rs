@@ -368,7 +368,15 @@ fn run_init_with_claude_home(path: &Path, claude_home: Option<&Path>) -> Result<
     // what `wkp index`'s change detection treats as ordinary store
     // content, so it would get indexed as if it were a real item. A glob
     // covers any future tier's materialized file, not just today's two.
-    ensure_gitignored(path, &[".wkp/index.db", ".wkp/tier*.md"])?;
+    //
+    // Another real bug found the same way while building M3-7:
+    // `.wkp/device-id` (M3-1) was never added here either -- its own doc
+    // comment (`wkp_git::sync::device_id`) says it "must never be
+    // committed at all" (cloning onto a second device must not inherit
+    // the first device's ID), but nothing enforced that, so a plain `git
+    // add -A` anywhere in this store's history would silently sweep it
+    // into a real commit.
+    ensure_gitignored(path, &[".wkp/index.db", ".wkp/tier*.md", ".wkp/device-id"])?;
 
     // An empty index at this point; `wkp index` (M1-3) populates it from
     // the store's markdown files.
@@ -1587,6 +1595,12 @@ struct SyncSummary {
     remote: String,
     merged: Vec<String>,
     pushed_branch: String,
+    /// Newly-arrived commits (this sync only, not the whole history) whose
+    /// signature doesn't resolve to a known `human:`/`agent:` principal
+    /// (M3-7) -- `"<short sha> <subject>"` per entry. Purely informational:
+    /// `wkp_core::index::compute_tier`'s signature check already keeps
+    /// these out of tier 0/1 regardless of whether this report exists.
+    unsigned_or_unknown: Vec<String>,
 }
 
 impl std::fmt::Display for SyncSummary {
@@ -1596,7 +1610,7 @@ impl std::fmt::Display for SyncSummary {
                 f,
                 "wkp: nothing new from {} (pushed {})",
                 self.remote, self.pushed_branch
-            )
+            )?;
         } else {
             write!(
                 f,
@@ -1604,8 +1618,19 @@ impl std::fmt::Display for SyncSummary {
                 self.merged.join(", "),
                 self.remote,
                 self.pushed_branch
-            )
+            )?;
         }
+        if !self.unsigned_or_unknown.is_empty() {
+            write!(
+                f,
+                "\nwkp: {} newly-arrived commit(s) unsigned or from an unknown signer (still tier 2 regardless):",
+                self.unsigned_or_unknown.len()
+            )?;
+            for entry in &self.unsigned_or_unknown {
+                write!(f, "\n  {entry}")?;
+            }
+        }
+        Ok(())
     }
 }
 
@@ -1633,6 +1658,7 @@ fn run_sync(opts: &SyncOptions) -> Result<SyncSummary, String> {
     wkp_git::sync::ensure_device_branch(&opts.path, &device_id)?;
     let own_branch = wkp_git::sync::device_branch_name(&device_id);
     wkp_git::checkout_branch(&opts.path, &own_branch, false)?;
+    let before_tip = wkp_git::current_commit(&opts.path)?;
 
     let mut refs_to_merge = Vec::new();
     if wkp_git::remote_branch_exists(&opts.path, &opts.remote, "main") {
@@ -1645,6 +1671,8 @@ fn run_sync(opts: &SyncOptions) -> Result<SyncSummary, String> {
     )?);
 
     let merged = merge_refs_into_current_branch(&opts.path, refs_to_merge)?;
+    let unsigned_or_unknown =
+        report_unsigned_or_unknown_commits(&opts.path, &before_tip, &own_branch)?;
 
     wkp_git::push_branch(&opts.path, &opts.remote, &own_branch)?;
 
@@ -1652,7 +1680,38 @@ fn run_sync(opts: &SyncOptions) -> Result<SyncSummary, String> {
         remote: opts.remote.clone(),
         merged,
         pushed_branch: own_branch,
+        unsigned_or_unknown,
     })
+}
+
+/// M3-7: every commit newly reachable from `until` but not from `since`
+/// whose signature doesn't resolve to a known `human:`/`agent:` principal
+/// -- reusing [`wkp_git::commits_between`] and
+/// [`wkp_git::allowed_signers::signer_for_commit`], no new signature
+/// -checking logic. Purely reporting: this never changes tier
+/// computation, confidence, or refuses the sync -- `compute_tier`'s own
+/// signature gate (M2-6) already excludes anything this flags from tier
+/// 0/1 regardless of whether anyone ever reads this report.
+fn report_unsigned_or_unknown_commits(
+    path: &Path,
+    since: &str,
+    until: &str,
+) -> Result<Vec<String>, String> {
+    let mut flagged = Vec::new();
+    for (sha, subject) in wkp_git::commits_between(path, since, until)? {
+        // A merge commit `wkp sync` itself just created is never signed
+        // by design (see `merge_branch`'s doc comment) -- flagging it
+        // would mean every sync that needed a real merge reports at
+        // least one "unsigned" entry regardless of whether anything
+        // actually concerning arrived, drowning out the real signal.
+        if wkp_git::is_merge_commit(path, &sha)? {
+            continue;
+        }
+        if wkp_git::allowed_signers::signer_for_commit(path, &sha).is_none() {
+            flagged.push(format!("{} {subject}", &sha[..sha.len().min(12)]));
+        }
+    }
+    Ok(flagged)
 }
 
 /// Merges each of `refs_to_merge` (already-resolved ref names, e.g.
@@ -4279,5 +4338,95 @@ mod tests {
         assert!(summary.contains("1 conflict"));
         assert!(summary.contains("content"));
         assert!(summary.contains("notes.txt"));
+    }
+
+    /// M3-7's own acceptance criterion, end to end: a `wkp sync` that
+    /// brings in one deliberately-unsigned commit (alongside ordinary
+    /// agent-signed `wkp remember` commits from both devices) must flag
+    /// exactly that one commit as unsigned/unknown-signer, and must not
+    /// false-positive on the ordinary signed ones.
+    #[test]
+    fn wkp_sync_reports_a_newly_arrived_unsigned_commit_without_false_positives() {
+        let remote = temp_dir("sync-signature-remote");
+        wkp_git::init_bare_repo(remote.path()).expect("init_bare_repo");
+
+        let device_a = temp_dir("sync-signature-device-a");
+        let device_b = temp_dir("sync-signature-device-b");
+        test_init(device_a.path()).expect("run_init a");
+        test_init(device_b.path()).expect("run_init b");
+
+        let key = generate_test_key_and_register_in_both(
+            device_a.path(),
+            device_b.path(),
+            "agent:claude-code@host",
+        );
+
+        for dir in [device_a.path(), device_b.path()] {
+            wkp_git::set_local_config(dir, "remote.origin.url", &remote.path().to_string_lossy())
+                .expect("set remote url");
+            wkp_git::set_local_config(
+                dir,
+                "remote.origin.fetch",
+                "+refs/heads/*:refs/remotes/origin/*",
+            )
+            .expect("set remote fetch refspec");
+        }
+
+        // A's own agent-signed item -- must land on A's device branch
+        // (M3-4's bootstrap: the very first commit lands there directly),
+        // then A makes one more, deliberately unsigned commit directly on
+        // that same branch, standing in for content that reached this
+        // history without going through wkp's own signed write path.
+        let opts_a = remember_opts(device_a.path(), &key, "knowledge", "Signed item from A");
+        run_remember_with_body(&opts_a, "signed content from A").expect("remember on A");
+        std::fs::write(device_a.path().join("unsigned.md"), "not signed\n")
+            .expect("write unsigned.md");
+        // Staged and committed narrowly (not `commit_all`'s `git add -A`):
+        // A's bootstrap `remember` commit only ever staged its own inbox
+        // path, so `.gitattributes`/`.gitignore`/`allowed_signers` are
+        // still untracked in A's own working tree at this point -- an
+        // `add -A` here would sweep those in too, diverging A's tree from
+        // B's (which never staged them either) and turning the merge
+        // below into an unrelated "untracked file would be overwritten"
+        // failure that has nothing to do with what this test means to
+        // exercise.
+        wkp_git::stage_path(device_a.path(), "unsigned.md").expect("stage_path unsigned.md");
+        wkp_git::commit_staged(device_a.path(), "an unsigned write")
+            .expect("commit_staged (deliberately unsigned)");
+
+        let sync_opts_a = SyncOptions {
+            path: device_a.path().to_path_buf(),
+            remote: "origin".to_string(),
+        };
+        let summary_a = run_sync(&sync_opts_a).expect("first sync on A (push only)");
+        assert!(
+            summary_a.unsigned_or_unknown.is_empty(),
+            "nothing new arrived on A's own first sync: {:?}",
+            summary_a.unsigned_or_unknown
+        );
+
+        // B's own agent-signed item, then sync: fetches A's branch
+        // (bringing in both A's signed remember commit and A's unsigned
+        // one), merges it in.
+        let opts_b = remember_opts(device_b.path(), &key, "knowledge", "Signed item from B");
+        run_remember_with_body(&opts_b, "signed content from B").expect("remember on B");
+
+        let sync_opts_b = SyncOptions {
+            path: device_b.path().to_path_buf(),
+            remote: "origin".to_string(),
+        };
+        let summary_b = run_sync(&sync_opts_b).expect("sync on B");
+
+        assert_eq!(
+            summary_b.unsigned_or_unknown.len(),
+            1,
+            "{:?}",
+            summary_b.unsigned_or_unknown
+        );
+        assert!(summary_b.unsigned_or_unknown[0].contains("an unsigned write"));
+        assert!(!summary_b
+            .unsigned_or_unknown
+            .iter()
+            .any(|entry| entry.contains("remember")));
     }
 }
