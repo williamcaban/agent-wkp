@@ -207,8 +207,11 @@ mod tests {
 
         commit_staged(repo.path(), "only the staged file").expect("commit_staged");
 
-        assert!(crate::plumbing::run_git_stdout(repo.path(), &["cat-file", "-e", "HEAD:staged.md"])
-            .is_ok());
+        assert!(crate::plumbing::run_git_stdout(
+            repo.path(),
+            &["cat-file", "-e", "HEAD:staged.md"]
+        )
+        .is_ok());
         assert!(crate::plumbing::run_git_stdout(
             repo.path(),
             &["cat-file", "-e", "HEAD:not-staged.md"]
