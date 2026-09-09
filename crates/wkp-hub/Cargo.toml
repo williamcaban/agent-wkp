@@ -11,3 +11,18 @@ repository.workspace = true
 [[bin]]
 name = "wkp-hub"
 path = "src/main.rs"
+
+[dependencies]
+# M5-1: the control plane's Postgres client (design 8.2). The
+# synchronous `postgres` crate, not `tokio-postgres`/`sqlx` directly --
+# every other crate in this workspace is deliberately blocking (git
+# subprocesses, rusqlite), and this keeps `wkp-hub`'s own code in that
+# same style rather than pulling an async runtime into its call sites
+# at this stage; `postgres` still uses `tokio` internally, but only as
+# a private implementation detail behind a fully blocking public API.
+# Revisit if M5-2's HTTP server needs real request concurrency this
+# can't provide. `with-time-0_3` maps `TIMESTAMPTZ` (this schema's
+# `revoked_at`, `created_at`) to a real `time::OffsetDateTime` instead
+# of hand-parsing a raw string.
+postgres = { version = "0.19.14", features = ["with-time-0_3"] }
+time = "0.3"
