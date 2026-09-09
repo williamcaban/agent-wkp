@@ -8,6 +8,7 @@ use std::path::{Path, PathBuf};
 
 mod bundle;
 mod context;
+mod filter;
 mod hooks;
 mod import;
 mod index_cmd;
@@ -240,6 +241,49 @@ fn main() {
             ) {
                 eprintln!("wkp: merge-driver failed: {msg}");
                 std::process::exit(1);
+            }
+        }
+        // Deliberately no `ensure_min_git_version` check, same reasoning
+        // as merge-driver above: git itself invokes this per its own
+        // clean/smudge filter protocol (gitattributes(5)), with cwd
+        // already set to the top of the working tree -- confirmed by
+        // hand, not assumed, since that's exactly what
+        // `filter::run_filter_clean`/`run_filter_smudge` rely on to find
+        // the store's `recipients` file and `.wkp/device-identity`
+        // fallback without a separate `--store` flag.
+        Some("filter") => {
+            use std::io::{Read, Write};
+            let direction = args.next();
+            let _file_path = args.next(); // %f -- accepted per git's protocol, not needed by content-based detection
+            let store_root = std::env::current_dir().expect("wkp: cannot read cwd");
+
+            let mut content = Vec::new();
+            std::io::stdin()
+                .read_to_end(&mut content)
+                .expect("wkp: failed to read filter input from stdin");
+
+            match direction.as_deref() {
+                Some("clean") => match filter::run_filter_clean(&store_root, &content) {
+                    Ok(output) => {
+                        std::io::stdout()
+                            .write_all(&output)
+                            .expect("wkp: failed to write filter output");
+                    }
+                    Err(msg) => {
+                        eprintln!("wkp: filter clean failed: {msg}");
+                        std::process::exit(1);
+                    }
+                },
+                Some("smudge") => {
+                    let output = filter::run_filter_smudge(&store_root, &content);
+                    std::io::stdout()
+                        .write_all(&output)
+                        .expect("wkp: failed to write filter output");
+                }
+                _ => {
+                    eprintln!("wkp: filter requires a direction: clean|smudge");
+                    std::process::exit(1);
+                }
             }
         }
         Some("resolve-conflicts") => {

@@ -25,10 +25,8 @@ use std::sync::Once;
 fn isolate_git_global_config() {
     static INIT: Once = Once::new();
     INIT.call_once(|| {
-        let path = std::env::temp_dir().join(format!(
-            "wkp-test-git-global-config-{}",
-            std::process::id()
-        ));
+        let path = std::env::temp_dir() // nosemgrep: rust.lang.security.temp-dir.temp-dir -- not a shared, guessable-name file: `std::process::id()` scopes this path to this one process, which is also the only reader/writer (`GIT_CONFIG_GLOBAL` is set here and read back only by `git` subprocesses this same process spawns), and the content is non-sensitive throwaway git config, not a secret.
+            .join(format!("wkp-test-git-global-config-{}", std::process::id()));
         std::env::set_var("GIT_CONFIG_GLOBAL", path);
     });
 }
