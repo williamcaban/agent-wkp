@@ -13,6 +13,21 @@ name = "wkp-hub"
 path = "src/main.rs"
 
 [dependencies]
+# M5-4: the tenant indexer reuses wkp-core's own frontmatter parser and
+# index builder rather than reimplementing them (CLAUDE.md's slim-core
+# rule, design 3.3) -- the same reuse contract this crate's own module
+# doc for `tenant_repo` names explicitly.
+wkp-core = { path = "../wkp-core" }
+# M5-4: bare-repo provisioning and reading pushed blob content both go
+# through this crate's plumbing wrapper (CLAUDE.md: no `Command::new("git")`
+# outside `wkp-git`), exactly like `wkp-cli` does.
+wkp-git = { path = "../wkp-git" }
+# M5-4: `wkp_crypto::AGE_HEADER`, the same age-ciphertext detection
+# `wkp-cli`'s filter (M4-4) uses, needed here so the tenant indexer never
+# parses a `visibility: private` blob's ciphertext as if it were plaintext
+# markdown. No encrypt/decrypt call in this crate -- the hub never holds a
+# device's decryption key (design 8's whole point).
+wkp-crypto = { path = "../wkp-crypto" }
 # M5-1: the control plane's Postgres client (design 8.2). The
 # synchronous `postgres` crate, not `tokio-postgres`/`sqlx` directly --
 # every other crate in this workspace is deliberately blocking (git
@@ -47,3 +62,9 @@ tiny_http = "0.12.0"
 # license on the TLS stack's `webpki-roots`, and no `https://` target
 # this milestone's scope needs anyway).
 ureq = { version = "3.4.1", default-features = false, features = ["json", "gzip"] }
+# M5-4: `tenant_repo`'s own tests and `tests/post_receive_hook.rs` need a
+# real per-test temp directory -- `tempfile::TempDir`, not
+# `std::env::temp_dir()` + a hand-rolled unique name, per this repo's own
+# semgrep gate and the identical choice `wkp-git`/`wkp-cli`'s test
+# fixtures already make (see their `test_support.rs` module docs).
+tempfile = "3.27.0"
