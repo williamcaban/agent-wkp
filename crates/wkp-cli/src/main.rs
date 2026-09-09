@@ -17,6 +17,7 @@ mod init;
 mod materialize;
 mod merge_driver;
 mod promote;
+mod purge;
 mod remember;
 mod resolve_conflicts;
 mod search;
@@ -228,6 +229,25 @@ fn main() {
                         }
                     }
                 }
+                Err(msg) => {
+                    eprintln!("wkp: {msg}");
+                    std::process::exit(1);
+                }
+            }
+        }
+        Some("purge") => {
+            if let Err(msg) = wkp_git::ensure_min_git_version() {
+                eprintln!("{msg}");
+                std::process::exit(1);
+            }
+            match purge::parse_purge_args(args) {
+                Ok(opts) => match purge::run_purge(&opts) {
+                    Ok(summary) => println!("{summary}"),
+                    Err(msg) => {
+                        eprintln!("wkp: purge failed: {msg}");
+                        std::process::exit(1);
+                    }
+                },
                 Err(msg) => {
                     eprintln!("wkp: {msg}");
                     std::process::exit(1);
