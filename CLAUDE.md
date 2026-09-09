@@ -25,6 +25,15 @@ Read in this order before starting any task: this file, `docs/design/wkp-hub-des
 - No new on-disk formats. The store is markdown in git; the index is SQLite; the config is TOML.
 - Frontmatter fields and CLI flags are a public contract once merged to `main`. Additive changes only; removals need an ADR.
 - Do not edit `.github/workflows/*`, `deny.toml`, `supply-chain/` or `CODEOWNERS` in the same PR as feature code.
+- Any code that resolves `std::env::current_exe()` (or otherwise assumes "this process is the real compiled CLI binary") to build a command git or anything else will invoke as a subprocess later must go through `crates/wkp-cli/src/init.rs`'s `resolve_wkp_exe()`, never call `current_exe()` directly. A direct call is silently wrong the moment that code path runs in-process from a unit test instead of the real `wkp` binary. `crates/wkp-cli/tests/architecture_lint.rs` fails `cargo test` if a second, unguarded call site appears — see its module doc and `resolve_wkp_exe`'s doc comment for the real incident (a self-reinforcing fork loop that exhausted a whole machine's memory and process table) this guards against.
+
+## Self-invocation: a class of bug to check for explicitly
+
+Some features make `wkp` invoke itself later as a subprocess — a git merge driver, a git clean/smudge filter, a hook script, anything of that shape. This class of feature has a specific failure mode that unit tests do not catch by construction, because the bug is in *how the calling process resolves its own binary path*, not in the feature's logic:
+
+- The path a unit test's `#[cfg(test)]` code runs in-process is not the same binary a later `git merge`/`git add`/etc. will actually spawn. `current_exe()` inside a unit test resolves to the compiled *test harness* binary, whose real entry point is libtest, not `main.rs`'s subcommand dispatch. Any git operation that ends up invoking that path will run libtest instead of the intended subcommand — and libtest silently reinterprets the subcommand's own arguments as test-name filters, which can rerun other tests that do the same thing again, recursively.
+- Before implementing a feature of this shape: identify every context the registration code can run in (the real CLI, an integration test via `CARGO_BIN_EXE_wkp`, and any in-process unit test that calls the same function directly), and confirm the self-referencing path is resolved correctly — not just written down — in each one. Reuse `resolve_wkp_exe()` rather than inventing a new resolution scheme.
+- After implementing it: run the affected tests while watching the OS process table (e.g. `pgrep -c -f <binary-name>` before and after) to confirm no processes are left running or accumulating. A test suite that "passes" while quietly leaking orphaned subprocesses is not done. Also run `cargo test -p wkp-cli --test architecture_lint` explicitly if you touched anything that calls `current_exe()`.
 
 ## Commands
 
@@ -44,6 +53,7 @@ Run all of them before opening a PR and paste the tail of the output in the PR d
 
 - Linked issue, acceptance criteria copied into the PR description with each item checked.
 - Tests for new behavior; a regression test for any bug fixed.
+- If the PR touches anything that makes `wkp` invoke itself later as a subprocess (a merge driver, a filter, a hook, a daemon respawn): see "Self-invocation: a class of bug to check for explicitly" above, and confirm no processes leak.
 - No new `unsafe`, no new dependency without justification, no benchmark regression beyond the threshold in `benches/README.md`.
 - Commit messages: imperative subject under 72 chars, body explains why, `Signed-off-by` trailer, and a `Co-Authored-By` trailer naming the agent and model that produced the change.
 - Small PRs. One issue per PR. If an issue turns out to need two PRs, split the issue.

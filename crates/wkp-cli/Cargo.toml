@@ -15,6 +15,10 @@ path = "src/main.rs"
 [dependencies]
 wkp-core = { version = "0.1.0", path = "../wkp-core" }
 wkp-git = { path = "../wkp-git" }
+# M4-4: the encryption filter's own real linkage of wkp-crypto (M4-1
+# through M4-3 landed the crate itself with no consumer yet). See the
+# M4-4 PR description for the measured target/release/wkp size delta.
+wkp-crypto = { path = "../wkp-crypto" }
 # M3-8 (wkpd): file-watch cycle. Named explicitly by design 4.2.
 notify = "8"
 # M3-8 (wkpd): safe UDS peer-credential verification without `unsafe` in
