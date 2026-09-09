@@ -20,7 +20,8 @@ mod control_plane;
 /// separate ways into the same control plane, not replacements for
 /// this one.
 fn main() {
-    let mut args = std::env::args().skip(1);
+    // Dispatching on a CLI flag, not a security-sensitive use of argv.
+    let mut args = std::env::args().skip(1); // nosemgrep: rust.lang.security.args.args
     let command = args.next();
 
     match command.as_deref() {
