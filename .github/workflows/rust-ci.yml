@@ -88,7 +88,7 @@ jobs:
       # real third-party audit coverage. `--locked` for a reproducible
       # build from this crate's own published Cargo.lock.
       - name: install cargo-vet (from crates.io, not the stale GitHub release binary)
-        run: cargo install cargo-vet --version 0.10.2 --locked
+        run: cargo install cargo-vet --version 0.10.2 --locked --force
 
       - name: cargo audit
         run: cargo audit
