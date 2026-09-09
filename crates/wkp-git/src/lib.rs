@@ -22,6 +22,7 @@ mod version;
 
 pub mod allowed_signers;
 pub mod provenance;
+pub mod purge;
 pub mod signed_commit;
 pub mod sync;
 
