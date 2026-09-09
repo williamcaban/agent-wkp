@@ -19,7 +19,7 @@
 //! `wkp-cli/tests/encryption_filter.rs` already establishes for
 //! integration tests that need to prove real git wiring end to end.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::Command;
 
 fn wkp_hub_bin() -> &'static str {
@@ -44,21 +44,19 @@ fn run_wkp_hub(repos_root: &Path, args: &[&str]) -> std::process::Output {
         .unwrap_or_else(|e| panic!("failed to run wkp-hub {args:?}: {e}"))
 }
 
-fn temp_repos_root() -> PathBuf {
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
-    let dir = std::env::temp_dir().join(format!("wkp-hub-post-receive-hook-test-{nanos}"));
-    std::fs::create_dir_all(&dir).expect("create temp repos root");
-    dir
+fn temp_repos_root() -> tempfile::TempDir {
+    tempfile::Builder::new()
+        .prefix("wkp-hub-post-receive-hook-test-")
+        .tempdir()
+        .expect("create temp repos root")
 }
 
 #[test]
 fn a_real_push_triggers_the_installed_hook_and_indexes_only_the_shared_item() {
-    let repos_root = temp_repos_root();
+    let temp = temp_repos_root();
+    let repos_root = temp.path();
 
-    let provision = run_wkp_hub(&repos_root, &["provision-repo", "acme"]);
+    let provision = run_wkp_hub(repos_root, &["provision-repo", "acme"]);
     assert!(
         provision.status.success(),
         "provision-repo failed: {}",
@@ -82,7 +80,7 @@ fn a_real_push_triggers_the_installed_hook_and_indexes_only_the_shared_item() {
     let repo_path = repos_root.join("acme.git");
     let clone_dir = repos_root.join("clone");
     run_git(
-        &repos_root,
+        repos_root,
         &["clone", "--quiet", repo_path.to_str().unwrap(), "clone"],
     );
     run_git(&clone_dir, &["checkout", "--quiet", "-b", "main"]);
@@ -118,7 +116,7 @@ fn a_real_push_triggers_the_installed_hook_and_indexes_only_the_shared_item() {
     let push_status = Command::new("git")
         .current_dir(&clone_dir)
         .env("PATH", &path_with_bin)
-        .env("WKP_HUB_REPOS_ROOT", &repos_root)
+        .env("WKP_HUB_REPOS_ROOT", repos_root)
         .args(["push", "--quiet", "origin", "main"])
         .status()
         .expect("run git push");
