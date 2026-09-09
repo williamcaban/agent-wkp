@@ -26,6 +26,12 @@ jobs:
           toolchain: "1.98.1" # keep in sync with rust-toolchain.toml
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      # M4-6 (`wkp purge`) shells out to the upstream `git-filter-repo`
+      # tool rather than vendoring it (CLAUDE.md: no vendoring a Python
+      # dependency) -- it must already be on PATH for that crate's tests
+      # to exercise the real thing instead of skipping or mocking it.
+      - name: install git-filter-repo
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends git-filter-repo
 
       - name: cargo fmt --check
         run: cargo fmt --all -- --check
