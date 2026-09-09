@@ -29,7 +29,9 @@ pub mod sync;
 mod test_support;
 
 pub use bundle::{bundle_create, bundle_fetch, bundle_verify};
-pub use changes::{detect_changes, list_tracked_files, remove_from_index, ChangeSet, Renamed};
+pub use changes::{
+    detect_changes, list_tracked_files, read_blob, remove_from_index, ChangeSet, Renamed,
+};
 pub use config::{fsmonitor_enabled, get_local_config, set_local_config};
 pub use conflicts::{
     conflicts, modify_delete_conflicts, stage_path, Conflict, ConflictKind, DeletedBy,

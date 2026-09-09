@@ -80,6 +80,56 @@ pub fn signed_commit(
         )?;
     }
 
+    commit_current_index(repo_dir, subject, principal, signing_key_path, provenance)
+}
+
+/// The deletion counterpart to [`signed_commit`] (design 7.6, M4-5):
+/// stages the removal of every path in `paths` (`update-index --remove`,
+/// the same primitive [`crate::remove_from_index`] wraps) and commits
+/// exactly that -- nothing added, nothing else already sitting in the
+/// index. Shares [`commit_current_index`] with `signed_commit`, which is
+/// the actual "serialize whatever the index holds right now into a
+/// signed commit" logic; the two public functions differ only in how
+/// they get the index into the state they want to commit.
+///
+/// Each path in `paths` must currently be tracked (in the index) --
+/// `update-index --remove` on an untracked path is a silent no-op in
+/// git itself, which would otherwise let a caller believe it removed
+/// something it never touched.
+pub fn signed_removal_commit(
+    repo_dir: &Path,
+    paths: &[PathBuf],
+    subject: &str,
+    principal: &str,
+    signing_key_path: &Path,
+    provenance: &Provenance,
+) -> Result<CommitId, String> {
+    if paths.is_empty() {
+        return Err("signed_removal_commit: no paths given".to_string());
+    }
+
+    for path in paths {
+        let path_str = path.to_string_lossy();
+        super::run_git(repo_dir, &["update-index", "--remove", "--", &path_str])?;
+    }
+
+    commit_current_index(repo_dir, subject, principal, signing_key_path, provenance)
+}
+
+/// Serializes whatever `repo_dir`'s index currently holds into a real,
+/// SSH-signed commit on top of `HEAD` -- the shared tail of
+/// [`signed_commit`] and [`signed_removal_commit`], which differ only in
+/// how they stage the index beforehand (adding new content vs. removing
+/// tracked paths). See `signed_commit`'s own doc comment for what each
+/// parameter means; this function trusts the index is already exactly
+/// what the caller wants committed.
+fn commit_current_index(
+    repo_dir: &Path,
+    subject: &str,
+    principal: &str,
+    signing_key_path: &Path,
+    provenance: &Provenance,
+) -> Result<CommitId, String> {
     let tree = super::run_git_stdout(repo_dir, &["write-tree"])?;
     let tree = tree.trim();
 
@@ -387,6 +437,92 @@ mod tests {
             .expect("read_provenance_trailers")
             .expect("expected Some(Provenance), got None");
         assert_eq!(read_back, provenance);
+    }
+
+    #[test]
+    fn signed_removal_commit_removes_a_tracked_path() {
+        let temp = temp_dir("signed-removal-commit");
+        let dir = temp.path();
+        let key = setup_signed_repo(dir, "human:alice");
+
+        std::fs::write(dir.join("a.md"), "hello\n").expect("write a.md");
+        signed_commit(
+            dir,
+            &[PathBuf::from("a.md")],
+            "add a.md",
+            "human:alice",
+            &key.private_path,
+            &Provenance::default(),
+        )
+        .expect("signed_commit");
+
+        std::fs::remove_file(dir.join("a.md")).expect("delete a.md from disk");
+        let commit = signed_removal_commit(
+            dir,
+            &[PathBuf::from("a.md")],
+            "forget a.md",
+            "human:alice",
+            &key.private_path,
+            &Provenance::default(),
+        )
+        .expect("signed_removal_commit");
+
+        verify_commit(dir, &commit).expect("removal commit must be validly signed");
+        let ls_tree = crate::run_git_stdout(dir, &["ls-tree", "-r", "--name-only", &commit.0])
+            .expect("ls-tree");
+        assert!(!ls_tree.contains("a.md"));
+    }
+
+    #[test]
+    fn signed_removal_commit_rejects_an_empty_path_list() {
+        let temp = temp_dir("signed-removal-commit-empty");
+        let dir = temp.path();
+        let key = setup_signed_repo(dir, "human:alice");
+
+        let result = signed_removal_commit(
+            dir,
+            &[],
+            "empty",
+            "human:alice",
+            &key.private_path,
+            &Provenance::default(),
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn signed_removal_commit_only_removes_the_given_path_leaving_others_intact() {
+        let temp = temp_dir("signed-removal-commit-scoped");
+        let dir = temp.path();
+        let key = setup_signed_repo(dir, "human:alice");
+
+        std::fs::write(dir.join("a.md"), "keep me\n").expect("write a.md");
+        std::fs::write(dir.join("b.md"), "forget me\n").expect("write b.md");
+        signed_commit(
+            dir,
+            &[PathBuf::from("a.md"), PathBuf::from("b.md")],
+            "add both",
+            "human:alice",
+            &key.private_path,
+            &Provenance::default(),
+        )
+        .expect("signed_commit");
+
+        std::fs::remove_file(dir.join("b.md")).expect("delete b.md from disk");
+        let commit = signed_removal_commit(
+            dir,
+            &[PathBuf::from("b.md")],
+            "forget b.md",
+            "human:alice",
+            &key.private_path,
+            &Provenance::default(),
+        )
+        .expect("signed_removal_commit");
+
+        let ls_tree = crate::run_git_stdout(dir, &["ls-tree", "-r", "--name-only", &commit.0])
+            .expect("ls-tree");
+        assert!(ls_tree.contains("a.md"), "a.md must survive: {ls_tree}");
+        assert!(!ls_tree.contains("b.md"));
     }
 
     #[test]

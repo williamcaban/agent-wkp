@@ -3,7 +3,7 @@
 
 use std::path::{Path, PathBuf};
 
-use crate::plumbing::{run_git, run_git_stdout};
+use crate::plumbing::{run_git, run_git_stdout, run_git_stdout_bytes};
 
 /// Which store files changed in the working tree, relative to git's own
 /// index (design 5.1: "which files changed" from cached stat metadata,
@@ -137,6 +137,16 @@ fn classify_ordinary(xy: &str, path: PathBuf, changes: &mut ChangeSet) {
 pub fn list_tracked_files(repo_dir: &Path) -> Result<Vec<PathBuf>, String> {
     let stdout = run_git_stdout(repo_dir, &["ls-files"])?;
     Ok(stdout.lines().map(PathBuf::from).collect())
+}
+
+/// Reads the exact bytes of the object at `rev_path` (e.g.
+/// `HEAD:secret.md`, `<sha>:path`) via `git cat-file -p` -- the object
+/// database's content exactly as committed, before any smudge filter a
+/// real checkout would apply. Raw bytes, not a lossy-UTF8 `String`: a
+/// `visibility: private` blob's content is age ciphertext, arbitrary
+/// binary data a lossy conversion would corrupt.
+pub fn read_blob(repo_dir: &Path, rev_path: &str) -> Result<Vec<u8>, String> {
+    run_git_stdout_bytes(repo_dir, &["cat-file", "-p", rev_path])
 }
 
 /// Removes `path` from `repo_dir`'s git index (`git update-index

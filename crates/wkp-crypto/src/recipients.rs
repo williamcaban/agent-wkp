@@ -125,6 +125,46 @@ pub fn append(path: &Path, entry: &RecipientEntry) -> Result<(), Error> {
     std::fs::write(path, updated).map_err(Error::Io)
 }
 
+/// Removes every line whose `label` matches `label` exactly, rewriting
+/// the file in place. Returns whether any line matched -- callers that
+/// need "this device was actually registered" (M4-5's device revocation)
+/// treat `Ok(false)` as an error condition themselves; this function
+/// stays a plain, unconditional removal, matching `append`'s own
+/// "exact label/line match" granularity rather than guessing intent.
+/// A missing file is treated as "nothing to remove" (`Ok(false)`), not
+/// an error -- symmetric with `append`'s "creates it if it doesn't exist"
+/// posture at the other end of this file's lifecycle.
+pub fn remove(path: &Path, label: &str) -> Result<bool, Error> {
+    let Ok(existing) = std::fs::read_to_string(path) else {
+        return Ok(false);
+    };
+
+    let mut removed = false;
+    let mut kept_lines = Vec::new();
+    for line in existing.lines() {
+        let trimmed = line.trim();
+        let matches = !trimmed.is_empty()
+            && !trimmed.starts_with('#')
+            && trimmed.split_whitespace().next() == Some(label);
+        if matches {
+            removed = true;
+        } else {
+            kept_lines.push(line);
+        }
+    }
+
+    if !removed {
+        return Ok(false);
+    }
+
+    let mut updated = kept_lines.join("\n");
+    if !updated.is_empty() {
+        updated.push('\n');
+    }
+    std::fs::write(path, updated).map_err(Error::Io)?;
+    Ok(true)
+}
+
 /// Generates a fresh recovery identity, appends its public half to the
 /// `recipients` file at `path` under `recovery:<label>`, and returns the
 /// *private* identity to the caller. This is the only code path that ever
@@ -298,6 +338,57 @@ mod tests {
         };
         append(&path, &entry).unwrap();
         assert!(path.is_file());
+    }
+
+    #[test]
+    fn remove_drops_only_the_matching_label() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("recipients");
+        let alice = RecipientEntry {
+            label: "device:alice-laptop".to_string(),
+            kind: RecipientKind::Device,
+            recipient: a_recipient(),
+        };
+        let bob = RecipientEntry {
+            label: "device:bob-desktop".to_string(),
+            kind: RecipientKind::Device,
+            recipient: a_recipient(),
+        };
+        append(&path, &alice).unwrap();
+        append(&path, &bob).unwrap();
+
+        let removed = remove(&path, "device:alice-laptop").unwrap();
+        assert!(removed);
+
+        let parsed = parse(&std::fs::read_to_string(&path).unwrap());
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].label, "device:bob-desktop");
+    }
+
+    #[test]
+    fn remove_returns_false_for_an_unknown_label() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("recipients");
+        append(
+            &path,
+            &RecipientEntry {
+                label: "device:alice-laptop".to_string(),
+                kind: RecipientKind::Device,
+                recipient: a_recipient(),
+            },
+        )
+        .unwrap();
+
+        assert!(!remove(&path, "device:nonexistent").unwrap());
+        assert_eq!(parse(&std::fs::read_to_string(&path).unwrap()).len(), 1);
+    }
+
+    #[test]
+    fn remove_on_a_missing_file_returns_false_without_creating_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("recipients");
+        assert!(!remove(&path, "device:anything").unwrap());
+        assert!(!path.exists());
     }
 
     #[test]
