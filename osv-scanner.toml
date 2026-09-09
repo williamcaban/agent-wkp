@@ -1,3 +1,0 @@
-[[IgnoredVulns]]
-id = "RUSTSEC-2023-0071"
-reason = "rsa is an optional, feature-gated dependency of ssh-key (crates/wkp-crypto), never enabled by this workspace's feature selection -- see .cargo/audit.toml for the full explanation."

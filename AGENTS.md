@@ -1,35 +1,34 @@
 # AGENTS.md — WKP for AI Agents
 
-This file describes how AI agents should use the `wkp` CLI. Read it before calling any `wkp` command. `CLAUDE.md` is a different document: it tells contributors how to *build* `wkp`, not how to use it.
+This file describes how AI agents should use the `wkp` CLI. Read it before calling any `wkp` command.
 
 ## What WKP is
 
-WKP is a durable, cross-machine, cross-harness memory store: a git repository of markdown files with a small YAML-like frontmatter block, and a derived SQLite FTS5 index for full-text search. It is a single static binary — no daemon, no server, no MCP tool quota. You call it via the Bash tool.
+WKP is a command-line knowledge index. It embeds your workspace's markdown files and lets you retrieve relevant context by topic, tier, or explicit file relationship — without loading everything into every conversation.
 
-There is no embedding model and no network call anywhere in the default path. Search is BM25 full-text search over the local index, plus explicit graph edges (`refs:` frontmatter and `[[wikilink]]` mentions in the body).
+You call it via the Bash tool. It does not consume MCP tool quota. It has no server to start.
 
-## The tiers
+## The four tiers
 
-| Tier | How it reaches you | Contains |
-|------|--------------------|----------|
-| 0 | Already in context — a harness's `SessionStart` hook `cat`s `.wkp/tier0.md` before your first message | `type: project-state` and `type: instruction` items |
-| 1 | Call `wkp materialize --tier 1` then read `.wkp/tier1.md`, or `wkp search --tier 1` | `type: feedback` and `type: knowledge` items |
-| 2 | On demand — call `wkp search` or `wkp context` | Everything else, including anything under `inbox/` |
-| 3 | Explicit file read — use the Read tool directly on a path `wkp` returned | Full file content, any tier |
+| Tier | Token budget | How it reaches you |
+|------|-------------|-------------------|
+| 0 | ≤4k | Already in context — injected by the SessionStart hook before your first message |
+| 1 | ≤8k | Index listing — call `wkp context --tier 1 "topic"` to load the routing map |
+| 2 | ≤16k | On-demand — call `wkp search` or `wkp context` when you need content |
+| 3 | Unlimited | Explicit file read — use the Read tool directly |
 
-**Tier 0 is already present.** Never search for it — it was injected before this conversation started. If you don't see a `<wkp-context tier="0">` block, the hook isn't wired into `.claude/settings.local.json` yet; run `wkp hooks --framework claude_code` and apply the printed JSON.
+**Tier 0 is already present.** Never search for it — it was injected before this conversation started. If you don't see a `<wkp-context tier="0">` block, it means the hook is not yet wired into `settings.local.json` (see README quickstart).
 
-Tier is computed from frontmatter, not chosen by hand: `project-state`/`instruction` → tier 0, `feedback`/`knowledge` → tier 1, everything else → tier 2. Anything under `inbox/`, or with `confidence: proposed`/`inferred`, is forced to tier 2 regardless of its `type` — agent-written or imported memory never self-promotes into tier 0/1 (see "Writing memory" below).
+## When to call wkp
+
+Call `wkp search` or `wkp context` when:
+- The user asks about a topic you don't have enough context on
+- You need to find which files cover a subject before reading them
+- You want to discover related files via explicit references (use `wkp traverse`)
+
+Do **not** call `wkp search` for every message — only when you genuinely need to retrieve knowledge you don't already have.
 
 ## Core commands
-
-### Initialize a store
-
-```bash
-wkp init [path]
-```
-
-Makes `path` (default: cwd) a git repository with a `.wkp/` directory holding the derived, gitignored `index.db`. Also runs the one-time import described below. Safe to re-run — idempotent.
 
 ### Search by topic
 
@@ -37,17 +36,11 @@ Makes `path` (default: cwd) a git repository with a `.wkp/` directory holding th
 wkp search "rfe creation workflow" --tier 2 --budget 6000
 ```
 
-BM25 full-text search over `index.db`. Flags: `--tier N` (filter to a tier), `--budget N` (stop once estimated tokens exceed N), `-k`/`--limit N` (max hits), `--format text|paths|json` (default `text`), `--path DIR` (store root, default cwd).
-
-Use `--format paths` to get bare paths for Read tool calls:
+Returns a ranked list of files with scores. Use `--format paths` to get bare paths for Read tool calls:
 
 ```bash
 wkp search "guardrails nemo" --format paths -k 5
 ```
-
-#### Optional hybrid search
-
-`wkp search` (only `search`, not yet `context`) additionally supports `--embed-url URL [--embed-model NAME] [--embed-key-file PATH]`: Reciprocal Rank Fusion between BM25 and cosine similarity against an OpenAI-compatible embeddings endpoint (a local Ollama/llama.cpp server, or a hosted one). Falls back to plain BM25 with a stderr warning on any failure — an unreachable endpoint or an embedding-dimension mismatch never makes `wkp search` itself fail. Requires embeddings to already exist (`wkp index --embed-url ...`, same three flags, computed once per changed item) and a binary built with `cargo build --features wkp-cli/embed` — this is opt-in at build time as well as at the command line, so a plain `wkp` may not have it at all; if it doesn't, both commands fail with a message naming the rebuild flag rather than "unrecognized argument". Never call this from a session-start hook or any other default path — it's the one place `wkp` ever makes a network call, and only when a human has explicitly configured `--embed-url`.
 
 ### Assemble context for a topic
 
@@ -55,7 +48,7 @@ wkp search "guardrails nemo" --format paths -k 5
 wkp context "evalhub adapter patterns" --tier 2 --budget 8000
 ```
 
-Same flags as `search`. Combines the BM25 hits with a graph traversal of the `refs:`/`[[wikilink]]` edges from those hits, under one result set. Better than `search` when you want a hit's directly-linked neighbors included, not just the hit itself.
+Combines semantic search with graph traversal of explicit `refs:` links. Returns file content up to the token budget. Better than `search` when you need to load and read, not just find.
 
 ### Traverse explicit references from a known file
 
@@ -63,68 +56,45 @@ Same flags as `search`. Combines the BM25 hits with a graph traversal of the `re
 wkp traverse memory/reference_rfe.md --depth 2
 ```
 
-Follows `refs:` and `[[wikilink]]` edges outward from a specific file, no search query involved. `--depth N` (default 2) caps hop count. Output includes hop distance (`+1`, `+2`, ...) from the starting file. Same `--format`/`--path` flags as `search`.
+Follows `refs:` and `[[wikilink]]` edges. Use when you have a starting file and want its dependencies. Returns files ordered by hop distance and tier.
 
-### Re-index the store
-
-```bash
-wkp index [path]
-```
-
-Rescans the store rooted at `path` (default cwd) and updates `index.db` incrementally: uses git's own change detection to hash only files that are new, modified, or deleted since the last run — cost is proportional to what changed, not to corpus size. Only `.md` files are indexed. Safe to run at any time.
-
-There is no per-file re-index command — `wkp index` always operates on the whole store, but because it's incremental, running it after editing one file is cheap.
-
-Also takes the same optional `--embed-url URL [--embed-model NAME] [--embed-key-file PATH]` trio as `wkp search` (see below) — when given, computes and stores an embedding for each added/modified item, so a later `wkp search --embed-url ...` has something to compare against. A per-item embedding failure is a warning, not a fatal error for the run.
-
-### Materialize a tier to disk
+### Re-index a file you just edited
 
 ```bash
-wkp materialize --tier 0
-wkp materialize --tier 1
+wkp index memory/project_active.md
 ```
 
-Writes `.wkp/tier{N}.md`, atomically (temp file + rename, never in place). This is what a harness's `SessionStart` hook reads for tier 0; you would only call this yourself to inspect tier 0/1 content directly, or after editing frontmatter and wanting materialized output to reflect it (run `wkp index` first, since materialize reads from `index.db`).
+Re-embeds a single file. Run this if you edited a knowledge file mid-session and want the current session's searches to reflect it.
 
-### Print the SessionStart hook text
+### Re-index everything changed since last run
 
 ```bash
-wkp hooks --framework claude_code
+wkp index
 ```
 
-Prints the exact JSON to merge into `.claude/settings.local.json`. It re-indexes quietly (best-effort — a broken index never blocks session start) and then prints `.wkp/tier0.md`, also best-effort (a store with no materialized tier 0 yet produces nothing, not an error). This command never touches git or the store; it only prints static text.
-
-### Import existing harness memory
-
-```bash
-wkp import [path]
-```
-
-One-shot, idempotent migration of pre-existing memory into `inbox/import/`: `CLAUDE.md`/`AGENTS.md` at the store root (tagged `type: instruction`), and every `<home>/.claude/projects/*/memory/*.md` file this harness itself wrote (tagged from that file's own `metadata.type`). Every imported item gets `confidence: proposed` — nothing here has been through review, so nothing here reaches tier 0/1 (see "Writing memory"). Already runs once automatically as part of `wkp init`; call it again by hand if new source files show up later. A destination file that already exists is left alone, never overwritten — a human may have edited their imported copy since.
+Scans all markdown files, skips unchanged ones (git blob SHA), re-embeds only what changed. Safe to run at any time — cost is proportional to changes, not corpus size.
 
 ## Reading output
 
-`wkp search`/`wkp context`/`wkp traverse` text output:
+`wkp search` text output:
 
 ```
 [T2] Title of the file  (score=0.031, ~800t)
      path/to/file.md
 ```
 
-- `T2` = tier 2 (use the Read tool to get full content)
-- `score` = BM25 score (higher = more relevant)
-- `~800t` = estimated token cost (from frontmatter `tokens:` if present, otherwise ~4 chars/token)
+- `T2` = tier 2 (use Read tool to get full content)
+- `score` = RRF score from vector + keyword search (higher = more relevant)
+- `~800t` = estimated token cost
 
-A hit reached only through graph traversal (`context`, or any `traverse` result) carries a hop distance:
+`wkp traverse` output:
 
 ```
-[T2 +1] Directly referenced file  (score=0.500, ~200t)
+[+1] Directly referenced file  (~200t)
      path/to/direct.md
+  [+2] File referenced by the above  (~500t)
+       path/to/transitive.md
 ```
-
-`+1` = one `refs:`/`[[wikilink]]` hop from a direct hit (traversal-only score is `1/(1+hops)`, not a BM25 score); `+2` = two hops, and so on. No `+N` suffix means it matched the query directly.
-
-`--format json` gives one array of objects, each with exactly: `path`, `title`, `score`, `tier`, `tokens`, `hop_distance` (string/string/number/integer/integer/integer).
 
 ## Typical retrieval pattern
 
@@ -133,7 +103,7 @@ A hit reached only through graph traversal (`context`, or any `traverse` result)
 wkp search "topic" --format paths -k 5
 
 # 2. Read the most relevant one
-# (use the Read tool on the path returned above)
+# (use Read tool on the path returned above)
 
 # 3. Follow explicit references from that file
 wkp traverse path/to/file.md --depth 1
@@ -142,36 +112,43 @@ wkp traverse path/to/file.md --depth 1
 wkp context "topic" --tier 2 --budget 8000
 ```
 
-## When to call wkp
-
-Call `wkp search` or `wkp context` when:
-- The user asks about a topic you don't have enough context on.
-- You need to find which files cover a subject before reading them.
-- You want to discover related files via explicit references (`wkp traverse`).
-
-Do **not** call `wkp search` for every message — only when you genuinely need to retrieve knowledge you don't already have. Do not call it to check whether a specific file exists; use the Read tool directly if you already know the path.
-
-## Writing memory
-
-There is no `wkp remember` yet (M2). Until then, do not hand-edit files outside `inbox/` and do not hand-write `confidence:` as anything other than `proposed` — Tier 0 and Tier 1 promotion is a human decision made through a signed commit, not something an agent or import step can do to itself. If you write a markdown file to record something learned mid-session, put it under `inbox/` with `confidence: proposed` and let a human promote it later.
-
 ## Storage locations
 
 ```
 your-workspace/
   .wkp/
-    index.db      — SQLite: FTS5 content index + graph edges (gitignored, derived)
-    tier0.md      — materialized tier 0, read by the SessionStart hook (gitignored, derived)
-    tier1.md      — materialized tier 1 (gitignored, derived)
-  inbox/
-    import/       — output of `wkp import`: proposed, tier-2-only until a human promotes it
+    index.db    — SQLite: embeddings + metadata + FTS + graph edges
+    tier0.md    — pre-assembled always-on context (regenerated by wkp materialize)
 ```
 
-`.wkp/index.db` and `.wkp/tier{0,1}.md` are gitignored derived artifacts, written atomically. Deleting `.wkp/` and running `wkp init && wkp index` rebuilds them from scratch; nothing under `.wkp/` is ever the source of truth.
+Both are gitignored derived artifacts. Deleting `.wkp/` and running `wkp init && wkp index` rebuilds from scratch.
+
+## Index freshness
+
+The index reflects the state of files at the last `wkp index` run. In a knowledge-base workspace where git commits are infrequent, the SessionStart hook re-indexes changed files before each session so you always start current.
+
+If you edit a file mid-session, run `wkp index <file>` to make that change visible to searches in the same session.
+
+## PageRank hints
+
+```bash
+wkp analyze --top 10
+```
+
+Runs PageRank on the knowledge graph and suggests files that are heavily referenced but not yet Tier 1. If the output suggests a file you know is foundational, add `type: feedback` or `type: project-state` to its OKF frontmatter to promote it to Tier 1.
+
+## Sub-workspace search
+
+```bash
+wkp search "topic" --workspace eval-hub
+wkp search "topic" --all-workspaces
+```
+
+Each sub-workspace (`eval-hub/`, `trustworthy-ai/`, etc.) has its own `.wkp/` index shard. Cross-workspace search federates across all shards.
 
 ## What not to do
 
-- Do not pass more than ~10k tokens of search results to the model at once — use `--budget` to stay within budget.
-- Do not rely on `wkp search`/`wkp context` for Tier 0 content — it is already in your context.
-- Do not hand-write or hand-edit `index.db` or `tier{0,1}.md` — they are derived; edit the markdown source and re-run `wkp index`/`wkp materialize`.
-- Do not set `confidence: proposed`/`inferred` items to a stated confidence yourself, or move a file out of `inbox/` yourself — that promotion is a human-signed action.
+- Do not pass more than ~10k tokens of search results to the model at once — use `--budget` to stay within the token budget
+- Do not call `wkp index` on the full corpus mid-session unless necessary — it takes 5–10 seconds
+- Do not use `wkp search` to verify that a specific file exists — use the Read tool directly if you know the path
+- Do not rely on `wkp search` for Tier 0 content — it is already in your context

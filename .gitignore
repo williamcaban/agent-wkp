@@ -39,9 +39,6 @@ nosetests.xml
 # WKP runtime index (derived from markdown — never commit)
 .wkp/
 
-# Rust build output (Cargo.lock is tracked; design 9.6 requires --locked builds)
-/target/
-
 # macOS
 .DS_Store
 .AppleDouble
