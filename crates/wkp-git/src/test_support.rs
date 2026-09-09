@@ -6,6 +6,30 @@
 
 use std::path::Path;
 use std::process::Command;
+use std::sync::Once;
+
+/// Points `GIT_CONFIG_GLOBAL` at a throwaway file for the lifetime of
+/// this test binary's process, instead of the real `~/.gitconfig` --
+/// found the hard way (2026-09-08 crash postmortem): `apply_init_settings`
+/// runs `git maintenance start`, which registers `maintenance.repo`
+/// against whatever `--global` config resolves to. Every temp repo this
+/// module or `init.rs`'s tests create did that against the *real* global
+/// config, and nothing ever unregistered it after the temp dir was
+/// deleted -- 12,597 stale entries later, an hourly
+/// `maintenance run --schedule=hourly` cron job was forking a git
+/// process per dead path, and a run of that colliding with a live
+/// `cargo test` OOM'd the box. `git` itself honors this env var, so no
+/// caller of `run_git`/`run_git_stdout`/`run_git_with_stdin` needs to
+/// know about it; `Once` because `set_var` is process-wide and cheap to
+/// call once regardless of test parallelism.
+fn isolate_git_global_config() {
+    static INIT: Once = Once::new();
+    INIT.call_once(|| {
+        let path = std::env::temp_dir() // nosemgrep: rust.lang.security.temp-dir.temp-dir -- not a shared, guessable-name file: `std::process::id()` scopes this path to this one process, which is also the only reader/writer (`GIT_CONFIG_GLOBAL` is set here and read back only by `git` subprocesses this same process spawns), and the content is non-sensitive throwaway git config, not a secret.
+            .join(format!("wkp-test-git-global-config-{}", std::process::id()));
+        std::env::set_var("GIT_CONFIG_GLOBAL", path);
+    });
+}
 
 pub(crate) struct TempGitRepo {
     dir: tempfile::TempDir,
@@ -13,6 +37,7 @@ pub(crate) struct TempGitRepo {
 
 impl TempGitRepo {
     pub(crate) fn new(name: &str) -> Self {
+        isolate_git_global_config();
         let dir = tempfile::Builder::new()
             .prefix(&format!("wkp-git-test-{name}-"))
             .tempdir()
@@ -99,6 +124,7 @@ impl TempGitRepo {
 /// already trusts" (design 6.1) -- the target of `fetch`/`push_branch`
 /// in these tests, never opened as a working tree itself.
 pub(crate) fn bare_remote(name: &str) -> tempfile::TempDir {
+    isolate_git_global_config();
     let dir = tempfile::Builder::new()
         .prefix(&format!("wkp-git-test-bare-{name}-"))
         .tempdir()

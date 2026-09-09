@@ -1,12 +1,33 @@
 //! Shared test-only fixtures used across this crate's module test suites.
 
 use std::path::{Path, PathBuf};
+use std::sync::Once;
+
+/// Points `GIT_CONFIG_GLOBAL` at a throwaway file for the lifetime of
+/// this test binary's process, instead of the real `~/.gitconfig`.
+/// `run_init`/`test_init` calls `wkp_git::apply_init_settings`, which
+/// runs `git maintenance start` and registers the repo in whatever
+/// `--global` config resolves to -- and since `wkp-git`'s own
+/// `#[cfg(test)]` isolation (see its `test_support.rs`) only applies
+/// when `wkp-git` itself is the crate under test, not when it's linked
+/// in as a dependency here, this crate's tests need the same guard
+/// independently. See `wkp-git/src/test_support.rs` for the incident
+/// this traces back to.
+fn isolate_git_global_config() {
+    static INIT: Once = Once::new();
+    INIT.call_once(|| {
+        let path = std::env::temp_dir() // nosemgrep: rust.lang.security.temp-dir.temp-dir -- not a shared, guessable-name file: `std::process::id()` scopes this path to this one process, which is also the only reader/writer (`GIT_CONFIG_GLOBAL` is set here and read back only by `git` subprocesses this same process spawns), and the content is non-sensitive throwaway git config, not a secret.
+            .join(format!("wkp-test-git-global-config-{}", std::process::id()));
+        std::env::set_var("GIT_CONFIG_GLOBAL", path);
+    });
+}
 
 /// `tempfile` rather than `std::env::temp_dir()` + a predictable name:
 /// the latter is flagged by this repo's semgrep gate as an
 /// insecure-temp-file pattern (a shared temp directory with a
 /// guessable name invites symlink/TOCTOU races).
 pub(crate) fn temp_dir(name: &str) -> tempfile::TempDir {
+    isolate_git_global_config();
     tempfile::Builder::new()
         .prefix(&format!("wkp-cli-test-{name}-"))
         .tempdir()
