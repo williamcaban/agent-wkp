@@ -9,6 +9,7 @@
 
 mod control_plane;
 mod http;
+mod tenant_repo;
 mod wkp_shell;
 
 /// Where per-tenant bare repos live (M5-4's own job to actually
@@ -117,6 +118,50 @@ fn main() {
                 }
             }
         }
+        Some("index-tenant") => {
+            let Some(tenant_slug) = args.next() else {
+                eprintln!("wkp-hub: usage: wkp-hub index-tenant <tenant-slug>");
+                std::process::exit(1);
+            };
+            match tenant_repo::index_tenant(&repos_root(), &tenant_slug) {
+                Ok(summary) => {
+                    println!(
+                        "wkp-hub: indexed {} item(s) for tenant {tenant_slug}, skipped {} \
+                         private item(s)",
+                        summary.indexed.len(),
+                        summary.skipped_private.len()
+                    );
+                }
+                Err(e) => {
+                    eprintln!("wkp-hub: index-tenant failed: {e}");
+                    std::process::exit(1);
+                }
+            }
+        }
+        Some("provision-repo") => {
+            // The git/filesystem half of `tenant create`, exposed on its
+            // own: genuinely useful on its own (re-provisioning a repo
+            // whose control-plane row already exists, or fixing a
+            // missing/corrupted hook, without touching Postgres at all)
+            // and, not incidentally, lets this crate's own tests and
+            // this task's acceptance-criteria integration test exercise
+            // the repo+hook half without needing a database -- the same
+            // DB-free property `index-tenant` above already has.
+            let Some(tenant_slug) = args.next() else {
+                eprintln!("wkp-hub: usage: wkp-hub provision-repo <tenant-slug>");
+                std::process::exit(1);
+            };
+            match tenant_repo::provision_tenant_repo(&repos_root(), &tenant_slug) {
+                Ok(repo_path) => println!(
+                    "wkp-hub: provisioned repo for tenant {tenant_slug} at {}",
+                    repo_path.display()
+                ),
+                Err(e) => {
+                    eprintln!("wkp-hub: provision-repo failed: {e}");
+                    std::process::exit(1);
+                }
+            }
+        }
         Some("migrate") => {
             match control_plane::connect() {
                 Ok(_client) => println!("wkp-hub: schema is up to date"),
@@ -132,14 +177,31 @@ fn main() {
                     eprintln!("wkp-hub: tenant create requires a slug");
                     std::process::exit(1);
                 };
-                match control_plane::connect()
+                let tenant = match control_plane::connect()
                     .and_then(|mut client| control_plane::create_tenant(&mut client, &slug))
                 {
-                    Ok(tenant) => {
-                        println!("wkp-hub: created tenant {} (id {})", tenant.slug, tenant.id)
-                    }
+                    Ok(tenant) => tenant,
                     Err(e) => {
                         eprintln!("wkp-hub: tenant create failed: {e}");
+                        std::process::exit(1);
+                    }
+                };
+                // M5-4: a tenant isn't actually usable (nothing to push
+                // or pull) until its bare repo exists too -- one command
+                // leaves both the control-plane row and the repo in
+                // place, rather than requiring a second manual step.
+                match tenant_repo::provision_tenant_repo(&repos_root(), &tenant.slug) {
+                    Ok(repo_path) => println!(
+                        "wkp-hub: created tenant {} (id {}), repo at {}",
+                        tenant.slug,
+                        tenant.id,
+                        repo_path.display()
+                    ),
+                    Err(e) => {
+                        eprintln!(
+                            "wkp-hub: tenant create: control-plane row created, but \
+                                   repo provisioning failed: {e}"
+                        );
                         std::process::exit(1);
                     }
                 }
@@ -208,7 +270,8 @@ fn main() {
                 "wkp-hub: usage: wkp-hub serve [--port <port>] | migrate | \
                  tenant create <slug> | device register <tenant-slug> <public-key> | \
                  device revoke <public-key> | authorized-keys-command <public-key> | \
-                 git-shell <tenant-slug>"
+                 git-shell <tenant-slug> | index-tenant <tenant-slug> | \
+                 provision-repo <tenant-slug>"
             );
             std::process::exit(1);
         }

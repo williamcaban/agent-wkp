@@ -40,9 +40,22 @@ pub fn init_repo(path: &Path) -> Result<(), String> {
 /// real `wkp sync` remote points at (design 6.1). `wkp` itself only ever
 /// `fetch`/`push`es against a remote like this; nothing in this crate
 /// opens one as a working tree.
+///
+/// `--initial-branch=main`, the same fixed-convention fix [`init_repo`]'s
+/// own doc comment explains: a bare repo's `HEAD` symref only follows
+/// whatever branch name it was created with, not whatever a client later
+/// pushes -- without this, a bare repo created on a host whose
+/// `init.defaultBranch` is unset (`master`) never resolves `HEAD` at all
+/// once a client's `wkp init`-created `main` branch (M3-4's own fixed
+/// convention) is pushed to it, since `main` and `master` are different
+/// refs (found in M5-4: a hub's per-tenant indexer reading a freshly
+/// pushed-to repo's `HEAD` came back "unborn" every time).
 pub fn init_bare_repo(path: &Path) -> Result<(), String> {
     std::fs::create_dir_all(path).map_err(|e| e.to_string())?;
-    run_git(path, &["init", "--quiet", "--bare"])
+    run_git(
+        path,
+        &["init", "--quiet", "--bare", "--initial-branch=main"],
+    )
 }
 
 /// Stages every change in `repo_dir` and commits it with `message`.

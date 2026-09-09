@@ -3797,6 +3797,9 @@ dependencies = [
  "time",
  "tiny_http",
  "ureq",
+ "wkp-core",
+ "wkp-crypto",
+ "wkp-git",
 ]
 
 [[package]]

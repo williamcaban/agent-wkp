@@ -22,7 +22,6 @@ use std::path::Path;
 
 pub(crate) const RECIPIENTS_FILENAME: &str = "recipients";
 const DEVICE_IDENTITY_FALLBACK: &str = ".wkp/device-identity";
-const AGE_HEADER: &[u8] = b"age-encryption.org/v1";
 
 /// Clean direction (working tree -> repo object): encrypts `content` to
 /// every recipient in `store_root`'s `recipients` file (M4-3) when its
@@ -71,7 +70,7 @@ pub(crate) fn run_filter_clean(store_root: &Path, content: &[u8]) -> Result<Vec<
 /// returns `content` unchanged. Never fails the process -- see the
 /// module doc comment and ADR-0006.
 pub(crate) fn run_filter_smudge(store_root: &Path, content: &[u8]) -> Vec<u8> {
-    if !content.starts_with(AGE_HEADER) {
+    if !content.starts_with(wkp_crypto::AGE_HEADER) {
         return content.to_vec();
     }
 
@@ -161,7 +160,7 @@ mod tests {
         let content = b"---\nvisibility: private\n---\n\nsecret body\n";
 
         let ciphertext = run_filter_clean(temp.path(), content).expect("run_filter_clean");
-        assert!(ciphertext.starts_with(AGE_HEADER));
+        assert!(ciphertext.starts_with(wkp_crypto::AGE_HEADER));
         assert_ne!(ciphertext, content);
 
         let plaintext = wkp_crypto::decrypt(&ciphertext, &identity).expect("decrypt");
