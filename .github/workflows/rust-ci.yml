@@ -206,3 +206,50 @@ jobs:
 
       - name: semgrep --config p/rust
         run: semgrep scan --config p/rust --error --metrics=off
+
+  hub-ssh-integration:
+    name: hub SSH integration test (M5-5)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    # Same Postgres service container the control-plane job (above)
+    # uses -- this job's `wkp-hub` container talks to it exactly the
+    # way that job's own test binary does, just from inside a container
+    # instead of the runner's own process.
+    services:
+      postgres:
+        image: postgres@sha256:f1c3376c26f2609ab9f29f71f824103fe2fcd8ee0346485cb6122a4f93df6f94 # 16
+        env:
+          POSTGRES_PASSWORD: wkp_hub_ci
+          POSTGRES_DB: wkp_hub_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    env:
+      DATABASE_URL: postgres://postgres:wkp_hub_ci@localhost:5432/wkp_hub_test
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      # `sudo`, not rootless podman: this job's own container needs
+      # `--network host` (deploy/hub/test-ssh-integration.sh's own
+      # comment explains why) to bind port 22 and reach the Postgres
+      # service container above at `localhost`, which needs real
+      # privilege a rootless runner user does not have -- found by hand
+      # while developing this image in a rootless sandbox, which is why
+      # that script's own local-dev instructions use bridge networking
+      # instead. `ubuntu-latest` ships podman already; this just
+      # confirms it rather than reinstalling.
+      - name: confirm podman is available
+        run: podman --version
+
+      - name: podman build -f deploy/hub/Containerfile
+        run: sudo podman build -f deploy/hub/Containerfile -t wkp-hub .
+
+      # M5-5's own required integration test: register a device, push
+      # over SSH, revoke it, attempt another push, confirm it fails.
+      - name: deploy/hub/test-ssh-integration.sh
+        run: sudo -E bash deploy/hub/test-ssh-integration.sh
