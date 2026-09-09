@@ -270,8 +270,16 @@ fn handle_device_token(request: &mut tiny_http::Request) -> Rendered {
             },
         );
     };
-    let tenant_slug = match control_plane_tenant_slug(&mut client, grant.tenant_id) {
-        Ok(slug) => slug,
+    let tenant_slug = match control_plane::find_tenant_by_id(&mut client, grant.tenant_id) {
+        Ok(Some(tenant)) => tenant.slug,
+        Ok(None) => {
+            return Rendered::json(
+                500,
+                &ErrorBody {
+                    error: "grant references a tenant that no longer exists".to_string(),
+                },
+            )
+        }
         Err(e) => {
             return Rendered::json(
                 500,
@@ -290,18 +298,6 @@ fn handle_device_token(request: &mut tiny_http::Request) -> Rendered {
             device_id,
         },
     )
-}
-
-/// `control_plane` only exposes tenant lookup by slug, not by id (no
-/// caller needed the reverse direction until now) -- this is the one
-/// place in this task that does, so it queries directly rather than
-/// growing `control_plane`'s own public surface for a single call site.
-fn control_plane_tenant_slug(
-    client: &mut postgres::Client,
-    tenant_id: i64,
-) -> Result<String, control_plane::Error> {
-    let row = client.query_one("SELECT slug FROM tenants WHERE id = $1", &[&tenant_id])?;
-    Ok(row.get("slug"))
 }
 
 /// `GET /verify?user_code=...`: a bare HTML form, prefilled with

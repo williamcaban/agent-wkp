@@ -9,6 +9,23 @@
 
 mod control_plane;
 mod http;
+mod wkp_shell;
+
+/// Where per-tenant bare repos live (M5-4's own job to actually
+/// provision) -- read once, here, so `wkp-hub git-shell` doesn't need
+/// its own separate configuration story beyond this one env var.
+/// Never argv (CLAUDE.md's secrets rule doesn't strictly apply to a
+/// plain filesystem path, but there is no reason for it to be
+/// per-invocation configurable via the `authorized_keys` `command=`
+/// string either -- one hub process, one repos root).
+const REPOS_ROOT_ENV: &str = "WKP_HUB_REPOS_ROOT";
+const DEFAULT_REPOS_ROOT: &str = "/srv/wkp-hub/repos";
+
+fn repos_root() -> std::path::PathBuf {
+    std::env::var(REPOS_ROOT_ENV)
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|_| std::path::PathBuf::from(DEFAULT_REPOS_ROOT))
+}
 
 /// A minimal admin CLI over M5-1's control plane -- `migrate` (ensure
 /// the schema exists), `tenant create`, `device register`/`revoke`.
@@ -37,6 +54,67 @@ fn main() {
             if let Err(e) = http::serve(port) {
                 eprintln!("wkp-hub: serve failed: {e}");
                 std::process::exit(1);
+            }
+        }
+        Some("authorized-keys-command") => {
+            // sshd's AuthorizedKeysCommand (M5-5's own wiring) passes
+            // the key as one or more tokens depending on how the
+            // directive names them (`%t %k`, or a single pre-quoted
+            // `"%t %k"`) -- join whatever's left so both shapes
+            // reconstruct the same `<type> <base64>` string
+            // control_plane::Device::public_key stores.
+            let public_key = args.collect::<Vec<_>>().join(" ");
+            if public_key.trim().is_empty() {
+                eprintln!("wkp-hub: usage: wkp-hub authorized-keys-command <public-key>");
+                std::process::exit(1);
+            }
+            let result = control_plane::connect()
+                .and_then(|mut client| wkp_shell::resolve_authorized_key(&mut client, &public_key));
+            match result {
+                // Deliberately no output at all for an unknown/revoked
+                // key, exit 0 -- sshd's own AuthorizedKeysCommand
+                // contract for "no keys found", not an error.
+                Ok(Some(resolved)) => {
+                    // stderr, not stdout: sshd parses AuthorizedKeysCommand's
+                    // stdout as literal authorized_keys lines, nothing else
+                    // may appear there. This is just an operator-facing
+                    // diagnostic (which tenant a connection resolved to,
+                    // useful in sshd's own logs), not part of the protocol.
+                    eprintln!("wkp-hub: resolved to tenant {}", resolved.tenant_slug);
+                    println!("{}", resolved.line);
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    eprintln!("wkp-hub: authorized-keys-command failed: {e}");
+                    std::process::exit(1);
+                }
+            }
+        }
+        Some("git-shell") => {
+            let Some(tenant_slug) = args.next() else {
+                eprintln!("wkp-hub: usage: wkp-hub git-shell <tenant-slug>");
+                std::process::exit(1);
+            };
+            let ssh_original_command = std::env::var("SSH_ORIGINAL_COMMAND").ok();
+            match wkp_shell::decide_git_shell_command(
+                &tenant_slug,
+                &repos_root(),
+                ssh_original_command.as_deref(),
+            ) {
+                wkp_shell::GitShellDecision::Exec { program, repo_path } => {
+                    let status = std::process::Command::new(program).arg(&repo_path).status();
+                    match status {
+                        Ok(status) => std::process::exit(status.code().unwrap_or(1)),
+                        Err(e) => {
+                            eprintln!("wkp-hub: git-shell: failed to run {program}: {e}");
+                            std::process::exit(1);
+                        }
+                    }
+                }
+                wkp_shell::GitShellDecision::Refuse { reason } => {
+                    eprintln!("wkp-hub: git-shell: {reason}");
+                    std::process::exit(1);
+                }
             }
         }
         Some("migrate") => {
@@ -127,8 +205,10 @@ fn main() {
         },
         _ => {
             eprintln!(
-                "wkp-hub: usage: wkp-hub serve [--port <port>] | migrate | tenant create <slug> | \
-                 device register <tenant-slug> <public-key> | device revoke <public-key>"
+                "wkp-hub: usage: wkp-hub serve [--port <port>] | migrate | \
+                 tenant create <slug> | device register <tenant-slug> <public-key> | \
+                 device revoke <public-key> | authorized-keys-command <public-key> | \
+                 git-shell <tenant-slug>"
             );
             std::process::exit(1);
         }

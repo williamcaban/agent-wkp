@@ -126,6 +126,15 @@ pub fn find_tenant_by_slug(client: &mut Client, slug: &str) -> Result<Option<Ten
     Ok(row.as_ref().map(tenant_from_row))
 }
 
+/// Looks up a tenant by its `id` -- the reverse direction of
+/// [`find_tenant_by_slug`], needed by anything that starts from a
+/// [`Device`] row (which only carries `tenant_id`), e.g. `wkp-shell`'s
+/// key-to-tenant resolution (M5-3).
+pub fn find_tenant_by_id(client: &mut Client, tenant_id: i64) -> Result<Option<Tenant>, Error> {
+    let row = client.query_opt("SELECT id, slug FROM tenants WHERE id = $1", &[&tenant_id])?;
+    Ok(row.as_ref().map(tenant_from_row))
+}
+
 /// Registers a device's public key under `tenant_id` -- the write side
 /// of what M5-2's RFC 8628 flow calls once a grant is approved, and
 /// what M5-3's `wkp-shell` reads back to resolve a presented key.
@@ -241,6 +250,22 @@ mod tests {
                 .expect("find_tenant_by_slug")
                 .is_none()
         );
+    }
+
+    #[test]
+    fn find_tenant_by_id_round_trips_and_returns_none_for_unknown() {
+        let mut client = connect().expect("connect");
+        let created =
+            create_tenant(&mut client, &unique_slug("find-by-id")).expect("create_tenant");
+
+        let found = find_tenant_by_id(&mut client, created.id)
+            .expect("find_tenant_by_id")
+            .expect("tenant must be found");
+        assert_eq!(found, created);
+
+        assert!(find_tenant_by_id(&mut client, -1)
+            .expect("find_tenant_by_id")
+            .is_none());
     }
 
     #[test]
