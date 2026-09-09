@@ -1,0 +1,58 @@
+# wkpd: watch-triggered automation for a single wkp store (M3-8, design
+# 4.2/7.5). Runs as a `systemd --user` unit -- never as root, never a
+# system-wide service -- since wkpd only ever needs the invoking user's
+# own permissions to read/write their own store.
+#
+# Install (per store):
+#   mkdir -p ~/.config/systemd/user
+#   cp deploy/systemd/wkpd.service ~/.config/systemd/user/wkpd.service
+#   # Edit the three placeholders below for your setup, then:
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now wkpd.service
+#
+# A second store needs a second, differently-named unit file (e.g.
+# wkpd-work.service) with its own ReadWritePaths/ExecStart -- this is a
+# plain unit, not a systemd template (`wkpd@.service`), because turning a
+# filesystem path into a template instance name needs systemd's own path
+# escaping (`systemd-escape`) at install time, which is more ceremony than
+# a single-store deployment (the common case) should need. Revisit as a
+# template unit if multi-store-per-host becomes a real, common need.
+
+[Unit]
+Description=wkpd: watch-triggered wkp sync automation
+Documentation=https://github.com/williamcaban/agent-wkp
+
+[Service]
+Type=simple
+
+# --- Edit these three for your setup ---
+# Absolute path to the wkp binary (e.g. `which wkp`).
+ExecStart=%h/.cargo/bin/wkp wkpd --path %h/REPLACE_ME_STORE_PATH --principal REPLACE_ME_PRINCIPAL --signing-key-file %h/REPLACE_ME_SIGNING_KEY_FILE
+# Must match the store path above, exactly, for ReadWritePaths below.
+Environment=WKPD_STORE_PATH=%h/REPLACE_ME_STORE_PATH
+
+Restart=on-failure
+RestartSec=5
+
+# --- Hardening (design 7.5) ---
+# The store itself is the only place this process ever needs to write;
+# everything else on disk is read-only or fully denied.
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=%h/REPLACE_ME_STORE_PATH
+NoNewPrivileges=yes
+# `wkp sync`'s fetch/push needs real network access, so this is left
+# disabled by default. Uncomment for an air-gapped setup that only ever
+# uses `wkp bundle export`/`import` (never `wkp sync`), or if this
+# store's remote is reachable purely over a local Unix/vsock transport
+# this unit's own PrivateNetwork wouldn't isolate anyway.
+# PrivateNetwork=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictNamespaces=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+
+[Install]
+WantedBy=default.target

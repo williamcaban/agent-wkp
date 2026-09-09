@@ -1,0 +1,43 @@
+[package]
+name = "wkp-crypto"
+description = "age filter, key handling, signing, allowed_signers"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+name = "wkp_crypto"
+
+[dependencies]
+# design 7.2: "implemented in-process with the `rage` crate" -- the
+# str4d/rage project's library crate is published to crates.io as `age`
+# (the `rage` name on crates.io is the CLI binary from the same project).
+age = "0.12.1"
+# M4-2: device encryption identity storage (design 7.2, 7.5). keyring-core
+# is the storage-backend-agnostic API; the actual macOS/Linux backends are
+# pulled in per-platform below. Deliberately not the `keyring` facade crate
+# -- its own docs recommend linking keyring-core + specific store crates
+# directly for an application (like this one) that wants to control which
+# stores it uses on which platforms, rather than pulling in every backend
+# `keyring`'s all-platforms default bundles (Windows, Android, a bundled-DB
+# fallback keystore this project doesn't want -- CLAUDE.md: no new on-disk
+# formats beyond the documented 0600-file fallback).
+keyring-core = "1.0.0"
+rand_core = { version = "0.6", features = ["getrandom"] }
+ssh-key = { version = "0.6.7", features = ["ed25519", "rand_core"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+apple-native-keyring-store = { version = "1", default-features = false, features = [
+    "keychain",
+] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+zbus-secret-service-keyring-store = { version = "1", default-features = false, features = [
+    "crypto-rust",
+] }
+
+[dev-dependencies]
+tempfile = "3.27.0"
