@@ -25,4 +25,25 @@ path = "src/main.rs"
 # `revoked_at`, `created_at`) to a real `time::OffsetDateTime` instead
 # of hand-parsing a raw string.
 postgres = { version = "0.19.14", features = ["with-time-0_3"] }
+# M5-2: request/response bodies for the RFC 8628 device-authorization
+# endpoints (design 6.4). A well-vetted library, not a hand-rolled
+# parser: this parses untrusted network input, unlike promote.rs's
+# small, local, trusted TOML config.
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
 time = "0.3"
+# M5-2: the RFC 8628 endpoints and `/verify` page (design 6.4, 8.1).
+# Synchronous, not an async web framework -- matches `postgres`'s own
+# blocking choice above; a handful of low-traffic, infrequent-by-nature
+# endpoints has no real concurrency need an async framework would
+# justify.
+tiny_http = "0.12.0"
+
+[dev-dependencies]
+# M5-2's own test suite drives this crate's HTTP endpoints over a real
+# socket (crates/wkp-hub/src/http.rs's own tests), not by calling
+# handler functions directly -- `default-features = false`: see
+# wkp-cli/Cargo.toml's identical ureq entry for why (CDLA-Permissive-2.0
+# license on the TLS stack's `webpki-roots`, and no `https://` target
+# this milestone's scope needs anyway).
+ureq = { version = "3.4.1", default-features = false, features = ["json", "gzip"] }

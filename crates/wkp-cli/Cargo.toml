@@ -26,6 +26,22 @@ notify = "8"
 # Already a transitive dependency (via `tempfile`) before this; promoted
 # to direct here, no new supply-chain surface.
 rustix = { version = "1.1.4", default-features = false, features = ["net", "process", "std"] }
+# M5-2: `wkp hub register`'s HTTP client (RFC 8628 device-authorization
+# grant against `wkp-hub`, design 6.4). `serde`/`serde_json` alongside it
+# for the same request/response bodies -- deliberately not a hand-rolled
+# parser for this one: unlike promote.rs's small, local, trusted TOML
+# config, this parses untrusted network responses, where a well-vetted
+# library is the safer choice, not a shortcut.
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+# `default-features = false`: ureq's defaults pull in rustls (for TLS),
+# which transitively pulls `webpki-roots`, whose CDLA-Permissive-2.0
+# license this workspace's deny.toml doesn't allow. Not needed anyway --
+# every hub URL this milestone's scope covers is a CI/local `http://`
+# target (docs/plan/milestones.md's M5 scope notes: real hosted
+# deployment, and so real TLS, is later work). Revisit if/when a real
+# `https://` hub target lands.
+ureq = { version = "3.4.1", default-features = false, features = ["json", "gzip"] }
 
 [dev-dependencies]
 tempfile = "3.27.0"

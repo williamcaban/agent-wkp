@@ -16,6 +16,7 @@ use std::io::{Read, Write};
 
 pub mod device_identity;
 pub mod recipients;
+pub mod signing_identity;
 
 /// An X25519 decryption identity (a device's private key).
 pub struct Identity(age::x25519::Identity);
@@ -27,7 +28,12 @@ pub struct Recipient(age::x25519::Recipient);
 /// Error type for this crate's encrypt/decrypt/parse operations.
 #[derive(Debug)]
 pub enum Error {
-    /// The identity string was not a valid age X25519 identity.
+    /// The identity string was not a valid age X25519 identity, or (a
+    /// keystore entry's bytes weren't UTF-8 at all) not even readable
+    /// as a string in the first place -- shared between
+    /// `device_identity` and `signing_identity`, neither of which
+    /// needs its own dedicated "not a string" variant for the same
+    /// underlying keystore-corruption case.
     InvalidIdentity(String),
     /// The recipient string was not a valid age X25519 recipient.
     InvalidRecipient(String),
@@ -48,6 +54,11 @@ pub enum Error {
     /// operation, or -- far more commonly in practice -- is not reachable
     /// at all (no D-Bus session, no Keychain). See [`device_identity`].
     Keystore(keyring_core::Error),
+    /// An OpenSSH key parse/generate/encode failure in
+    /// [`signing_identity`] -- a different key (ed25519, not X25519), a
+    /// different job (SSH transport authentication, M5-2/8.1), from
+    /// this same keystore-or-file storage pattern.
+    SshKey(ssh_key::Error),
 }
 
 impl fmt::Display for Error {
@@ -60,6 +71,7 @@ impl fmt::Display for Error {
             Error::Decrypt(e) => write!(f, "age decryption failed: {e}"),
             Error::Io(e) => write!(f, "I/O error during age streaming: {e}"),
             Error::Keystore(e) => write!(f, "OS keystore error: {e}"),
+            Error::SshKey(e) => write!(f, "SSH key error: {e}"),
         }
     }
 }
