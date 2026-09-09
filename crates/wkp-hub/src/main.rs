@@ -8,6 +8,7 @@
 //! Implementation lands starting in M5; see `docs/plan/milestones.md`.
 
 mod control_plane;
+mod http;
 
 /// A minimal admin CLI over M5-1's control plane -- `migrate` (ensure
 /// the schema exists), `tenant create`, `device register`/`revoke`.
@@ -25,6 +26,19 @@ fn main() {
     let command = args.next();
 
     match command.as_deref() {
+        Some("serve") => {
+            let port = args
+                .next()
+                .as_deref()
+                .filter(|a| *a == "--port")
+                .and_then(|_| args.next())
+                .and_then(|p| p.parse::<u16>().ok())
+                .unwrap_or(8080);
+            if let Err(e) = http::serve(port) {
+                eprintln!("wkp-hub: serve failed: {e}");
+                std::process::exit(1);
+            }
+        }
         Some("migrate") => {
             match control_plane::connect() {
                 Ok(_client) => println!("wkp-hub: schema is up to date"),
@@ -113,7 +127,7 @@ fn main() {
         },
         _ => {
             eprintln!(
-                "wkp-hub: usage: wkp-hub migrate | tenant create <slug> | \
+                "wkp-hub: usage: wkp-hub serve [--port <port>] | migrate | tenant create <slug> | \
                  device register <tenant-slug> <public-key> | device revoke <public-key>"
             );
             std::process::exit(1);

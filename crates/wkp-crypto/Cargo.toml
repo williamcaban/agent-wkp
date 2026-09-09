@@ -26,6 +26,8 @@ age = "0.12.1"
 # fallback keystore this project doesn't want -- CLAUDE.md: no new on-disk
 # formats beyond the documented 0600-file fallback).
 keyring-core = "1.0.0"
+rand_core = { version = "0.6", features = ["getrandom"] }
+ssh-key = { version = "0.6.7", features = ["ed25519", "rand_core"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 apple-native-keyring-store = { version = "1", default-features = false, features = [

@@ -11,6 +11,7 @@ mod context;
 mod filter;
 mod forget;
 mod hooks;
+mod hub_register;
 mod import;
 mod index_cmd;
 mod init;
@@ -200,6 +201,27 @@ fn main() {
                 },
                 Err(msg) => {
                     eprintln!("wkp: {msg}");
+                    std::process::exit(1);
+                }
+            }
+        }
+        Some("hub") => {
+            match args.next().as_deref() {
+                Some("register") => match hub_register::parse_hub_register_args(args) {
+                    Ok(opts) => match hub_register::run_hub_register(&opts) {
+                        Ok(summary) => println!("{summary}"),
+                        Err(msg) => {
+                            eprintln!("wkp: hub register failed: {msg}");
+                            std::process::exit(1);
+                        }
+                    },
+                    Err(msg) => {
+                        eprintln!("wkp: {msg}");
+                        std::process::exit(1);
+                    }
+                },
+                _ => {
+                    eprintln!("wkp: usage: wkp hub register --hub-url <url> --tenant <slug> [--path <dir>]");
                     std::process::exit(1);
                 }
             }

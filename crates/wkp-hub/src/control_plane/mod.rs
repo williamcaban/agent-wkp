@@ -15,6 +15,7 @@
 //! development or CI names that service container, never a
 //! credential this crate itself picks or stores.
 
+pub mod grants;
 mod schema;
 
 use postgres::{Client, NoTls, Row};
@@ -57,6 +58,9 @@ pub enum Error {
     /// variant exists for callers (the admin CLI) that instead want to
     /// `?`-propagate "not found" as a single, uniform failure.
     NotFound(String),
+    /// A `/dev/urandom` read failed while generating a grant's
+    /// `device_code`/`user_code` ([`grants`]).
+    Io(std::io::Error),
 }
 
 impl std::fmt::Display for Error {
@@ -71,6 +75,7 @@ impl std::fmt::Display for Error {
             ),
             Error::Postgres(e) => write!(f, "postgres error: {e}"),
             Error::NotFound(what) => write!(f, "not found: {what}"),
+            Error::Io(e) => write!(f, "I/O error: {e}"),
         }
     }
 }
