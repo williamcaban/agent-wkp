@@ -18,6 +18,15 @@ pub mod device_identity;
 pub mod recipients;
 pub mod signing_identity;
 
+/// age's own ciphertext header (design 7.2's suggested detection),
+/// shared by `wkp-cli`'s clean/smudge filter (M4-4) and `wkp-hub`'s
+/// tenant indexer (M5-4) -- both need the exact same "is this blob
+/// really age ciphertext, not plaintext markdown" check, and neither
+/// depends on the other (design 3.3: `wkp-cli` and `wkp-hub` are
+/// sibling binaries), so it lives here rather than being duplicated or
+/// exposed from one to the other.
+pub const AGE_HEADER: &[u8] = b"age-encryption.org/v1";
+
 /// An X25519 decryption identity (a device's private key).
 pub struct Identity(age::x25519::Identity);
 

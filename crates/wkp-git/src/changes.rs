@@ -149,6 +149,17 @@ pub fn read_blob(repo_dir: &Path, rev_path: &str) -> Result<Vec<u8>, String> {
     run_git_stdout_bytes(repo_dir, &["cat-file", "-p", rev_path])
 }
 
+/// Every path tracked at `rev` (e.g. `HEAD`, a branch, a sha), via `git
+/// ls-tree -r --name-only` -- unlike [`list_tracked_files`], this walks a
+/// commit's tree object directly rather than reading the index/working
+/// tree, so it also works against a bare repo (design 8.2, M5-4's tenant
+/// indexer: a freshly pushed-to bare repo has no working tree or index to
+/// read at all).
+pub fn list_files_at_ref(repo_dir: &Path, rev: &str) -> Result<Vec<PathBuf>, String> {
+    let stdout = run_git_stdout(repo_dir, &["ls-tree", "-r", "--name-only", rev])?;
+    Ok(stdout.lines().map(PathBuf::from).collect())
+}
+
 /// Removes `path` from `repo_dir`'s git index (`git update-index
 /// --remove -- <path>`), without touching the working tree itself --
 /// `wkp promote` (M2-7, design 7.4) uses this to stage the "old"
