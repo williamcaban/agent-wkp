@@ -130,8 +130,8 @@ fn ensure_lines_present(file_path: &Path, lines: &[&str]) -> Result<(), String> 
 /// directory is literally named `deps`, this rewrites to that sibling
 /// plain binary -- a real, correctly-dispatching `wkp` -- instead.
 fn resolve_wkp_exe() -> String {
-    let current = match std::env::current_exe() {
-        // nosemgrep: rust.lang.security.current-exe.current-exe -- not a security decision: this path is a same-user, same-process convenience written to *this clone's own* local git config, read back only by a later `git merge`/filter run by that same user on that same machine; nothing crosses a trust boundary, and a hostile actor who could already redirect this process's own binary path controls the machine outright.
+    let current_exe = std::env::current_exe(); // nosemgrep: rust.lang.security.current-exe.current-exe -- not a security decision: this path is a same-user, same-process convenience written to *this clone's own* local git config, read back only by a later `git merge`/filter run by that same user on that same machine; nothing crosses a trust boundary, and a hostile actor who could already redirect this process's own binary path controls the machine outright.
+    let current = match current_exe {
         Ok(p) => p,
         Err(_) => return "wkp".to_string(),
     };
