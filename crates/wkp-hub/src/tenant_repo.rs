@@ -162,20 +162,18 @@ pub fn index_tenant(repos_root: &Path, tenant_slug: &str) -> Result<IndexSummary
 mod tests {
     use super::*;
 
-    fn temp_repos_root(label: &str) -> PathBuf {
-        let nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0);
-        let dir = std::env::temp_dir().join(format!("wkp-hub-tenant-repo-{label}-{nanos}"));
-        std::fs::create_dir_all(&dir).expect("create temp repos root");
-        dir
+    fn temp_repos_root(label: &str) -> tempfile::TempDir {
+        tempfile::Builder::new()
+            .prefix(&format!("wkp-hub-tenant-repo-{label}-"))
+            .tempdir()
+            .expect("create temp repos root")
     }
 
     #[test]
     fn provision_tenant_repo_creates_a_hardened_bare_repo_with_a_hook() {
-        let repos_root = temp_repos_root("provision");
-        let repo_path = provision_tenant_repo(&repos_root, "acme").expect("provision");
+        let temp = temp_repos_root("provision");
+        let repos_root = temp.path();
+        let repo_path = provision_tenant_repo(repos_root, "acme").expect("provision");
 
         assert_eq!(repo_path, repos_root.join("acme.git"));
         assert!(repo_path.join("HEAD").exists(), "must be a real bare repo");
@@ -194,27 +192,30 @@ mod tests {
 
     #[test]
     fn provision_tenant_repo_is_idempotent() {
-        let repos_root = temp_repos_root("idempotent");
-        provision_tenant_repo(&repos_root, "acme").expect("first provision");
-        provision_tenant_repo(&repos_root, "acme").expect("second provision must not fail");
+        let temp = temp_repos_root("idempotent");
+        let repos_root = temp.path();
+        provision_tenant_repo(repos_root, "acme").expect("first provision");
+        provision_tenant_repo(repos_root, "acme").expect("second provision must not fail");
     }
 
     #[test]
     fn index_tenant_on_an_unborn_repo_produces_an_empty_index() {
-        let repos_root = temp_repos_root("empty");
-        provision_tenant_repo(&repos_root, "acme").expect("provision");
+        let temp = temp_repos_root("empty");
+        let repos_root = temp.path();
+        provision_tenant_repo(repos_root, "acme").expect("provision");
 
-        let summary = index_tenant(&repos_root, "acme").expect("index_tenant");
+        let summary = index_tenant(repos_root, "acme").expect("index_tenant");
         assert_eq!(summary, IndexSummary::default());
-        assert!(tenant_index_path(&repos_root, "acme").exists());
+        assert!(tenant_index_path(repos_root, "acme").exists());
     }
 
     /// M5-4's own core acceptance criterion: a push containing both a
     /// shared and a private item indexes only the shared one.
     #[test]
     fn index_tenant_indexes_shared_content_and_skips_private_frontmatter() {
-        let repos_root = temp_repos_root("shared-and-private");
-        let repo_path = provision_tenant_repo(&repos_root, "acme").expect("provision");
+        let temp = temp_repos_root("shared-and-private");
+        let repos_root = temp.path();
+        let repo_path = provision_tenant_repo(repos_root, "acme").expect("provision");
 
         // Simulate a push by committing directly into the bare repo via
         // a throwaway non-bare clone -- this crate's own test-only use
@@ -222,7 +223,7 @@ mod tests {
         // integration tests already use for real end-to-end git wiring.
         let clone_dir = repos_root.join("clone");
         run_git(
-            &repos_root,
+            repos_root,
             &["clone", "--quiet", repo_path.to_str().unwrap(), "clone"],
         );
         run_git(&clone_dir, &["checkout", "--quiet", "-b", "main"]);
@@ -254,11 +255,11 @@ mod tests {
         );
         run_git(&clone_dir, &["push", "--quiet", "origin", "main"]);
 
-        let summary = index_tenant(&repos_root, "acme").expect("index_tenant");
+        let summary = index_tenant(repos_root, "acme").expect("index_tenant");
         assert_eq!(summary.indexed, vec!["shared.md".to_string()]);
         assert_eq!(summary.skipped_private, vec!["private.md".to_string()]);
 
-        let index_path = tenant_index_path(&repos_root, "acme");
+        let index_path = tenant_index_path(repos_root, "acme");
         let conn = wkp_core::index::open_index(&index_path).expect("open index");
         let known = wkp_core::index::known_paths(&conn).expect("known_paths");
         assert_eq!(
@@ -269,12 +270,13 @@ mod tests {
 
     #[test]
     fn index_tenant_skips_content_that_is_recognizably_age_ciphertext_even_without_frontmatter() {
-        let repos_root = temp_repos_root("ciphertext");
-        let repo_path = provision_tenant_repo(&repos_root, "acme").expect("provision");
+        let temp = temp_repos_root("ciphertext");
+        let repos_root = temp.path();
+        let repo_path = provision_tenant_repo(repos_root, "acme").expect("provision");
 
         let clone_dir = repos_root.join("clone");
         run_git(
-            &repos_root,
+            repos_root,
             &["clone", "--quiet", repo_path.to_str().unwrap(), "clone"],
         );
         run_git(&clone_dir, &["checkout", "--quiet", "-b", "main"]);
@@ -301,7 +303,7 @@ mod tests {
         );
         run_git(&clone_dir, &["push", "--quiet", "origin", "main"]);
 
-        let summary = index_tenant(&repos_root, "acme").expect("index_tenant");
+        let summary = index_tenant(repos_root, "acme").expect("index_tenant");
         assert!(summary.indexed.is_empty());
         assert_eq!(summary.skipped_private, vec!["secret.md".to_string()]);
     }

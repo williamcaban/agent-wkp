@@ -62,3 +62,9 @@ tiny_http = "0.12.0"
 # license on the TLS stack's `webpki-roots`, and no `https://` target
 # this milestone's scope needs anyway).
 ureq = { version = "3.4.1", default-features = false, features = ["json", "gzip"] }
+# M5-4: `tenant_repo`'s own tests and `tests/post_receive_hook.rs` need a
+# real per-test temp directory -- `tempfile::TempDir`, not
+# `std::env::temp_dir()` + a hand-rolled unique name, per this repo's own
+# semgrep gate and the identical choice `wkp-git`/`wkp-cli`'s test
+# fixtures already make (see their `test_support.rs` module docs).
+tempfile = "3.27.0"
