@@ -76,7 +76,19 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - uses: taiki-e/install-action@84f5ac3124727fb3d284d4d22ee9ab3654fd09a6 # v2.87.7
         with:
-          tool: cargo-audit,cargo-deny,cargo-vet
+          tool: cargo-audit,cargo-deny
+      # Not via taiki-e/install-action above: mozilla/cargo-vet's last
+      # GitHub release binary is v0.10.0, but v0.10.2 (crates.io-only)
+      # fixed reading newer entries (e.g. `trusted-publisher`) that
+      # upstream import sources like bytecode-alliance's audits.toml
+      # already use -- found the hard way (M5-1): the v0.10.0 binary
+      # silently drops ~80 audits it can't parse and reports a much
+      # larger, wrong "backlog" as a result, which would have pushed
+      # this repo toward blanket-exempting crates that already have
+      # real third-party audit coverage. `--locked` for a reproducible
+      # build from this crate's own published Cargo.lock.
+      - name: install cargo-vet (from crates.io, not the stale GitHub release binary)
+        run: cargo install cargo-vet --version 0.10.2 --locked
 
       - name: cargo audit
         run: cargo audit
