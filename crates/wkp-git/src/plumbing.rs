@@ -21,6 +21,25 @@ pub(crate) fn run_git_stdout(repo_dir: &Path, args: &[&str]) -> Result<String, S
     }
 }
 
+/// Like [`run_git_stdout`], but returns stdout's exact bytes rather than
+/// a lossy-UTF8 `String` -- needed for any command whose output isn't
+/// necessarily text, e.g. `cat-file -p` on a blob that holds arbitrary
+/// binary content (an age-encrypted payload's ciphertext bytes, which a
+/// lossy UTF-8 conversion would silently corrupt).
+pub(crate) fn run_git_stdout_bytes(repo_dir: &Path, args: &[&str]) -> Result<Vec<u8>, String> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(repo_dir)
+        .args(args)
+        .output()
+        .map_err(|e| e.to_string())?;
+    if output.status.success() {
+        Ok(output.stdout)
+    } else {
+        Err(String::from_utf8_lossy(&output.stderr).trim().to_string())
+    }
+}
+
 /// Like [`run_git_stdout`], but feeds `stdin_data` to the child process's
 /// stdin rather than assuming the command needs none -- `git
 /// interpret-trailers` (design 5.4/7.4's provenance-trailer machinery,

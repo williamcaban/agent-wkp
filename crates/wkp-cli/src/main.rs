@@ -9,6 +9,7 @@ use std::path::{Path, PathBuf};
 mod bundle;
 mod context;
 mod filter;
+mod forget;
 mod hooks;
 mod import;
 mod index_cmd;
@@ -196,6 +197,37 @@ fn main() {
                         std::process::exit(1);
                     }
                 },
+                Err(msg) => {
+                    eprintln!("wkp: {msg}");
+                    std::process::exit(1);
+                }
+            }
+        }
+        Some("forget") => {
+            if let Err(msg) = wkp_git::ensure_min_git_version() {
+                eprintln!("{msg}");
+                std::process::exit(1);
+            }
+            match forget::parse_forget_args(args) {
+                Ok(opts) => {
+                    let result = match &opts.target {
+                        forget::ForgetTarget::Item(item_path) => {
+                            let item_path = item_path.clone();
+                            forget::run_forget_item(&opts, &item_path).map(|s| s.to_string())
+                        }
+                        forget::ForgetTarget::Device(device_id) => {
+                            let device_id = device_id.clone();
+                            forget::run_forget_device(&opts, &device_id).map(|s| s.to_string())
+                        }
+                    };
+                    match result {
+                        Ok(summary) => println!("{summary}"),
+                        Err(msg) => {
+                            eprintln!("wkp: forget failed: {msg}");
+                            std::process::exit(1);
+                        }
+                    }
+                }
                 Err(msg) => {
                     eprintln!("wkp: {msg}");
                     std::process::exit(1);

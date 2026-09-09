@@ -20,7 +20,7 @@
 
 use std::path::Path;
 
-const RECIPIENTS_FILENAME: &str = "recipients";
+pub(crate) const RECIPIENTS_FILENAME: &str = "recipients";
 const DEVICE_IDENTITY_FALLBACK: &str = ".wkp/device-identity";
 const AGE_HEADER: &[u8] = b"age-encryption.org/v1";
 
