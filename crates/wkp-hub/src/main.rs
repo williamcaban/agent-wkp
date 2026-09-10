@@ -63,7 +63,7 @@ fn main() {
                 .and_then(|_| args.next())
                 .and_then(|p| p.parse::<u16>().ok())
                 .unwrap_or(8080);
-            if let Err(e) = http::serve(port, repos_root()) {
+            if let Err(e) = http::serve(port, repos_root(), tenant_image()) {
                 eprintln!("wkp-hub: serve failed: {e}");
                 std::process::exit(1);
             }
