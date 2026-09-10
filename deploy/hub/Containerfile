@@ -1,0 +1,103 @@
+# wkp-hub front-door container (design 8.1/8.3, M5-5): sshd + wkp-shell
+# in front of a single shared filesystem. Per-tenant hard isolation
+# (a pod per tenant) is ADR-0009/M5-7's job, not this image's.
+#
+# Fedora-based (quay.io/fedora), built and run with podman -- standing
+# preference, not specific to this task.
+#
+# Build from the workspace root:
+#   podman build -f deploy/hub/Containerfile -t wkp-hub .
+
+FROM quay.io/fedora/fedora-minimal:41 AS builder
+
+# gcc: rustc needs a linker. openssl-devel/pkgconf-pkg-config: the
+# `postgres` crate's TLS-adjacent dependencies probe for these at build
+# time even though this workspace's own `postgres` usage is NoTls
+# (M5-1) -- cheaper to provide them than to fight the build over it.
+RUN microdnf install -y --setopt=install_weak_deps=0 \
+        gcc openssl-devel pkgconf-pkg-config git tar xz \
+    && microdnf clean all
+
+# rustup, not a distro rustc package: CLAUDE.md pins the toolchain in
+# rust-toolchain.toml (currently 1.98.1), and this must build with
+# exactly that version, not whatever Fedora 41 happens to ship.
+ENV RUSTUP_HOME=/usr/local/rustup \
+    CARGO_HOME=/usr/local/cargo \
+    PATH=/usr/local/cargo/bin:$PATH
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | \
+    sh -s -- --profile minimal --default-toolchain none -y
+
+WORKDIR /src
+COPY rust-toolchain.toml Cargo.toml Cargo.lock ./
+COPY crates ./crates
+COPY tests ./tests
+# `rustup show` alone installs the pinned toolchain named in
+# rust-toolchain.toml (rustup's own documented trigger for this), so
+# the actual `cargo build` below uses exactly that version.
+RUN rustup show
+RUN cargo build --release -p wkp-hub
+
+FROM quay.io/fedora/fedora-minimal:41
+
+RUN microdnf install -y --setopt=install_weak_deps=0 \
+        openssh-server git shadow-utils \
+    && microdnf clean all \
+    && mkdir -p /etc/wkp-hub /srv/wkp-hub/repos
+
+# The one shared login account every SSH client authenticates as
+# (design 8.1's gitolite pattern; per-tenant Unix users are ADR-0009's
+# job, not this image's).
+RUN useradd --system --create-home --home-dir /home/git \
+        --shell /bin/sh git \
+    && chown git:git /srv/wkp-hub/repos \
+    # `useradd` alone leaves the account password-*locked*
+    # (`!` in /etc/shadow), which sshd refuses to let log in at all --
+    # even with PasswordAuthentication no and a valid key -- found by
+    # hand while testing this image ("User git not allowed because
+    # account is locked"). `*` is the standard "no password set, but
+    # not locked" convention, distinct from `!`/`!!`; safe here since
+    # PasswordAuthentication/PermitEmptyPasswords are both "no" in
+    # sshd_config regardless.
+    && usermod -p '*' git
+# `git`'s shell must be a real POSIX shell, not /sbin/nologin: found by
+# hand -- OpenSSH runs *every* command it executes, forced `command=`
+# included, as `<the account's login shell> -c "<command>"`, never a
+# raw execve of the command string. `/sbin/nologin` ignores `-c`
+# entirely and just prints its refusal message, which the git client on
+# the other end then tried to parse as pack-protocol bytes ("bad line
+# length character: This..."). The real security boundary here is the
+# `command=`/`restrict` `authorized_keys` line `wkp-shell` emits
+# (M5-3) -- not the account's own shell field, which forced commands
+# route through regardless of what it is.
+# AuthorizedKeysCommandUser (sshd_config): sshd requires this directive
+# name a *different* account from anyone it could ever authenticate as
+# a login target, precisely so the key-lookup process never shares
+# filesystem access with the sessions it authorizes. No home directory
+# needed -- this account only ever runs one fixed wrapper script.
+RUN useradd --system --no-create-home --shell /sbin/nologin wkp-akc \
+    && usermod -p '*' wkp-akc
+# Every repo under /srv/wkp-hub/repos belongs to this one service, no
+# matter which of its own accounts (root, during provisioning; `git`,
+# during a push/fetch) happens to touch it -- unlike a general
+# multi-user workstation, there is no untrusted third party whose
+# directory this config would wrongly extend trust to. Without this,
+# `git-receive-pack` run as `git` refuses a repo `provision-repo`
+# created as root ("detected dubious ownership"), found by hand while
+# testing a real push against this image.
+RUN printf '[safe]\n\tdirectory = *\n' > /etc/gitconfig
+
+COPY --from=builder /src/target/release/wkp-hub /usr/local/bin/wkp-hub
+COPY deploy/hub/sshd_config /etc/ssh/sshd_config
+COPY deploy/hub/wkp-hub-akc.sh /usr/local/bin/wkp-hub-akc.sh
+COPY deploy/hub/entrypoint.sh /usr/local/bin/entrypoint.sh
+RUN chmod 755 /usr/local/bin/wkp-hub /usr/local/bin/entrypoint.sh \
+    # sshd itself requires an AuthorizedKeysCommand target to be
+    # owned by root and not writable by group/other (sshd_config(5));
+    # 755 root:root satisfies that and is also correct for a script
+    # any user needs to *execute* but none but root should modify.
+    && chown root:root /usr/local/bin/wkp-hub-akc.sh \
+    && chmod 755 /usr/local/bin/wkp-hub-akc.sh \
+    && chmod 600 /etc/ssh/sshd_config
+
+EXPOSE 22
+ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]
