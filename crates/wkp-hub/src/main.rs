@@ -52,7 +52,7 @@ fn main() {
                 .and_then(|_| args.next())
                 .and_then(|p| p.parse::<u16>().ok())
                 .unwrap_or(8080);
-            if let Err(e) = http::serve(port) {
+            if let Err(e) = http::serve(port, repos_root()) {
                 eprintln!("wkp-hub: serve failed: {e}");
                 std::process::exit(1);
             }
@@ -260,8 +260,36 @@ fn main() {
                     }
                 }
             }
+            Some("issue-token") => {
+                let Some(public_key) = args.next() else {
+                    eprintln!("wkp-hub: usage: wkp-hub device issue-token <public-key>");
+                    std::process::exit(1);
+                };
+                let result = (|| {
+                    let mut client = control_plane::connect()?;
+                    let device =
+                        control_plane::find_device_by_public_key(&mut client, &public_key)?
+                            .ok_or_else(|| {
+                                control_plane::Error::NotFound(format!("device {public_key}"))
+                            })?;
+                    control_plane::issue_bearer_token(&mut client, device.id)
+                })();
+                match result {
+                    // stdout carries only the token itself, no
+                    // decoration: `wkp hub register`-style tooling can
+                    // pipe/capture this directly rather than parsing a
+                    // sentence out of it. The one time this plaintext
+                    // is ever visible is right here -- the control
+                    // plane never stores or returns it again.
+                    Ok(token) => println!("{token}"),
+                    Err(e) => {
+                        eprintln!("wkp-hub: device issue-token failed: {e}");
+                        std::process::exit(1);
+                    }
+                }
+            }
             _ => {
-                eprintln!("wkp-hub: usage: wkp-hub device register|revoke ...");
+                eprintln!("wkp-hub: usage: wkp-hub device register|revoke|issue-token ...");
                 std::process::exit(1);
             }
         },
@@ -269,7 +297,8 @@ fn main() {
             eprintln!(
                 "wkp-hub: usage: wkp-hub serve [--port <port>] | migrate | \
                  tenant create <slug> | device register <tenant-slug> <public-key> | \
-                 device revoke <public-key> | authorized-keys-command <public-key> | \
+                 device revoke <public-key> | device issue-token <public-key> | \
+                 authorized-keys-command <public-key> | \
                  git-shell <tenant-slug> | index-tenant <tenant-slug> | \
                  provision-repo <tenant-slug>"
             );

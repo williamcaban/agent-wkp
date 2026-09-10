@@ -42,7 +42,16 @@ CREATE TABLE IF NOT EXISTS devices (
     tenant_id BIGINT NOT NULL REFERENCES tenants (id),
     public_key TEXT NOT NULL UNIQUE,
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-    revoked_at TIMESTAMPTZ
+    revoked_at TIMESTAMPTZ,
+    -- M5-6 (design 8.1's HTTPS transport): a SHA-256 hex digest, never
+    -- the plaintext token itself -- same reasoning as a password hash,
+    -- even though this secret is high-entropy and machine-generated
+    -- rather than user-chosen (so a fast hash is fine here; there is
+    -- no offline dictionary attack to slow down, unlike a real
+    -- password). Nullable: an SSH-only device never gets one. UNIQUE
+    -- so a lookup by presented token is a single indexed equality
+    -- check, matching `public_key`'s own lookup shape exactly.
+    bearer_token_hash TEXT UNIQUE
 );
 
 CREATE INDEX IF NOT EXISTS devices_tenant_id_idx ON devices (tenant_id);

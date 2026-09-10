@@ -21,6 +21,7 @@ mod remote;
 mod version;
 
 pub mod allowed_signers;
+pub mod http_backend;
 pub mod provenance;
 pub mod purge;
 pub mod signed_commit;
