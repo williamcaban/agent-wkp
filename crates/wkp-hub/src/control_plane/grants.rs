@@ -56,7 +56,9 @@ const USER_CODE_ALPHABET: &[u8] = b"ABCDEFGHJKMNPQRSTUVWXYZ23456789";
 /// slim-core rule: this is exactly the kind of thing a `rand` crate
 /// would otherwise exist only to provide), reused here rather than
 /// adding a second random-generation dependency to this workspace.
-fn random_hex(byte_len: usize) -> Result<String, Error> {
+/// `pub(super)`: M5-6's bearer-token issuance (`super::issue_bearer_token`)
+/// reuses this exact generator rather than a second copy.
+pub(super) fn random_hex(byte_len: usize) -> Result<String, Error> {
     use std::io::Read;
     let mut bytes = vec![0u8; byte_len];
     std::fs::File::open("/dev/urandom")

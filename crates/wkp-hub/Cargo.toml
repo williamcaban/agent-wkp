@@ -53,6 +53,17 @@ time = "0.3"
 # endpoints has no real concurrency need an async framework would
 # justify.
 tiny_http = "0.12.0"
+# M5-6: hashing a device's HTTPS bearer token before storing it
+# (CLAUDE.md's secrets rule extends naturally to "never store the
+# plaintext of a credential you validate later," the same reasoning a
+# password hash follows -- SHA-256, not a slow password hash, is the
+# right tool here specifically because this secret is high-entropy and
+# machine-generated, not user-chosen: there is no offline dictionary
+# attack a slow hash would need to defend against). Already present in
+# this workspace's dependency tree transitively (`age`/`ssh-key`'s own
+# use); this just makes it a direct dependency instead of duplicating
+# a hash implementation.
+sha2 = "0.11.0"
 
 [dev-dependencies]
 # M5-2's own test suite drives this crate's HTTP endpoints over a real

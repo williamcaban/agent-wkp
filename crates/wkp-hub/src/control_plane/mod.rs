@@ -43,6 +43,10 @@ pub struct Device {
     pub public_key: String,
     pub created_at: OffsetDateTime,
     pub revoked_at: Option<OffsetDateTime>,
+    /// SHA-256 hex digest of this device's HTTPS bearer token (M5-6,
+    /// design 8.1), if it has one -- never the plaintext, which exists
+    /// only for the instant [`issue_bearer_token`] returns it.
+    pub bearer_token_hash: Option<String>,
 }
 
 #[derive(Debug)]
@@ -145,7 +149,7 @@ pub fn register_device(
 ) -> Result<Device, Error> {
     let row = client.query_one(
         "INSERT INTO devices (tenant_id, public_key) VALUES ($1, $2) \
-         RETURNING id, tenant_id, public_key, created_at, revoked_at",
+         RETURNING id, tenant_id, public_key, created_at, revoked_at, bearer_token_hash",
         &[&tenant_id, &public_key],
     )?;
     Ok(device_from_row(&row))
@@ -160,9 +164,58 @@ pub fn find_device_by_public_key(
     public_key: &str,
 ) -> Result<Option<Device>, Error> {
     let row = client.query_opt(
-        "SELECT id, tenant_id, public_key, created_at, revoked_at FROM devices \
-         WHERE public_key = $1",
+        "SELECT id, tenant_id, public_key, created_at, revoked_at, bearer_token_hash \
+         FROM devices WHERE public_key = $1",
         &[&public_key],
+    )?;
+    Ok(row.as_ref().map(device_from_row))
+}
+
+/// A SHA-256 hex digest of `token` -- the only form of a bearer token
+/// this control plane ever stores or compares against (see
+/// [`Device::bearer_token_hash`]'s own doc comment).
+fn hash_bearer_token(token: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(token.as_bytes());
+    digest.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// Issues a fresh HTTPS bearer token for an existing device (M5-6,
+/// design 8.1) -- overwrites any previous token that device had,
+/// which invalidates it, the same way rotating an API key does.
+/// Returns the plaintext token: this is the only moment it exists
+/// outside the caller's own hands, since only [`hash_bearer_token`]'s
+/// digest is ever persisted.
+pub fn issue_bearer_token(client: &mut Client, device_id: i64) -> Result<String, Error> {
+    let token = grants::random_hex(32)?;
+    let hash = hash_bearer_token(&token);
+    let updated = client.execute(
+        "UPDATE devices SET bearer_token_hash = $1 WHERE id = $2",
+        &[&hash, &device_id],
+    )?;
+    if updated == 0 {
+        return Err(Error::NotFound(format!("device {device_id}")));
+    }
+    Ok(token)
+}
+
+/// Looks up a device by presenting the bearer token a client claims
+/// (the reverse-proxy/CGI bridge's own job, M5-6) -- hashes `token`
+/// and compares against [`Device::bearer_token_hash`], never the
+/// plaintext. `Ok(None)` for an unknown token, the same "ordinary,
+/// expected outcome" shape [`find_device_by_public_key`] uses; callers
+/// still need their own `revoked_at` check, exactly as `wkp-shell`
+/// does for the SSH path -- this function does not filter revoked
+/// devices out itself.
+pub fn find_device_by_bearer_token(
+    client: &mut Client,
+    token: &str,
+) -> Result<Option<Device>, Error> {
+    let hash = hash_bearer_token(token);
+    let row = client.query_opt(
+        "SELECT id, tenant_id, public_key, created_at, revoked_at, bearer_token_hash \
+         FROM devices WHERE bearer_token_hash = $1",
+        &[&hash],
     )?;
     Ok(row.as_ref().map(device_from_row))
 }
@@ -193,6 +246,7 @@ fn device_from_row(row: &Row) -> Device {
         public_key: row.get("public_key"),
         created_at: row.get("created_at"),
         revoked_at: row.get("revoked_at"),
+        bearer_token_hash: row.get("bearer_token_hash"),
     }
 }
 
@@ -333,5 +387,72 @@ mod tests {
             refreshed_b.revoked_at.is_none(),
             "revoking a device in tenant A must not affect tenant B's device"
         );
+    }
+
+    #[test]
+    fn issue_bearer_token_round_trips_and_never_stores_the_plaintext() {
+        let mut client = connect().expect("connect");
+        let tenant = create_tenant(&mut client, &unique_slug("bearer-token")).expect("tenant");
+        let device = register_device(&mut client, tenant.id, &unique_slug("device-key"))
+            .expect("register_device");
+        assert!(
+            device.bearer_token_hash.is_none(),
+            "a freshly registered device has no bearer token yet"
+        );
+
+        let token = issue_bearer_token(&mut client, device.id).expect("issue_bearer_token");
+        assert!(!token.is_empty());
+
+        let found = find_device_by_bearer_token(&mut client, &token)
+            .expect("find_device_by_bearer_token")
+            .expect("device must be found by its own token");
+        assert_eq!(found.id, device.id);
+        assert_ne!(
+            found.bearer_token_hash.as_deref(),
+            Some(token.as_str()),
+            "the stored hash must never equal the plaintext token"
+        );
+    }
+
+    #[test]
+    fn find_device_by_bearer_token_returns_none_for_an_unknown_token() {
+        let mut client = connect().expect("connect");
+        assert!(
+            find_device_by_bearer_token(&mut client, "this-token-was-never-issued")
+                .expect("find_device_by_bearer_token")
+                .is_none()
+        );
+    }
+
+    /// Rotation: issuing a new token for the same device invalidates
+    /// the old one, the same way rotating an API key does.
+    #[test]
+    fn issuing_a_new_bearer_token_invalidates_the_previous_one() {
+        let mut client = connect().expect("connect");
+        let tenant = create_tenant(&mut client, &unique_slug("bearer-rotate")).expect("tenant");
+        let device = register_device(&mut client, tenant.id, &unique_slug("device-key"))
+            .expect("register_device");
+
+        let first = issue_bearer_token(&mut client, device.id).expect("first issue");
+        let second = issue_bearer_token(&mut client, device.id).expect("second issue");
+        assert_ne!(first, second);
+
+        assert!(
+            find_device_by_bearer_token(&mut client, &first)
+                .expect("find first")
+                .is_none(),
+            "the first token must no longer resolve to any device"
+        );
+        let found_second = find_device_by_bearer_token(&mut client, &second)
+            .expect("find second")
+            .expect("second token must resolve");
+        assert_eq!(found_second.id, device.id);
+    }
+
+    #[test]
+    fn issue_bearer_token_fails_for_an_unknown_device() {
+        let mut client = connect().expect("connect");
+        let result = issue_bearer_token(&mut client, -1);
+        assert!(matches!(result, Err(Error::NotFound(_))));
     }
 }
