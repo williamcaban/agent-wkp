@@ -54,18 +54,36 @@ podman run -d --name "$CONTAINER_NAME" --network host \
     -e DATABASE_URL="$DATABASE_URL" \
     "$IMAGE" >/dev/null
 
+# If sshd fails to start at all (e.g. a bad sshd_config, or port 22
+# already bound on this network namespace), the container exits almost
+# immediately -- surfacing *why* here beats a much later, opaque
+# "container state improper" the first `podman exec` would otherwise
+# report instead.
+sleep 1
+if [ "$(podman inspect --format '{{.State.Running}}' "$CONTAINER_NAME" 2>/dev/null)" != "true" ]; then
+    echo "FAIL: wkp-hub container is not running; its own logs:" >&2
+    podman logs "$CONTAINER_NAME" >&2 || true
+    exit 1
+fi
+
 hub_exec() {
     podman exec -e DATABASE_URL="$DATABASE_URL" "$@"
 }
 
 log "waiting for the control plane's schema"
+migrate_ok=0
 for _ in $(seq 1 20); do
     if hub_exec "$CONTAINER_NAME" /usr/local/bin/wkp-hub migrate >/dev/null 2>&1; then
+        migrate_ok=1
         break
     fi
     sleep 0.5
 done
-hub_exec "$CONTAINER_NAME" /usr/local/bin/wkp-hub migrate
+if [ "$migrate_ok" -ne 1 ]; then
+    echo "FAIL: could not reach the control plane's schema; container logs:" >&2
+    podman logs "$CONTAINER_NAME" >&2 || true
+    hub_exec "$CONTAINER_NAME" /usr/local/bin/wkp-hub migrate
+fi
 
 log "creating tenant '$TENANT' (control-plane row + repo; as the git user -- see Containerfile's own note on repo ownership)"
 podman exec --user git -e DATABASE_URL="$DATABASE_URL" "$CONTAINER_NAME" \
