@@ -234,22 +234,19 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
-      # `sudo`, not rootless podman: this job's own container needs
-      # `--network host` (deploy/hub/test-ssh-integration.sh's own
-      # comment explains why) to bind port 22 and reach the Postgres
-      # service container above at `localhost`, which needs real
-      # privilege a rootless runner user does not have -- found by hand
-      # while developing this image in a rootless sandbox, which is why
-      # that script's own local-dev instructions use bridge networking
-      # instead. `ubuntu-latest` ships podman already; this just
-      # confirms it rather than reinstalling.
+      # Rootless podman -- `ubuntu-latest` ships it already, this just
+      # confirms it rather than reinstalling. `test-ssh-integration.sh`
+      # uses bridge networking with a mapped port (not `--network
+      # host`, which collides with the runner's own sshd already on
+      # port 22 -- found by hand the first time this job actually ran),
+      # so no elevated privilege is needed here.
       - name: confirm podman is available
         run: podman --version
 
       - name: podman build -f deploy/hub/Containerfile
-        run: sudo podman build -f deploy/hub/Containerfile -t wkp-hub .
+        run: podman build -f deploy/hub/Containerfile -t wkp-hub .
 
       # M5-5's own required integration test: register a device, push
       # over SSH, revoke it, attempt another push, confirm it fails.
       - name: deploy/hub/test-ssh-integration.sh
-        run: sudo -E bash deploy/hub/test-ssh-integration.sh
+        run: bash deploy/hub/test-ssh-integration.sh
