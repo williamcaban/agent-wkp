@@ -15,30 +15,25 @@
 # tenant, with a fixed slug, and does not assume anything else in that
 # database is untouched).
 #
-# `--network host`: the built-in default is the simplest way for this
-# container to reach whatever DATABASE_URL names (a CI Postgres service
-# container is reachable at `localhost` from the runner's own network
-# namespace, which `--network host` shares) without needing this
-# script to know the container-runtime-specific address a bridge
-# network's gateway would otherwise require -- see the comment in
-# ADR-0009 about why this container's *tenant* isolation model
-# deliberately avoids depending on such runtime-specific addressing;
-# this is just how the single hub container itself reaches its own
-# control-plane database; ADR-0009's concern doesn't apply here.
+# Bridge networking with a mapped port, not --network host: a real
+# GitHub Actions runner already has its own sshd bound to port 22
+# ("Bind to port 22 ... Address already in use", found by hand once
+# this test actually ran in CI), so this container can't share that
+# network namespace at all, let alone bind 22 in it. With a bridge
+# network, DATABASE_URL's host needs rewriting to
+# `host.containers.internal` (podman's own name for "the machine
+# running the container engine") for anything that runs *inside* this
+# container -- `localhost` from in there means the container's own
+# loopback, not the runner's -- while the SSH client below still
+# reaches the mapped port at the runner's own 127.0.0.1.
 set -euo pipefail
 
 IMAGE="${WKP_HUB_IMAGE:-localhost/wkp-hub}"
 CONTAINER_NAME="wkp-hub-ssh-integration-test"
-# sshd_config hardcodes Port 22 -- with --network host this container
-# shares the runner's own network namespace, so 22 here really means
-# the runner's port 22, reachable at 127.0.0.1 below. A rootless
-# sandbox without CAP_NET_BIND_SERVICE (found while developing this
-# image locally) cannot bind 22 this way; run with bridge networking
-# and a mapped port plus a rewritten DATABASE_URL host instead in that
-# case -- this script targets a real CI runner, not that constraint.
-SSH_PORT="${WKP_HUB_TEST_SSH_PORT:-22}"
+SSH_PORT="${WKP_HUB_TEST_SSH_PORT:-2299}"
 TENANT="ssh-integration-test"
 : "${DATABASE_URL:?DATABASE_URL must be set (e.g. postgres://postgres:wkp_hub_ci@localhost:5432/wkp_hub_test)}"
+CONTAINER_DATABASE_URL="$(printf '%s' "$DATABASE_URL" | sed -E 's#@(localhost|127\.0\.0\.1):#@host.containers.internal:#')"
 
 WORKDIR="$(mktemp -d)"
 cleanup() {
@@ -50,25 +45,43 @@ trap cleanup EXIT
 log() { printf '==> %s\n' "$*"; }
 
 log "starting wkp-hub container"
-podman run -d --name "$CONTAINER_NAME" --network host \
-    -e DATABASE_URL="$DATABASE_URL" \
+podman run -d --name "$CONTAINER_NAME" -p "${SSH_PORT}:22" \
+    -e DATABASE_URL="$CONTAINER_DATABASE_URL" \
     "$IMAGE" >/dev/null
 
+# If sshd fails to start at all (e.g. a bad sshd_config, or port 22
+# already bound on this network namespace), the container exits almost
+# immediately -- surfacing *why* here beats a much later, opaque
+# "container state improper" the first `podman exec` would otherwise
+# report instead.
+sleep 1
+if [ "$(podman inspect --format '{{.State.Running}}' "$CONTAINER_NAME" 2>/dev/null)" != "true" ]; then
+    echo "FAIL: wkp-hub container is not running; its own logs:" >&2
+    podman logs "$CONTAINER_NAME" >&2 || true
+    exit 1
+fi
+
 hub_exec() {
-    podman exec -e DATABASE_URL="$DATABASE_URL" "$@"
+    podman exec -e DATABASE_URL="$CONTAINER_DATABASE_URL" "$@"
 }
 
 log "waiting for the control plane's schema"
+migrate_ok=0
 for _ in $(seq 1 20); do
     if hub_exec "$CONTAINER_NAME" /usr/local/bin/wkp-hub migrate >/dev/null 2>&1; then
+        migrate_ok=1
         break
     fi
     sleep 0.5
 done
-hub_exec "$CONTAINER_NAME" /usr/local/bin/wkp-hub migrate
+if [ "$migrate_ok" -ne 1 ]; then
+    echo "FAIL: could not reach the control plane's schema; container logs:" >&2
+    podman logs "$CONTAINER_NAME" >&2 || true
+    hub_exec "$CONTAINER_NAME" /usr/local/bin/wkp-hub migrate
+fi
 
 log "creating tenant '$TENANT' (control-plane row + repo; as the git user -- see Containerfile's own note on repo ownership)"
-podman exec --user git -e DATABASE_URL="$DATABASE_URL" "$CONTAINER_NAME" \
+podman exec --user git -e DATABASE_URL="$CONTAINER_DATABASE_URL" "$CONTAINER_NAME" \
     /usr/local/bin/wkp-hub tenant create "$TENANT"
 
 log "generating a device keypair and registering it"
