@@ -9,6 +9,7 @@
 
 mod control_plane;
 mod http;
+mod tenant_pod;
 mod tenant_repo;
 mod wkp_shell;
 
@@ -26,6 +27,16 @@ fn repos_root() -> std::path::PathBuf {
     std::env::var(REPOS_ROOT_ENV)
         .map(std::path::PathBuf::from)
         .unwrap_or_else(|_| std::path::PathBuf::from(DEFAULT_REPOS_ROOT))
+}
+
+/// The image a tenant's own pod runs (M5-7, ADR-0010) -- the same
+/// `wkp-hub` image M5-5's `deploy/hub/Containerfile` already builds,
+/// invoked in `serve-tenant` mode; not a second image to build.
+const TENANT_IMAGE_ENV: &str = "WKP_HUB_TENANT_IMAGE";
+const DEFAULT_TENANT_IMAGE: &str = "localhost/wkp-hub";
+
+fn tenant_image() -> String {
+    std::env::var(TENANT_IMAGE_ENV).unwrap_or_else(|_| DEFAULT_TENANT_IMAGE.to_string())
 }
 
 /// A minimal admin CLI over M5-1's control plane -- `migrate` (ensure
@@ -142,6 +153,82 @@ fn main() {
                 }
                 wkp_shell::GitShellDecision::Refuse { reason } => {
                     eprintln!("wkp-hub: git-shell: {reason}");
+                    std::process::exit(1);
+                }
+            }
+        }
+        Some("start-pod") => {
+            let Some(tenant_slug) = args.next() else {
+                eprintln!("wkp-hub: usage: wkp-hub start-pod <tenant-slug>");
+                std::process::exit(1);
+            };
+            let result = tenant_pod::start_pod(&tenant_image(), &repos_root(), &tenant_slug)
+                .map_err(|e| e.to_string())
+                .and_then(|()| {
+                    let mut client = control_plane::connect()
+                        .map_err(|e: control_plane::Error| e.to_string())?;
+                    let tenant = control_plane::find_tenant_by_slug(&mut client, &tenant_slug)
+                        .map_err(|e| e.to_string())?
+                        .ok_or_else(|| format!("tenant {tenant_slug} not found"))?;
+                    control_plane::record_pod_started(&mut client, tenant.id)
+                        .map_err(|e| e.to_string())
+                });
+            match result {
+                Ok(()) => println!("wkp-hub: pod started for tenant {tenant_slug}"),
+                Err(e) => {
+                    eprintln!("wkp-hub: start-pod failed: {e}");
+                    std::process::exit(1);
+                }
+            }
+        }
+        Some("stop-pod") => {
+            let Some(tenant_slug) = args.next() else {
+                eprintln!("wkp-hub: usage: wkp-hub stop-pod <tenant-slug>");
+                std::process::exit(1);
+            };
+            let result = tenant_pod::stop_pod(&tenant_slug)
+                .map_err(|e| e.to_string())
+                .and_then(|()| {
+                    let mut client = control_plane::connect()
+                        .map_err(|e: control_plane::Error| e.to_string())?;
+                    let tenant = control_plane::find_tenant_by_slug(&mut client, &tenant_slug)
+                        .map_err(|e| e.to_string())?
+                        .ok_or_else(|| format!("tenant {tenant_slug} not found"))?;
+                    control_plane::record_pod_stopped(&mut client, tenant.id)
+                        .map_err(|e| e.to_string())
+                });
+            match result {
+                Ok(()) => println!("wkp-hub: pod stopped for tenant {tenant_slug}"),
+                Err(e) => {
+                    eprintln!("wkp-hub: stop-pod failed: {e}");
+                    std::process::exit(1);
+                }
+            }
+        }
+        Some("reap-idle-pods") => {
+            let idle_minutes = args
+                .next()
+                .as_deref()
+                .filter(|a| *a == "--idle-minutes")
+                .and_then(|_| args.next())
+                .and_then(|m| m.parse::<i64>().ok())
+                .unwrap_or(30);
+            let result = control_plane::connect()
+                .map_err(|e| e.to_string())
+                .and_then(|mut client| {
+                    tenant_pod::reap_idle(&mut client, time::Duration::minutes(idle_minutes))
+                });
+            match result {
+                Ok(reaped) => {
+                    if reaped.is_empty() {
+                        println!("wkp-hub: no pods idle for {idle_minutes}+ minutes");
+                    }
+                    for slug in reaped {
+                        println!("wkp-hub: reaped pod for tenant {slug}");
+                    }
+                }
+                Err(e) => {
+                    eprintln!("wkp-hub: reap-idle-pods failed: {e}");
                     std::process::exit(1);
                 }
             }
@@ -453,7 +540,8 @@ fn main() {
                  device revoke <public-key> | device issue-token <public-key> | \
                  authorized-keys-command <public-key> | \
                  git-shell <tenant-slug> | index-tenant <tenant-slug> | \
-                 provision-repo <tenant-slug>"
+                 provision-repo <tenant-slug> | start-pod <tenant-slug> | \
+                 stop-pod <tenant-slug> | reap-idle-pods [--idle-minutes <n>]"
             );
             std::process::exit(1);
         }
