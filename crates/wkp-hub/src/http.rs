@@ -27,11 +27,11 @@ use crate::control_plane::{self, grants};
 use serde::{Deserialize, Serialize};
 use tiny_http::{Method, Response, StatusCode};
 
-pub fn serve(port: u16, repos_root: std::path::PathBuf) -> Result<(), String> {
+pub fn serve(port: u16, repos_root: std::path::PathBuf, image: String) -> Result<(), String> {
     let server = tiny_http::Server::http(("0.0.0.0", port)).map_err(|e| e.to_string())?;
     eprintln!("wkp-hub: listening on http://0.0.0.0:{port}");
     for request in server.incoming_requests() {
-        handle(request, &repos_root);
+        handle(request, &repos_root, &image);
     }
     Ok(())
 }
@@ -105,7 +105,7 @@ impl Rendered {
     }
 }
 
-fn handle(mut request: tiny_http::Request, repos_root: &std::path::Path) {
+fn handle(mut request: tiny_http::Request, repos_root: &std::path::Path, image: &str) {
     let method = request.method().clone();
     let url = request.url().to_string();
     let path = url.split('?').next().unwrap_or("").to_string();
@@ -122,6 +122,7 @@ fn handle(mut request: tiny_http::Request, repos_root: &std::path::Path) {
             &suffix,
             &query,
             repos_root,
+            image,
         )
     } else {
         match (&method, path.as_str()) {
@@ -269,6 +270,7 @@ fn handle_git_http(
     suffix: &str,
     query: &str,
     repos_root: &std::path::Path,
+    image: &str,
 ) -> Rendered {
     let method_str = match method {
         Method::Get => "GET",
@@ -323,16 +325,111 @@ fn handle_git_http(
         eprintln!("wkp-hub: git-http: touch_last_active failed (non-fatal): {e}");
     }
 
-    let remote_user = format!("device:{}", device.id);
-    serve_git_http(
-        request,
-        method_str,
+    // M5-7 (ADR-0009/0010): the front door never runs `git http-backend`
+    // itself -- it proxies to the resolved tenant's own pod over the
+    // shared network, starting it first if this control plane's own
+    // bookkeeping ([`control_plane::Tenant::pod_running`]) says it
+    // isn't already up. Simplest cold-start policy that's actually
+    // correct (ADR-0010 explicitly left this undecided): retry the
+    // proxy attempt a few times with a short wait rather than queueing
+    // or failing the first request outright -- a fresh container needs
+    // a moment to actually start listening.
+    if !tenant.pod_running {
+        if let Err(e) = crate::tenant_pod::start_pod(image, repos_root, tenant_slug) {
+            eprintln!("wkp-hub: git-http: failed to start tenant pod: {e}");
+            return Rendered::status_only(503);
+        }
+        if let Err(e) = control_plane::record_pod_started(&mut client, tenant.id) {
+            eprintln!("wkp-hub: git-http: pod started but failed to record it: {e}");
+        }
+    }
+
+    let content_type = find_header(request, "Content-Type");
+    let body = read_body_bytes(request);
+    proxy_to_tenant_pod(
         tenant_slug,
         suffix,
         query,
-        repos_root,
-        &remote_user,
+        method_str,
+        content_type.as_deref(),
+        &body,
     )
+}
+
+/// Proxies one git-http request to `tenant_slug`'s own pod, over the
+/// shared user-defined network ([`crate::tenant_pod::NETWORK_NAME`]),
+/// reached by its container-runtime DNS alias -- never
+/// `podman exec`/local execution (ADR-0009's own decision, and the
+/// whole reason a pod's isolation actually holds). A handful of short
+/// retries: a pod [`handle_git_http`] just cold-started needs a moment
+/// to actually be listening; see that function's own comment on why
+/// this simple retry, not a request queue, is this PR's answer to
+/// ADR-0010's explicitly undecided cold-start question.
+fn proxy_to_tenant_pod(
+    tenant_slug: &str,
+    suffix: &str,
+    query: &str,
+    method_str: &str,
+    content_type: Option<&str>,
+    body: &[u8],
+) -> Rendered {
+    let url = format!(
+        "http://{tenant_slug}:{}/{tenant_slug}.git/{suffix}?{query}",
+        crate::tenant_pod::SERVE_PORT
+    );
+    let agent: ureq::Agent = ureq::Agent::config_builder()
+        .http_status_as_error(false)
+        .build()
+        .into();
+
+    let mut last_err = String::new();
+    for attempt in 0..10 {
+        let result = match method_str {
+            "GET" => {
+                let mut builder = agent.get(&url);
+                if let Some(ct) = content_type {
+                    builder = builder.header("Content-Type", ct);
+                }
+                builder.call()
+            }
+            "POST" => {
+                let mut builder = agent.post(&url);
+                if let Some(ct) = content_type {
+                    builder = builder.header("Content-Type", ct);
+                }
+                builder.send(body)
+            }
+            _ => return Rendered::status_only(405),
+        };
+        match result {
+            Ok(mut response) => {
+                let status = response.status().as_u16();
+                let mut content_type = "application/octet-stream".to_string();
+                let mut extra_headers = Vec::new();
+                for (name, value) in response.headers().iter() {
+                    let Ok(v) = value.to_str() else { continue };
+                    if name.as_str().eq_ignore_ascii_case("content-type") {
+                        content_type = v.to_string();
+                    } else {
+                        extra_headers.push((name.to_string(), v.to_string()));
+                    }
+                }
+                let body = response.body_mut().read_to_vec().unwrap_or_default();
+                return Rendered {
+                    status,
+                    content_type,
+                    extra_headers,
+                    body,
+                };
+            }
+            Err(e) => last_err = e.to_string(),
+        }
+        if attempt < 9 {
+            std::thread::sleep(std::time::Duration::from_millis(200));
+        }
+    }
+    eprintln!("wkp-hub: git-http: proxy to tenant {tenant_slug}'s pod failed: {last_err}");
+    Rendered::status_only(502)
 }
 
 /// The actual `git http-backend` call, shared by [`handle_git_http`]
@@ -717,7 +814,12 @@ mod tests {
         drop(listener); // release it so tiny_http can bind the same port itself
 
         std::thread::spawn(move || {
-            let _ = serve(port, repos_root);
+            // The image name is irrelevant to every test that uses
+            // this helper: none of them reach the cold-start path
+            // (the four rejection tests return before it; the one
+            // success-path test only checks that auth passes, per its
+            // own doc comment).
+            let _ = serve(port, repos_root, "unused".to_string());
         });
         // tiny_http's Server::http binds synchronously before returning,
         // but `serve` doesn't hand that moment back to this thread -- a
@@ -895,74 +997,49 @@ mod tests {
         }
     }
 
-    /// M5-6's own explicit acceptance criterion: a valid, active
-    /// device's token can push/fetch over HTTPS -- driven as a real
-    /// `git push`/`git clone`, over real HTTP, against the actually
-    /// running server, not a raw request to `/info/refs` alone.
+    /// M5-6's own explicit acceptance criterion (a valid, active
+    /// device's token is accepted) still holds after M5-7 changed what
+    /// happens *next* on acceptance: the front door now proxies to the
+    /// resolved tenant's own pod (ADR-0009) instead of serving
+    /// `git http-backend` itself, so a plain `cargo test` run (no real
+    /// podman pod for this tenant) cannot complete an actual push/clone
+    /// the way M5-6's original version of this test did -- that
+    /// end-to-end proof now belongs to
+    /// `deploy/hub/test-pod-lifecycle.sh`, run against a real running
+    /// pod. What this test still proves directly: a valid,
+    /// active, correctly-tenant-matched token is never rejected by
+    /// this module's own auth checks (401/404) -- whatever happens
+    /// after that (a successful proxy, or a 502/503 because no pod is
+    /// actually running here) is a separate concern.
     #[test]
-    fn a_valid_active_devices_token_can_push_and_fetch_over_http() {
+    fn a_valid_active_devices_token_passes_auth_and_reaches_the_proxy_step() {
         let fixture = set_up_git_http_fixture();
-        let remote = format!("{}/{}.git", fixture.base, fixture.tenant_slug);
-        // One `-c` per config value, not a naive `.split(' ')` of a
-        // single string -- the header value itself contains spaces
-        // ("Authorization: Bearer <token>"), so splitting on space
-        // would hand git a mangled argv instead of one config entry.
-        let auth_header_config =
-            format!("http.extraHeader=Authorization: Bearer {}", fixture.token);
-
-        let client_dir = tempfile::Builder::new()
-            .prefix("wkp-hub-http-git-test-client-")
-            .tempdir()
-            .expect("temp dir");
-        run_git(client_dir.path(), &["init", "--quiet", "-b", "main"]);
-        std::fs::write(
-            client_dir.path().join("shared.md"),
-            "---\nvisibility: shared\n---\n\nhello over https\n",
-        )
-        .expect("write shared.md");
-        run_git(client_dir.path(), &["add", "-A"]);
-        run_git(
-            client_dir.path(),
-            &[
-                "-c",
-                "user.email=test@example.com",
-                "-c",
-                "user.name=test",
-                "commit",
-                "--quiet",
-                "-m",
-                "https test",
-            ],
+        let agent = test_agent();
+        let response = agent
+            .get(format!(
+                "{}/{}.git/info/refs?service=git-upload-pack",
+                fixture.base, fixture.tenant_slug
+            ))
+            .header("Authorization", format!("Bearer {}", fixture.token))
+            .call()
+            .expect("GET /info/refs");
+        assert_ne!(
+            response.status(),
+            401,
+            "a valid, active token must not be rejected"
         );
-
-        run_git(
-            client_dir.path(),
-            &[
-                "-c",
-                &auth_header_config,
-                "push",
-                "--quiet",
-                &remote,
-                "main",
-            ],
+        assert_ne!(
+            response.status(),
+            404,
+            "a token correctly matched to its own tenant must not 404"
         );
-
-        let fetch_dir = tempfile::Builder::new()
-            .prefix("wkp-hub-http-git-test-fetch-")
-            .tempdir()
-            .expect("temp dir");
-        run_git(
-            client_dir.path(),
-            &[
-                "-c",
-                &auth_header_config,
-                "clone",
-                "--quiet",
-                &remote,
-                fetch_dir.path().to_str().unwrap(),
-            ],
-        );
-        assert!(fetch_dir.path().join("shared.md").exists());
+        // The cold-start attempt above creates a real (empty, since
+        // `serve()`'s own test setup passes a deliberately invalid
+        // image name -- see that call site's own comment) podman pod
+        // even though the actual `podman run` inside it fails --
+        // cleaned up here rather than leaking one `wkp-tenant-<slug>`
+        // pod per test run indefinitely.
+        let _ = crate::tenant_pod::stop_pod(&fixture.tenant_slug);
     }
 
     /// Test-only exception to CLAUDE.md's "no `Command::new(\"git\")`
