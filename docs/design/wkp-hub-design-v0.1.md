@@ -9,6 +9,17 @@
 
 ## Changelog
 
+- 2026-09-10: ADR-0009's per-tenant pod model gets its lifecycle,
+  addressing, and repo-persistence design: pods are started on-demand
+  per tenant (with a per-tenant `always_warm` override) and torn down
+  after an idle period; each pod runs `wkp-hub` itself in a new
+  single-tenant serving mode rather than a second program; the front
+  door reaches a tenant's pod by container-runtime DNS name on a
+  shared user-defined network, not a per-tenant host-port mapping; bare
+  repos persist on a bind-mounted shared path outside each pod's own
+  ephemeral filesystem. See
+  `docs/adr/0010-per-tenant-pod-lifecycle-and-addressing.md`; not yet
+  implemented (M5-7, issue #110).
 - 2026-09-09: 8.2's "a bare repo under its own Unix user (or a per-tenant
   user namespace in the container runtime)" is resolved in favor of the
   second option: a container-runtime pod per tenant, with the front-door
