@@ -137,7 +137,15 @@ fn handle(mut request: tiny_http::Request, repos_root: &std::path::Path) {
             ),
         }
     };
+    respond(request, rendered);
+}
 
+/// Sends a [`Rendered`] response back over `request` -- the one place
+/// that needs to know how to actually talk to `tiny_http::Response`,
+/// shared by [`handle`] (the front door's authenticated routes) and
+/// [`serve_single_tenant`] (M5-7's own no-auth, one-repo mode a
+/// tenant's pod runs).
+fn respond(request: tiny_http::Request, rendered: Rendered) {
     let status = StatusCode(rendered.status);
     let content_type_header =
         tiny_http::Header::from_bytes(&b"Content-Type"[..], rendered.content_type.as_bytes())
@@ -153,6 +161,57 @@ fn handle(mut request: tiny_http::Request, repos_root: &std::path::Path) {
     if let Err(e) = request.respond(response) {
         eprintln!("wkp-hub: failed to send response: {e}");
     }
+}
+
+/// M5-7 (ADR-0010): the mode a tenant's own pod runs -- serves exactly
+/// one fixed tenant's repo via `git http-backend`, with no bearer-token
+/// check at all (the front door already made that decision before ever
+/// proxying a request here) and no RFC 8628/`/verify` routes (a pod
+/// has no reason to run them; those stay the front door's own job).
+/// Refuses (404) any request naming a *different* tenant than the one
+/// this process was started for -- defense in depth even though the
+/// front door should never send one here, the same posture
+/// `handle_git_http`'s own tenant-match check takes for the same
+/// reason.
+pub fn serve_single_tenant(
+    port: u16,
+    tenant_slug: String,
+    repos_root: std::path::PathBuf,
+) -> Result<(), String> {
+    let server = tiny_http::Server::http(("0.0.0.0", port)).map_err(|e| e.to_string())?;
+    eprintln!("wkp-hub: serving tenant {tenant_slug} on http://0.0.0.0:{port}");
+    for mut request in server.incoming_requests() {
+        let method = request.method().clone();
+        let url = request.url().to_string();
+        let path = url.split('?').next().unwrap_or("").to_string();
+        let query = url
+            .split_once('?')
+            .map(|(_, q)| q.to_string())
+            .unwrap_or_default();
+
+        let method_str = match method {
+            Method::Get => "GET",
+            Method::Post => "POST",
+            _ => {
+                respond(request, Rendered::status_only(405));
+                continue;
+            }
+        };
+        let rendered = match git_http_path(&path) {
+            Some((slug, suffix)) if slug == tenant_slug => serve_git_http(
+                &mut request,
+                method_str,
+                &slug,
+                &suffix,
+                &query,
+                &repos_root,
+                "pod",
+            ),
+            _ => Rendered::status_only(404),
+        };
+        respond(request, rendered);
+    }
+    Ok(())
 }
 
 /// Recognizes `/<tenant-slug>.git/<suffix>` (`info/refs`,
@@ -257,7 +316,40 @@ fn handle_git_http(
         // apply to private-repo 404s.
         return Rendered::status_only(404);
     }
+    // M5-7 (ADR-0010): the reaper's own idle-timeout decision
+    // (`find_idle_running_tenants`) reads this -- best-effort, a
+    // failure here must never block serving the actual request.
+    if let Err(e) = control_plane::touch_last_active(&mut client, tenant.id) {
+        eprintln!("wkp-hub: git-http: touch_last_active failed (non-fatal): {e}");
+    }
 
+    let remote_user = format!("device:{}", device.id);
+    serve_git_http(
+        request,
+        method_str,
+        tenant_slug,
+        suffix,
+        query,
+        repos_root,
+        &remote_user,
+    )
+}
+
+/// The actual `git http-backend` call, shared by [`handle_git_http`]
+/// (the front door, after its own auth checks -- passes the resolved
+/// device's own identity as `remote_user`) and [`serve_single_tenant`]
+/// (a tenant's own pod, which has no device to attribute a request to
+/// at all -- the front door already made that decision before ever
+/// proxying here).
+fn serve_git_http(
+    request: &mut tiny_http::Request,
+    method_str: &str,
+    tenant_slug: &str,
+    suffix: &str,
+    query: &str,
+    repos_root: &std::path::Path,
+    remote_user: &str,
+) -> Rendered {
     let content_type = find_header(request, "Content-Type");
     let body = read_body_bytes(request);
     let path_info = format!("/{tenant_slug}.git/{suffix}");
@@ -266,7 +358,7 @@ fn handle_git_http(
         path_info: &path_info,
         query_string: query,
         content_type: content_type.as_deref(),
-        remote_user: &format!("device:{}", device.id),
+        remote_user,
         body: &body,
     };
 
@@ -958,5 +1050,117 @@ mod tests {
             .call()
             .expect("GET /info/refs");
         assert_eq!(response.status(), 404);
+    }
+
+    /// M5-7 (ADR-0010): the mode a tenant's own pod runs -- serves its
+    /// one fixed repo with no bearer-token check at all (the front door
+    /// already made that decision before ever proxying here).
+    #[test]
+    fn serve_single_tenant_serves_its_one_configured_tenant_with_no_auth_needed() {
+        let repos_root = tempfile::Builder::new()
+            .prefix("wkp-hub-http-single-tenant-test-repos-")
+            .tempdir()
+            .expect("temp dir")
+            .keep();
+        let tenant_slug = unique_slug("single-tenant");
+        wkp_git::init_bare_repo(&repos_root.join(format!("{tenant_slug}.git")))
+            .expect("init_bare_repo");
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind an ephemeral port");
+        let port = listener.local_addr().expect("local_addr").port();
+        drop(listener);
+        let slug_for_thread = tenant_slug.clone();
+        std::thread::spawn(move || {
+            let _ = serve_single_tenant(port, slug_for_thread, repos_root);
+        });
+
+        let remote = format!("http://127.0.0.1:{port}/{tenant_slug}.git");
+        let client_dir = tempfile::Builder::new()
+            .prefix("wkp-hub-http-single-tenant-test-client-")
+            .tempdir()
+            .expect("temp dir");
+        run_git(client_dir.path(), &["init", "--quiet", "-b", "main"]);
+        std::fs::write(
+            client_dir.path().join("shared.md"),
+            "---\nvisibility: shared\n---\n\nno auth needed here\n",
+        )
+        .expect("write shared.md");
+        run_git(client_dir.path(), &["add", "-A"]);
+        run_git(
+            client_dir.path(),
+            &[
+                "-c",
+                "user.email=test@example.com",
+                "-c",
+                "user.name=test",
+                "commit",
+                "--quiet",
+                "-m",
+                "single-tenant test",
+            ],
+        );
+
+        // No `-c http.extraHeader=Authorization: ...` at all -- this is
+        // the whole point of this mode; retried a few times since the
+        // server thread above needs a moment to actually bind.
+        let mut last_err = None;
+        for attempt in 0..20 {
+            match std::process::Command::new("git")
+                .current_dir(client_dir.path())
+                .args(["push", "--quiet", &remote, "main"])
+                .output()
+            {
+                Ok(output) if output.status.success() => {
+                    last_err = None;
+                    break;
+                }
+                Ok(output) => last_err = Some(String::from_utf8_lossy(&output.stderr).into_owned()),
+                Err(e) => last_err = Some(e.to_string()),
+            }
+            if attempt < 19 {
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+        }
+        assert!(last_err.is_none(), "push failed: {last_err:?}");
+    }
+
+    #[test]
+    fn serve_single_tenant_refuses_a_request_for_a_different_tenant() {
+        let repos_root = tempfile::Builder::new()
+            .prefix("wkp-hub-http-single-tenant-wrong-tenant-repos-")
+            .tempdir()
+            .expect("temp dir")
+            .keep();
+        let configured_slug = unique_slug("single-tenant-configured");
+        let other_slug = unique_slug("single-tenant-other");
+        wkp_git::init_bare_repo(&repos_root.join(format!("{other_slug}.git")))
+            .expect("init_bare_repo");
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind an ephemeral port");
+        let port = listener.local_addr().expect("local_addr").port();
+        drop(listener);
+        std::thread::spawn(move || {
+            let _ = serve_single_tenant(port, configured_slug, repos_root);
+        });
+
+        let agent = test_agent();
+        let url =
+            format!("http://127.0.0.1:{port}/{other_slug}.git/info/refs?service=git-upload-pack");
+        let mut response = None;
+        for attempt in 0..20 {
+            match agent.get(&url).call() {
+                Ok(r) => {
+                    response = Some(r);
+                    break;
+                }
+                Err(_) if attempt < 19 => std::thread::sleep(std::time::Duration::from_millis(50)),
+                Err(e) => panic!("request never succeeded: {e}"),
+            }
+        }
+        assert_eq!(
+            response.expect("got a response").status(),
+            404,
+            "a pod configured for one tenant must refuse requests naming a different one"
+        );
     }
 }

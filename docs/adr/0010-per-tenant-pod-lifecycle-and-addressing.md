@@ -1,6 +1,6 @@
 # ADR-0010: Per-tenant pod lifecycle, addressing, and repo persistence
 
-Status: proposed
+Status: accepted
 Date: 2026-09-10
 Design sections affected: 8.1, 8.2, 8.3
 Depends on: ADR-0009 (decided *that* isolation is a pod per tenant, reached over `git http-backend`; this ADR decides how those pods are started, stopped, found, and kept from losing data)

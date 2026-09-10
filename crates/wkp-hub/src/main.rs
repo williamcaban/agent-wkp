@@ -57,6 +57,34 @@ fn main() {
                 std::process::exit(1);
             }
         }
+        Some("serve-tenant") => {
+            // M5-7 (ADR-0010): the mode a tenant's own pod runs -- one
+            // fixed repo, no bearer-token check (the front door already
+            // made that decision before ever proxying here), no
+            // RFC 8628/`/verify` routes at all.
+            let mut tenant_slug = None;
+            let mut port = 8080u16;
+            while let Some(arg) = args.next() {
+                match arg.as_str() {
+                    "--tenant" => tenant_slug = args.next(),
+                    "--port" => {
+                        port = args
+                            .next()
+                            .and_then(|p| p.parse::<u16>().ok())
+                            .unwrap_or(port)
+                    }
+                    _ => {}
+                }
+            }
+            let Some(tenant_slug) = tenant_slug else {
+                eprintln!("wkp-hub: usage: wkp-hub serve-tenant --tenant <slug> [--port <port>]");
+                std::process::exit(1);
+            };
+            if let Err(e) = http::serve_single_tenant(port, tenant_slug, repos_root()) {
+                eprintln!("wkp-hub: serve-tenant failed: {e}");
+                std::process::exit(1);
+            }
+        }
         Some("authorized-keys-command") => {
             // sshd's AuthorizedKeysCommand (M5-5's own wiring) passes
             // the key as one or more tokens depending on how the
@@ -419,7 +447,8 @@ fn main() {
         },
         _ => {
             eprintln!(
-                "wkp-hub: usage: wkp-hub serve [--port <port>] | migrate | \
+                "wkp-hub: usage: wkp-hub serve [--port <port>] | \
+                 serve-tenant --tenant <slug> [--port <port>] | migrate | \
                  tenant create <slug> | device register <tenant-slug> <public-key> | \
                  device revoke <public-key> | device issue-token <public-key> | \
                  authorized-keys-command <public-key> | \
