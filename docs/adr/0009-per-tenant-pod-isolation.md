@@ -1,6 +1,6 @@
 # ADR-0009: Per-tenant hard isolation via container-runtime pods, not `podman exec`
 
-Status: proposed
+Status: accepted
 Date: 2026-09-09
 Design sections affected: 8.1, 8.2, 8.3
 
