@@ -206,8 +206,132 @@ fn main() {
                     }
                 }
             }
+            // M5-7 (ADR-0010): admin/debug entry points into the pod-
+            // lifecycle bookkeeping the control plane now tracks --
+            // genuinely useful on their own (manually pinning a tenant
+            // warm, correcting a stuck pod-state row, or previewing
+            // what a reaper sweep would stop right now), independent
+            // of whether the actual provisioning/reaper code that
+            // would normally call these exists yet.
+            Some("set-always-warm") => {
+                let (slug, value) = (args.next(), args.next());
+                let (Some(slug), Some(value)) = (slug, value) else {
+                    eprintln!("wkp-hub: usage: wkp-hub tenant set-always-warm <slug> <true|false>");
+                    std::process::exit(1);
+                };
+                let Ok(always_warm) = value.parse::<bool>() else {
+                    eprintln!(
+                        "wkp-hub: set-always-warm: value must be 'true' or 'false', got {value}"
+                    );
+                    std::process::exit(1);
+                };
+                let result = (|| {
+                    let mut client = control_plane::connect()?;
+                    let tenant = control_plane::find_tenant_by_slug(&mut client, &slug)?
+                        .ok_or_else(|| control_plane::Error::NotFound(format!("tenant {slug}")))?;
+                    control_plane::set_always_warm(&mut client, tenant.id, always_warm)
+                })();
+                match result {
+                    Ok(()) => println!("wkp-hub: tenant {slug} always_warm = {always_warm}"),
+                    Err(e) => {
+                        eprintln!("wkp-hub: set-always-warm failed: {e}");
+                        std::process::exit(1);
+                    }
+                }
+            }
+            Some("pod-started") => {
+                let Some(slug) = args.next() else {
+                    eprintln!("wkp-hub: usage: wkp-hub tenant pod-started <slug>");
+                    std::process::exit(1);
+                };
+                let result = (|| {
+                    let mut client = control_plane::connect()?;
+                    let tenant = control_plane::find_tenant_by_slug(&mut client, &slug)?
+                        .ok_or_else(|| control_plane::Error::NotFound(format!("tenant {slug}")))?;
+                    control_plane::record_pod_started(&mut client, tenant.id)
+                })();
+                match result {
+                    Ok(()) => println!("wkp-hub: tenant {slug} pod marked started"),
+                    Err(e) => {
+                        eprintln!("wkp-hub: pod-started failed: {e}");
+                        std::process::exit(1);
+                    }
+                }
+            }
+            Some("pod-stopped") => {
+                let Some(slug) = args.next() else {
+                    eprintln!("wkp-hub: usage: wkp-hub tenant pod-stopped <slug>");
+                    std::process::exit(1);
+                };
+                let result = (|| {
+                    let mut client = control_plane::connect()?;
+                    let tenant = control_plane::find_tenant_by_slug(&mut client, &slug)?
+                        .ok_or_else(|| control_plane::Error::NotFound(format!("tenant {slug}")))?;
+                    control_plane::record_pod_stopped(&mut client, tenant.id)
+                })();
+                match result {
+                    Ok(()) => println!("wkp-hub: tenant {slug} pod marked stopped"),
+                    Err(e) => {
+                        eprintln!("wkp-hub: pod-stopped failed: {e}");
+                        std::process::exit(1);
+                    }
+                }
+            }
+            Some("touch-active") => {
+                let Some(slug) = args.next() else {
+                    eprintln!("wkp-hub: usage: wkp-hub tenant touch-active <slug>");
+                    std::process::exit(1);
+                };
+                let result = (|| {
+                    let mut client = control_plane::connect()?;
+                    let tenant = control_plane::find_tenant_by_slug(&mut client, &slug)?
+                        .ok_or_else(|| control_plane::Error::NotFound(format!("tenant {slug}")))?;
+                    control_plane::touch_last_active(&mut client, tenant.id)
+                })();
+                match result {
+                    Ok(()) => println!("wkp-hub: tenant {slug} marked active"),
+                    Err(e) => {
+                        eprintln!("wkp-hub: touch-active failed: {e}");
+                        std::process::exit(1);
+                    }
+                }
+            }
+            Some("list-idle") => {
+                let idle_minutes = args
+                    .next()
+                    .as_deref()
+                    .filter(|a| *a == "--idle-minutes")
+                    .and_then(|_| args.next())
+                    .and_then(|m| m.parse::<i64>().ok())
+                    .unwrap_or(30);
+                let result = control_plane::connect().and_then(|mut client| {
+                    control_plane::find_idle_running_tenants(
+                        &mut client,
+                        time::Duration::minutes(idle_minutes),
+                    )
+                });
+                match result {
+                    Ok(tenants) => {
+                        if tenants.is_empty() {
+                            println!("wkp-hub: no tenants idle for {idle_minutes}+ minutes");
+                        }
+                        for tenant in tenants {
+                            println!("wkp-hub: {} (id {}) idle", tenant.slug, tenant.id);
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("wkp-hub: list-idle failed: {e}");
+                        std::process::exit(1);
+                    }
+                }
+            }
             _ => {
-                eprintln!("wkp-hub: usage: wkp-hub tenant create <slug>");
+                eprintln!(
+                    "wkp-hub: usage: wkp-hub tenant create <slug> | \
+                     set-always-warm <slug> <true|false> | \
+                     pod-started <slug> | pod-stopped <slug> | \
+                     touch-active <slug> | list-idle [--idle-minutes <n>]"
+                );
                 std::process::exit(1);
             }
         },

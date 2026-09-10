@@ -21,13 +21,25 @@ mod schema;
 use postgres::{Client, NoTls, Row};
 use time::OffsetDateTime;
 
-/// A tenant: one bare repo, one per-tenant index, one Unix UID at the
-/// deployment layer (design 8.2) -- this table only carries the
-/// control-plane's own bookkeeping row, not the repo/index themselves.
+/// A tenant: one bare repo, one per-tenant pod (design 8.2, ADR-0009) --
+/// this table only carries the control-plane's own bookkeeping row,
+/// not the repo/pod themselves.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Tenant {
     pub id: i64,
     pub slug: String,
+    /// M5-7 (ADR-0010): skips on-demand start/idle-teardown for a
+    /// tenant that can't tolerate a cold start.
+    pub always_warm: bool,
+    /// This control plane's own last-known pod state -- not a live
+    /// poll of the container runtime. Kept honest by the
+    /// provisioning/reaper code that actually starts and stops pods.
+    pub pod_running: bool,
+    pub pod_started_at: Option<OffsetDateTime>,
+    /// What the reaper's idle-timeout decision reads. Starts equal to
+    /// `created_at`, never `NULL` -- a tenant is not "idle" before it
+    /// has ever had a chance to be active.
+    pub last_active_at: OffsetDateTime,
 }
 
 /// One registered device key (design 6.4, 8.1): the public half of a
@@ -111,12 +123,18 @@ pub fn connect() -> Result<Client, Error> {
     Ok(client)
 }
 
+/// Every column [`tenant_from_row`] reads -- named once so
+/// `create_tenant`/`find_tenant_by_slug`/`find_tenant_by_id`/
+/// [`find_idle_running_tenants`] can't drift out of sync with it one at
+/// a time as M5-7's pod-lifecycle columns get added to.
+const TENANT_COLUMNS: &str = "id, slug, always_warm, pod_running, pod_started_at, last_active_at";
+
 /// Creates a tenant with the given `slug` (the bare repo's own
 /// directory name at the deployment layer, M5-4 -- unique, never
 /// reused). Returns the new tenant's row.
 pub fn create_tenant(client: &mut Client, slug: &str) -> Result<Tenant, Error> {
     let row = client.query_one(
-        "INSERT INTO tenants (slug) VALUES ($1) RETURNING id, slug",
+        &format!("INSERT INTO tenants (slug) VALUES ($1) RETURNING {TENANT_COLUMNS}"),
         &[&slug],
     )?;
     Ok(tenant_from_row(&row))
@@ -126,7 +144,10 @@ pub fn create_tenant(client: &mut Client, slug: &str) -> Result<Tenant, Error> {
 /// an ordinary, expected outcome for a caller like `wkp-hub device
 /// register`, not a control-plane failure.
 pub fn find_tenant_by_slug(client: &mut Client, slug: &str) -> Result<Option<Tenant>, Error> {
-    let row = client.query_opt("SELECT id, slug FROM tenants WHERE slug = $1", &[&slug])?;
+    let row = client.query_opt(
+        &format!("SELECT {TENANT_COLUMNS} FROM tenants WHERE slug = $1"),
+        &[&slug],
+    )?;
     Ok(row.as_ref().map(tenant_from_row))
 }
 
@@ -135,8 +156,92 @@ pub fn find_tenant_by_slug(client: &mut Client, slug: &str) -> Result<Option<Ten
 /// [`Device`] row (which only carries `tenant_id`), e.g. `wkp-shell`'s
 /// key-to-tenant resolution (M5-3).
 pub fn find_tenant_by_id(client: &mut Client, tenant_id: i64) -> Result<Option<Tenant>, Error> {
-    let row = client.query_opt("SELECT id, slug FROM tenants WHERE id = $1", &[&tenant_id])?;
+    let row = client.query_opt(
+        &format!("SELECT {TENANT_COLUMNS} FROM tenants WHERE id = $1"),
+        &[&tenant_id],
+    )?;
     Ok(row.as_ref().map(tenant_from_row))
+}
+
+/// Sets a tenant's `always_warm` flag (M5-7, ADR-0010) -- an operator
+/// (or, later, a plan tier) pinning a tenant's pod to run continuously,
+/// skipping both the cold start and the reaper.
+pub fn set_always_warm(
+    client: &mut Client,
+    tenant_id: i64,
+    always_warm: bool,
+) -> Result<(), Error> {
+    let updated = client.execute(
+        "UPDATE tenants SET always_warm = $1 WHERE id = $2",
+        &[&always_warm, &tenant_id],
+    )?;
+    if updated == 0 {
+        return Err(Error::NotFound(format!("tenant {tenant_id}")));
+    }
+    Ok(())
+}
+
+/// Records that a tenant's pod has started -- the provisioning code's
+/// own job to call once it has actually done so (M5-7's later
+/// lifecycle task), not something this function verifies against the
+/// container runtime itself.
+pub fn record_pod_started(client: &mut Client, tenant_id: i64) -> Result<(), Error> {
+    let updated = client.execute(
+        "UPDATE tenants SET pod_running = true, pod_started_at = now() WHERE id = $1",
+        &[&tenant_id],
+    )?;
+    if updated == 0 {
+        return Err(Error::NotFound(format!("tenant {tenant_id}")));
+    }
+    Ok(())
+}
+
+/// Records that a tenant's pod has stopped -- the reaper's own job to
+/// call once it has actually done so.
+pub fn record_pod_stopped(client: &mut Client, tenant_id: i64) -> Result<(), Error> {
+    let updated = client.execute(
+        "UPDATE tenants SET pod_running = false, pod_started_at = NULL WHERE id = $1",
+        &[&tenant_id],
+    )?;
+    if updated == 0 {
+        return Err(Error::NotFound(format!("tenant {tenant_id}")));
+    }
+    Ok(())
+}
+
+/// Marks a tenant active right now -- the front door's own job to call
+/// on every real request it proxies to that tenant's pod, so the
+/// reaper's idle-timeout decision ([`find_idle_running_tenants`]) has
+/// something accurate to read.
+pub fn touch_last_active(client: &mut Client, tenant_id: i64) -> Result<(), Error> {
+    let updated = client.execute(
+        "UPDATE tenants SET last_active_at = now() WHERE id = $1",
+        &[&tenant_id],
+    )?;
+    if updated == 0 {
+        return Err(Error::NotFound(format!("tenant {tenant_id}")));
+    }
+    Ok(())
+}
+
+/// Every tenant whose pod is currently marked running, is not
+/// `always_warm`, and has been idle at least `idle_for` -- exactly what
+/// a reaper sweep (M5-7's later lifecycle task) needs to decide which
+/// pods to stop. Pure control-plane query: this function never talks
+/// to the container runtime itself, only this table's own bookkeeping.
+pub fn find_idle_running_tenants(
+    client: &mut Client,
+    idle_for: time::Duration,
+) -> Result<Vec<Tenant>, Error> {
+    let cutoff = OffsetDateTime::now_utc() - idle_for;
+    let rows = client.query(
+        &format!(
+            "SELECT {TENANT_COLUMNS} FROM tenants \
+             WHERE pod_running = true AND always_warm = false AND last_active_at < $1"
+        ),
+        &[&cutoff],
+    )?;
+    Ok(rows.iter().map(tenant_from_row).collect())
 }
 
 /// Registers a device's public key under `tenant_id` -- the write side
@@ -236,6 +341,10 @@ fn tenant_from_row(row: &Row) -> Tenant {
     Tenant {
         id: row.get("id"),
         slug: row.get("slug"),
+        always_warm: row.get("always_warm"),
+        pod_running: row.get("pod_running"),
+        pod_started_at: row.get("pod_started_at"),
+        last_active_at: row.get("last_active_at"),
     }
 }
 
@@ -454,5 +563,162 @@ mod tests {
         let mut client = connect().expect("connect");
         let result = issue_bearer_token(&mut client, -1);
         assert!(matches!(result, Err(Error::NotFound(_))));
+    }
+
+    /// M5-7 (ADR-0010): a freshly created tenant starts on-demand
+    /// (`always_warm: false`), with no pod running yet.
+    #[test]
+    fn a_freshly_created_tenant_defaults_to_on_demand_with_no_pod_running() {
+        let mut client = connect().expect("connect");
+        let tenant = create_tenant(&mut client, &unique_slug("pod-lifecycle-defaults"))
+            .expect("create_tenant");
+        assert!(!tenant.always_warm);
+        assert!(!tenant.pod_running);
+        assert!(tenant.pod_started_at.is_none());
+    }
+
+    #[test]
+    fn set_always_warm_round_trips_and_fails_for_an_unknown_tenant() {
+        let mut client = connect().expect("connect");
+        let tenant = create_tenant(&mut client, &unique_slug("always-warm")).expect("tenant");
+        assert!(!tenant.always_warm);
+
+        set_always_warm(&mut client, tenant.id, true).expect("set_always_warm");
+        let found = find_tenant_by_id(&mut client, tenant.id)
+            .expect("find_tenant_by_id")
+            .expect("tenant must be found");
+        assert!(found.always_warm);
+
+        set_always_warm(&mut client, tenant.id, false).expect("set_always_warm back off");
+        let found_again = find_tenant_by_id(&mut client, tenant.id)
+            .expect("find_tenant_by_id")
+            .expect("tenant must be found");
+        assert!(!found_again.always_warm);
+
+        assert!(matches!(
+            set_always_warm(&mut client, -1, true),
+            Err(Error::NotFound(_))
+        ));
+    }
+
+    #[test]
+    fn record_pod_started_and_stopped_round_trip() {
+        let mut client = connect().expect("connect");
+        let tenant = create_tenant(&mut client, &unique_slug("pod-start-stop")).expect("tenant");
+
+        record_pod_started(&mut client, tenant.id).expect("record_pod_started");
+        let started = find_tenant_by_id(&mut client, tenant.id)
+            .expect("find_tenant_by_id")
+            .expect("tenant must be found");
+        assert!(started.pod_running);
+        assert!(started.pod_started_at.is_some());
+
+        record_pod_stopped(&mut client, tenant.id).expect("record_pod_stopped");
+        let stopped = find_tenant_by_id(&mut client, tenant.id)
+            .expect("find_tenant_by_id")
+            .expect("tenant must be found");
+        assert!(!stopped.pod_running);
+        assert!(
+            stopped.pod_started_at.is_none(),
+            "stopping a pod must clear pod_started_at, not just pod_running"
+        );
+
+        assert!(matches!(
+            record_pod_started(&mut client, -1),
+            Err(Error::NotFound(_))
+        ));
+        assert!(matches!(
+            record_pod_stopped(&mut client, -1),
+            Err(Error::NotFound(_))
+        ));
+    }
+
+    #[test]
+    fn touch_last_active_moves_last_active_at_forward() {
+        let mut client = connect().expect("connect");
+        let tenant = create_tenant(&mut client, &unique_slug("touch-active")).expect("tenant");
+        let before = tenant.last_active_at;
+
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        touch_last_active(&mut client, tenant.id).expect("touch_last_active");
+        let after = find_tenant_by_id(&mut client, tenant.id)
+            .expect("find_tenant_by_id")
+            .expect("tenant must be found");
+        assert!(after.last_active_at > before);
+
+        assert!(matches!(
+            touch_last_active(&mut client, -1),
+            Err(Error::NotFound(_))
+        ));
+    }
+
+    /// Backdates a tenant's `last_active_at` directly via SQL --
+    /// simulating genuine long-term idleness inside a fast-running
+    /// unit test needs this rather than a real `sleep`, and rather
+    /// than a zero-duration idle threshold (which would race: the
+    /// query's own `now() - idle_for` cutoff is computed strictly
+    /// after any `touch_last_active` call the test just made, so a
+    /// zero threshold can never actually distinguish "just touched"
+    /// from "idle").
+    fn backdate_last_active(client: &mut Client, tenant_id: i64, ago: time::Duration) {
+        let ago_seconds = ago.whole_seconds();
+        client
+            .execute(
+                "UPDATE tenants SET last_active_at = now() - ($1 || ' seconds')::interval \
+                 WHERE id = $2",
+                &[&ago_seconds.to_string(), &tenant_id],
+            )
+            .expect("backdate last_active_at");
+    }
+
+    /// M5-7's own core acceptance criterion for the reaper query: a
+    /// running, non-`always_warm` tenant idle past the threshold is
+    /// returned; a running `always_warm` tenant, a non-running tenant,
+    /// and a recently active tenant are all excluded.
+    #[test]
+    fn find_idle_running_tenants_excludes_always_warm_and_recently_active() {
+        let mut client = connect().expect("connect");
+        let one_hour = time::Duration::hours(1);
+        let idle_threshold = time::Duration::minutes(30);
+
+        let idle = create_tenant(&mut client, &unique_slug("idle-candidate")).expect("tenant");
+        record_pod_started(&mut client, idle.id).expect("record_pod_started");
+        backdate_last_active(&mut client, idle.id, one_hour);
+
+        let warm = create_tenant(&mut client, &unique_slug("idle-but-warm")).expect("tenant");
+        record_pod_started(&mut client, warm.id).expect("record_pod_started");
+        set_always_warm(&mut client, warm.id, true).expect("set_always_warm");
+        backdate_last_active(&mut client, warm.id, one_hour);
+
+        let not_running =
+            create_tenant(&mut client, &unique_slug("idle-not-running")).expect("tenant");
+        backdate_last_active(&mut client, not_running.id, one_hour);
+
+        // Left at its create_tenant default (effectively "just now") --
+        // recently active, no backdating.
+        let recently_active =
+            create_tenant(&mut client, &unique_slug("idle-recently-active")).expect("tenant");
+        record_pod_started(&mut client, recently_active.id).expect("record_pod_started");
+
+        let idle_candidates =
+            find_idle_running_tenants(&mut client, idle_threshold).expect("query");
+        let idle_ids: Vec<i64> = idle_candidates.iter().map(|t| t.id).collect();
+
+        assert!(
+            idle_ids.contains(&idle.id),
+            "an idle, non-warm, running tenant must be included"
+        );
+        assert!(
+            !idle_ids.contains(&warm.id),
+            "an always_warm tenant must never be included"
+        );
+        assert!(
+            !idle_ids.contains(&not_running.id),
+            "a tenant with no pod running has nothing to reap"
+        );
+        assert!(
+            !idle_ids.contains(&recently_active.id),
+            "a tenant active well within the idle threshold must not be included"
+        );
     }
 }

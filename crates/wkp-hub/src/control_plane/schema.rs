@@ -34,7 +34,23 @@ pub(super) const SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS tenants (
     id BIGSERIAL PRIMARY KEY,
     slug TEXT NOT NULL UNIQUE,
-    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    -- M5-7 (ADR-0010): per-tenant pod lifecycle state. `always_warm`
+    -- opts a tenant out of on-demand start/idle-teardown entirely, for
+    -- one that can't tolerate a cold start. `pod_running`/
+    -- `pod_started_at` reflect this control plane's own last-known
+    -- state, not a live poll of the container runtime -- the
+    -- provisioning/reaper code (a later M5-7 task) is what keeps them
+    -- honest, the same way `devices.revoked_at` is a fact this table
+    -- records, not a live check against anything external.
+    -- `last_active_at` is what the reaper's idle-timeout decision reads;
+    -- it starts equal to `created_at` (a tenant is not "idle" before it
+    -- has ever had a chance to be active) rather than NULL, so a reaper
+    -- query never needs a NULL-handling special case.
+    always_warm BOOLEAN NOT NULL DEFAULT false,
+    pod_running BOOLEAN NOT NULL DEFAULT false,
+    pod_started_at TIMESTAMPTZ,
+    last_active_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
 CREATE TABLE IF NOT EXISTS devices (
