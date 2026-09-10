@@ -9,6 +9,16 @@
 
 ## Changelog
 
+- 2026-09-09: 8.2's "a bare repo under its own Unix user (or a per-tenant
+  user namespace in the container runtime)" is resolved in favor of the
+  second option: a container-runtime pod per tenant, with the front-door
+  `sshd`/`wkp-shell` process reaching a tenant's pod over the network
+  (its own `git http-backend`, 8.1's already-chosen HTTPS backend) rather
+  than a Unix UID switch or a runtime-specific mechanism like `podman
+  exec` (which has no Kubernetes equivalent). See
+  `docs/adr/0009-per-tenant-pod-isolation.md`; not yet implemented, and
+  M5-5 is rescoped to the front-door container only in the meantime
+  (`docs/plan/milestones.md`).
 - 2026-09-07: Resolved the `[unverified]` tag on the fsmonitor sentence in
   5.1 (Linux builtin fsmonitor support is newer than macOS/Windows, and
   specifically landed in git 2.55, not alongside the 2.37 daemon). Minimum
