@@ -9,6 +9,18 @@
 
 ## Changelog
 
+- 2026-09-11: 8.1's SSH half (`sshd` + `AuthorizedKeysCommand` +
+  `wkp-shell`) is dropped: ADR-0009/0010's pod-per-tenant model has no
+  way to run `git-receive-pack`/`git-upload-pack` locally once repos
+  move into per-tenant pods, and building an SSH-to-smart-HTTP protocol
+  bridge to reach a pod's `git http-backend` over the network was judged
+  disproportionate new surface for what SSH was still buying. HTTPS
+  becomes the only transport; device keys move from SSH public keys to
+  mutual TLS certificates issued by the hub's own private CA
+  (`rustls` + `rcgen`, pure Rust, no OpenSSL). See
+  `docs/adr/0011-drop-ssh-mtls-transport.md`; not yet implemented.
+  M5-3/M5-5's already-merged SSH-path code is scheduled for removal
+  once the mTLS replacement is built and proven working, not before.
 - 2026-09-10: ADR-0009's per-tenant pod model gets its lifecycle,
   addressing, and repo-persistence design: pods are started on-demand
   per tenant (with a per-tenant `always_warm` override) and torn down
@@ -405,6 +417,8 @@ Prompt injection through agent-consumed content is **established** as a practica
 ## 8. Hosted hub
 
 ### 8.1 D7: OpenSSH + git's own server binaries as the transport front end
+
+**Superseded (2026-09-11) for the SSH half only.** ADR-0011 drops the SSH transport described below: the pod-per-tenant model (ADR-0009/0010) leaves no local repo for `wkp-shell` to exec `git-receive-pack`/`git-upload-pack` against, and bridging an SSH session to a tenant pod's `git http-backend` over the network was judged not worth the new protocol-translation surface it would require. HTTPS (the second half of this decision, unaffected) becomes the only transport; SSH device keys are replaced by mutual TLS device certificates from the hub's own private CA (`rustls` + `rcgen`). The reasoning below is kept for history, not as current design -- see `docs/adr/0011-drop-ssh-mtls-transport.md`.
 
 **Decision.** The hub's git endpoint is unmodified `sshd` with `AuthorizedKeysCommand` (looks up the presented public key in the control plane and returns an `authorized_keys` line with `command=`, `restrict` options) and a small `wkp-shell` that maps the key to a tenant and executes only `git-receive-pack` / `git-upload-pack` on that tenant's bare repository ([sshd_config](https://man.openbsd.org/sshd_config), [git-shell](https://git-scm.com/docs/git-shell)). HTTPS transport uses `git http-backend`, the CGI program shipped with git ([git-http-backend](https://git-scm.com/docs/git-http-backend)), behind a reverse proxy that validates a device-scoped bearer token and sets `REMOTE_USER`.
 
