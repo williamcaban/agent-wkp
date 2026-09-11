@@ -59,25 +59,16 @@ CREATE TABLE IF NOT EXISTS devices (
     public_key TEXT NOT NULL UNIQUE,
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     revoked_at TIMESTAMPTZ,
-    -- M5-6 (design 8.1's HTTPS transport): a SHA-256 hex digest, never
-    -- the plaintext token itself -- same reasoning as a password hash,
-    -- even though this secret is high-entropy and machine-generated
-    -- rather than user-chosen (so a fast hash is fine here; there is
-    -- no offline dictionary attack to slow down, unlike a real
-    -- password). Nullable: an SSH-only device never gets one. UNIQUE
-    -- so a lookup by presented token is a single indexed equality
-    -- check, matching `public_key`'s own lookup shape exactly.
-    bearer_token_hash TEXT UNIQUE,
     -- M5-9 (ADR-0011): certificate-based enrollment. A device that
     -- registered via the CSR flow (`grants::approve_grant` +
     -- `issue_device_certificate`) has all four populated; a device
     -- created directly via the admin CLI's raw-public-key bypass
     -- (`wkp-hub device register`, unchanged by this task) has none of
-    -- them -- the same nullable-until-issued shape `bearer_token_hash`
-    -- already established for M5-6's own optional credential.
-    -- `cert_serial` is UNIQUE for the same reason `bearer_token_hash`
-    -- is: a future lookup by presented serial (#124/#128's own job) is
-    -- then a single indexed equality check, not a table scan.
+    -- them. `cert_serial` is UNIQUE so `find_device_by_cert_serial`
+    -- (M5-10's client-certificate verifier, one lookup per mTLS
+    -- handshake) is a single indexed equality check, not a table scan
+    -- -- the exact role `bearer_token_hash` played for M5-6's HTTPS
+    -- transport before M5-10 replaced bearer tokens with mTLS entirely.
     certificate_pem TEXT,
     cert_serial TEXT UNIQUE,
     cert_issued_at TIMESTAMPTZ,
