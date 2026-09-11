@@ -250,3 +250,62 @@ jobs:
       # over SSH, revoke it, attempt another push, confirm it fails.
       - name: deploy/hub/test-ssh-integration.sh
         run: bash deploy/hub/test-ssh-integration.sh
+
+  hub-mtls-integration:
+    name: hub HTTPS+mTLS integration test (M5-13)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    # M5-13 (ADR-0011): the milestone's exit-criterion test, mTLS-era
+    # replacement for `hub-ssh-integration` above (kept running side by
+    # side with it -- #125 removes the SSH path and its own job only
+    # once this one is proven green here). Same Postgres service
+    # container the other jobs use, for the same reason.
+    services:
+      postgres:
+        image: postgres@sha256:f1c3376c26f2609ab9f29f71f824103fe2fcd8ee0346485cb6122a4f93df6f94 # 16
+        env:
+          POSTGRES_PASSWORD: wkp_hub_ci
+          POSTGRES_DB: wkp_hub_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    env:
+      DATABASE_URL: postgres://postgres:wkp_hub_ci@localhost:5432/wkp_hub_test
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      # Unlike `hub-ssh-integration`, this job needs a real `wkp` (not
+      # just `wkp-hub`) on the runner itself: `test-mtls-integration.sh`
+      # drives the real RFC 8628 + CSR enrollment flow via the actual
+      # CLI a device would use, not an admin-CLI bypass, so it has to
+      # run outside the container, against the container's own mapped
+      # HTTPS port.
+      - uses: dtolnay/rust-toolchain@d1031067263f94b142dd6c0ce24c5eb9d02d52a0 # master, 2026-09-03
+        with:
+          toolchain: "1.98.1" # keep in sync with rust-toolchain.toml
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+
+      - name: cargo build --release -p wkp-cli
+        run: cargo build --release -p wkp-cli
+
+      # Rootless podman -- `ubuntu-latest` ships it already, this just
+      # confirms it rather than reinstalling.
+      - name: confirm podman is available
+        run: podman --version
+
+      - name: podman build -f deploy/hub/Containerfile
+        run: podman build -f deploy/hub/Containerfile -t wkp-hub .
+
+      # M5-13's own required integration test: register a device over
+      # the real CSR flow, push and fetch over HTTPS with mutual TLS,
+      # revoke it, attempt another push, confirm it fails at the TLS
+      # handshake itself.
+      - name: deploy/hub/test-mtls-integration.sh
+        env:
+          WKP_BIN: ${{ github.workspace }}/target/release/wkp
+        run: bash deploy/hub/test-mtls-integration.sh
