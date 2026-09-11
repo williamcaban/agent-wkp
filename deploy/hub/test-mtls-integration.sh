@@ -36,6 +36,7 @@ set -euo pipefail
 IMAGE="${WKP_HUB_IMAGE:-localhost/wkp-hub}"
 WKP_BIN="${WKP_BIN:-wkp}"
 CONTAINER_NAME="wkp-hub-mtls-integration-test"
+GIT_CLIENT_CONTAINER="wkp-hub-mtls-git-client"
 HTTPS_PORT="${WKP_HUB_TEST_HTTPS_PORT:-8443}"
 TENANT="mtls-integration-test"
 NETWORK_NAME="wkp-hub-tenants"
@@ -48,6 +49,7 @@ service_pid=""
 cleanup() {
     podman exec "$CONTAINER_NAME" /usr/local/bin/wkp-hub stop-pod "$TENANT" >/dev/null 2>&1 || true
     podman rm -f "$CONTAINER_NAME" >/dev/null 2>&1 || true
+    podman rm -f "$GIT_CLIENT_CONTAINER" >/dev/null 2>&1 || true
     [ -n "$service_pid" ] && kill "$service_pid" >/dev/null 2>&1 || true
     rm -rf "$WORKDIR"
 }
@@ -244,27 +246,53 @@ git -C "$CLIENT_DIR" -c user.email=test@example.com -c user.name=test add -A .wk
 git -C "$CLIENT_DIR" -c user.email=test@example.com -c user.name=test \
     commit -q -m "mtls integration test"
 
+# Runs `git` inside a throwaway Fedora 43 container rather than the
+# runner's own `git`, for the mTLS-authenticated calls specifically
+# (init/add/commit above and below need no TLS at all, so they stay on
+# the runner's own git). Found by hand, tracked as #136: `ubuntu-latest`
+# ships a `git` linked against GnuTLS, not OpenSSL (a longstanding
+# Debian/Ubuntu packaging choice), and GnuTLS's own client-certificate
+# loading in curl cannot parse this device identity's Ed25519 key at
+# all ("error reading X.509 key or certificate file") -- confirmed by
+# hand to be specific to Ed25519 client certs (an ECDSA one completes a
+# full handshake fine through the same GnuTLS-linked git/curl). This is
+# a **real product gap for actual Ubuntu/Debian users**, not just this
+# CI job -- #136 tracks the real fix (re-keying the shared device
+# identity, or a second mTLS-only key).
+#
+# The `wkp-hub` image itself (`fedora-minimal:41`) does *not* work
+# around this either, also found by hand: its own git is OpenSSL-linked
+# but fails the same key with a *different* OpenSSL-level error
+# ("unable to set private key file ... type PEM") -- an older-OpenSSL
+# PKCS8-Ed25519 quirk distinct from, but just as real as, the GnuTLS
+# one. Only a newer OpenSSL (confirmed: `fedora-minimal:43`, matching
+# this exact key/cert combination against a real local hub) loads it
+# cleanly, hence the separate image and version pin here rather than
+# reusing `$IMAGE`.
+#
+# Until #136's real fix lands, this workaround only proves the *hub's
+# own* mTLS mechanism (cert issuance, revocation-at-handshake) works
+# correctly -- it does not, and cannot, prove the device identity's
+# current key algorithm actually works for a real Ubuntu/Debian user.
+GIT_CLIENT_IMAGE="quay.io/fedora/fedora-minimal:43"
+podman run -d --name "$GIT_CLIENT_CONTAINER" --network host \
+    --security-opt label=disable \
+    -v "${WORKDIR}:${WORKDIR}" \
+    --entrypoint sleep \
+    "$GIT_CLIENT_IMAGE" infinity >/dev/null
+podman exec "$GIT_CLIENT_CONTAINER" \
+    microdnf install -y -q --setopt=install_weak_deps=0 git-core >/dev/null
+
 git_mtls() {
-    git -c "http.sslCert=$CLIENT_DIR/.wkp/hub-device-cert.pem" \
+    podman exec "$GIT_CLIENT_CONTAINER" git \
+        -c "http.sslCert=$CLIENT_DIR/.wkp/hub-device-cert.pem" \
         -c "http.sslKey=$CLIENT_DIR/.wkp/hub-device-key.pem" \
         -c "http.sslCAInfo=$WORKDIR/ca-cert.pem" \
         "$@"
 }
 
-# Diagnostic only, temporary: an Ed25519 client certificate is real
-# surface for a runner's own git/curl/OpenSSL build to disagree with
-# what this sandbox's own (much newer) OpenSSL happily parses and
-# presents -- printed once here, and GIT_CURL_VERBOSE on this first
-# push only, so a genuine environment-specific TLS failure shows its
-# actual OpenSSL-level reason instead of curl's generic wrapper
-# message alone.
-log "git/curl/openssl versions on this runner (diagnostic)"
-git --version
-curl --version | head -1
-openssl version
-
 log "pushing a shared item over HTTPS with mTLS -- this must succeed"
-GIT_CURL_VERBOSE=1 git_mtls -C "$CLIENT_DIR" push "https://127.0.0.1:${HTTPS_PORT}/${TENANT}.git" main
+git_mtls -C "$CLIENT_DIR" push --quiet "https://127.0.0.1:${HTTPS_PORT}/${TENANT}.git" main
 log "PASS: push succeeded for an active, registered device"
 
 log "fetching the same item back into a fresh clone -- this must succeed"
