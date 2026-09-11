@@ -79,8 +79,9 @@ ureq = { version = "3.4.1", default-features = false, features = ["json", "gzip"
 # M5-8 (ADR-0011): real TLS termination for the front door. Already in
 # this workspace's `Cargo.lock` at 0.23.44 (`ureq`'s own optional TLS
 # stack, which `default-features = false` above leaves unbuilt); this
-# makes it a direct dependency so `src/tls.rs` can drive the handshake
-# itself. `default-features = false` + `ring`: pin the crypto provider
+# makes it a direct dependency so `src/hub_ca.rs` can build the
+# `ServerConfig` the front door's acceptor presents.
+# `default-features = false` + `ring`: pin the crypto provider
 # to `ring`, the one already in this tree, rather than letting the
 # default pull in `aws-lc-rs`/`aws-lc-sys` -- a C library with `unsafe`
 # FFI, which is exactly the tradeoff ADR-0011 rejected OpenSSL over.
@@ -108,6 +109,36 @@ rustls = { version = "0.23", default-features = false, features = ["std", "ring"
 # without an intermediate re-parse.
 rcgen = { version = "0.14.10", default-features = false, features = ["ring", "pem", "x509-parser"] }
 rustls-pki-types = "1"
+# M5-8 (ADR-0011): the front door's HTTP listener, and only the front
+# door's. The rest of this crate stays deliberately synchronous
+# (`postgres`, `wkp-git`'s subprocesses, `ureq`) and `serve-tenant`
+# (the mode a tenant's own pod runs, plain HTTP inside the shared
+# podman network) stays on `tiny_http` untouched -- see
+# `src/front_door.rs`'s module doc. Why an async stack here at all,
+# against this crate's own grain: the front door is now the sole
+# process terminating client-facing TLS (ADR-0009/0010), and #124 has
+# to hang a custom `rustls` client-certificate verifier off that same
+# listener. `tiny_http`'s bundled TLS is pinned to rustls 0.20, which
+# has no usable client-verifier API, so keeping it would have meant
+# hand-rolling a TLS-terminating proxy in front of it -- novel,
+# security-critical code this project should not be writing itself
+# when `axum`/`axum-server` already do exactly this job and are far
+# more heavily audited. Security and long-term maintainability
+# outrank dependency-count here specifically (CLAUDE.md's priority 2
+# over priority 3), and the blast radius is one listener.
+# `default-features = false` on both: only what the front door
+# actually uses gets built.
+axum = { version = "0.8.9", default-features = false }
+# `tls-rustls-no-provider`, not `tls-rustls`: the latter forces
+# `rustls/aws-lc-rs`, a C library with `unsafe` FFI, which is exactly
+# what the `rustls`/`rcgen` entries above pin `ring` to avoid.
+axum-server = { version = "0.8.0", default-features = false, features = ["tls-rustls-no-provider"] }
+# The runtime `axum-server` needs, plus `spawn_blocking`: every
+# existing handler this crate re-serves through `axum` is blocking
+# (Postgres, `git http-backend`, `ureq` to a tenant pod) and none of
+# it is being converted to async -- it runs on the blocking pool
+# instead. Feature set kept to what that actually needs.
+tokio = { version = "1", default-features = false, features = ["rt-multi-thread", "net", "time"] }
 
 [dev-dependencies]
 # M5-4: `tenant_repo`'s own tests and `tests/post_receive_hook.rs` need a
