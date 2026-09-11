@@ -55,10 +55,6 @@ pub struct Device {
     pub public_key: String,
     pub created_at: OffsetDateTime,
     pub revoked_at: Option<OffsetDateTime>,
-    /// SHA-256 hex digest of this device's HTTPS bearer token (M5-6,
-    /// design 8.1), if it has one -- never the plaintext, which exists
-    /// only for the instant [`issue_bearer_token`] returns it.
-    pub bearer_token_hash: Option<String>,
     /// The device's hub-issued client certificate (M5-9, ADR-0011),
     /// PEM-encoded -- public information, set together with
     /// `cert_serial`/`cert_issued_at`/`cert_expires_at` by
@@ -67,10 +63,9 @@ pub struct Device {
     /// the admin CLI's raw-public-key bypass).
     pub certificate_pem: Option<String>,
     /// Hex-encoded serial number of `certificate_pem`. UNIQUE at the
-    /// schema level; the lookup #124/#128 will need (matching a
-    /// presented certificate's serial back to its device row for
-    /// revocation checks) is not implemented yet -- this column exists
-    /// so that later task has something to index against.
+    /// schema level and what [`find_device_by_cert_serial`] indexes on
+    /// -- the lookup `hub_ca`'s client-certificate verifier (M5-10)
+    /// makes on every mTLS handshake to check `revoked_at`.
     pub cert_serial: Option<String>,
     pub cert_issued_at: Option<OffsetDateTime>,
     pub cert_expires_at: Option<OffsetDateTime>,
@@ -260,10 +255,9 @@ pub fn find_idle_running_tenants(
 }
 
 /// Every column [`device_from_row`] reads -- named once for the same
-/// anti-drift reason [`TENANT_COLUMNS`] is, now that M5-9 added four
-/// certificate columns alongside `bearer_token_hash`.
+/// anti-drift reason [`TENANT_COLUMNS`] is.
 const DEVICE_COLUMNS: &str = "id, tenant_id, public_key, created_at, revoked_at, \
-     bearer_token_hash, certificate_pem, cert_serial, cert_issued_at, cert_expires_at";
+     certificate_pem, cert_serial, cert_issued_at, cert_expires_at";
 
 /// Registers a device's public key under `tenant_id` -- the write side
 /// of what M5-2's RFC 8628 flow calls once a grant is approved, and
@@ -310,50 +304,24 @@ pub fn find_device_by_id(client: &mut Client, device_id: i64) -> Result<Option<D
     Ok(row.as_ref().map(device_from_row))
 }
 
-/// A SHA-256 hex digest of `token` -- the only form of a bearer token
-/// this control plane ever stores or compares against (see
-/// [`Device::bearer_token_hash`]'s own doc comment).
-fn hash_bearer_token(token: &str) -> String {
-    use sha2::{Digest, Sha256};
-    let digest = Sha256::digest(token.as_bytes());
-    digest.iter().map(|b| format!("{b:02x}")).collect()
-}
-
-/// Issues a fresh HTTPS bearer token for an existing device (M5-6,
-/// design 8.1) -- overwrites any previous token that device had,
-/// which invalidates it, the same way rotating an API key does.
-/// Returns the plaintext token: this is the only moment it exists
-/// outside the caller's own hands, since only [`hash_bearer_token`]'s
-/// digest is ever persisted.
-pub fn issue_bearer_token(client: &mut Client, device_id: i64) -> Result<String, Error> {
-    let token = grants::random_hex(32)?;
-    let hash = hash_bearer_token(&token);
-    let updated = client.execute(
-        "UPDATE devices SET bearer_token_hash = $1 WHERE id = $2",
-        &[&hash, &device_id],
-    )?;
-    if updated == 0 {
-        return Err(Error::NotFound(format!("device {device_id}")));
-    }
-    Ok(token)
-}
-
-/// Looks up a device by presenting the bearer token a client claims
-/// (the reverse-proxy/CGI bridge's own job, M5-6) -- hashes `token`
-/// and compares against [`Device::bearer_token_hash`], never the
-/// plaintext. `Ok(None)` for an unknown token, the same "ordinary,
-/// expected outcome" shape [`find_device_by_public_key`] uses; callers
-/// still need their own `revoked_at` check, exactly as `wkp-shell`
-/// does for the SSH path -- this function does not filter revoked
-/// devices out itself.
-pub fn find_device_by_bearer_token(
+/// Looks up a device by its certificate's hex-encoded serial number --
+/// the lookup `hub_ca`'s client-certificate verifier (M5-10, ADR-0011)
+/// makes on every mTLS handshake, the certificate-based replacement for
+/// M5-6's now-removed `find_device_by_bearer_token`. `Ok(None)` for an
+/// unknown serial is the same "ordinary, expected outcome" shape
+/// [`find_device_by_public_key`] uses; a presented certificate that
+/// chains to the hub's own CA but names a serial this control plane has
+/// never issued should not be reachable in practice (the CA only signs
+/// what it also records here, in the same transaction-adjacent step --
+/// see [`issue_device_certificate`]), but a caller must still treat
+/// `Ok(None)` as a hard rejection, not an assumption violated.
+pub fn find_device_by_cert_serial(
     client: &mut Client,
-    token: &str,
+    cert_serial: &str,
 ) -> Result<Option<Device>, Error> {
-    let hash = hash_bearer_token(token);
     let row = client.query_opt(
-        &format!("SELECT {DEVICE_COLUMNS} FROM devices WHERE bearer_token_hash = $1"),
-        &[&hash],
+        &format!("SELECT {DEVICE_COLUMNS} FROM devices WHERE cert_serial = $1"),
+        &[&cert_serial],
     )?;
     Ok(row.as_ref().map(device_from_row))
 }
@@ -362,11 +330,11 @@ pub fn find_device_by_bearer_token(
 /// ADR-0011) -- the write side of what `handle_verify_submit` calls
 /// right after [`grants::approve_grant`] registers the device, once
 /// [`crate::hub_ca::HubCa::sign_device_csr`] has actually signed it.
-/// Overwrites any previous certificate the same way [`issue_bearer_token`]
-/// rotates a bearer token; callers that want idempotency (not minting a
-/// second certificate for a retried `/verify` submission) check
-/// `Device::certificate_pem` themselves before calling this, the same
-/// way [`grants::approve_grant`]'s own idempotency check works.
+/// Overwrites any previous certificate; callers that want idempotency
+/// (not minting a second certificate for a retried `/verify`
+/// submission) check `Device::certificate_pem` themselves before
+/// calling this, the same way [`grants::approve_grant`]'s own
+/// idempotency check works.
 pub fn issue_device_certificate(
     client: &mut Client,
     device_id: i64,
@@ -422,7 +390,6 @@ fn device_from_row(row: &Row) -> Device {
         public_key: row.get("public_key"),
         created_at: row.get("created_at"),
         revoked_at: row.get("revoked_at"),
-        bearer_token_hash: row.get("bearer_token_hash"),
         certificate_pem: row.get("certificate_pem"),
         cert_serial: row.get("cert_serial"),
         cert_issued_at: row.get("cert_issued_at"),
@@ -531,13 +498,18 @@ mod tests {
         assert!(device.certificate_pem.is_none());
         assert!(device.cert_serial.is_none());
 
+        // Unique per run, not a fixed literal -- `cert_serial` is
+        // UNIQUE, and this database persists across test runs (see
+        // `unique_slug`'s own doc comment), so a fixed literal here
+        // would collide with a previous run's leftover row.
+        let serial = unique_slug("deadbeef");
         let issued_at = OffsetDateTime::now_utc();
         let expires_at = issued_at + time::Duration::days(397);
         issue_device_certificate(
             &mut client,
             device.id,
             "-----BEGIN CERTIFICATE-----\nfake\n-----END CERTIFICATE-----\n",
-            "deadbeef",
+            &serial,
             issued_at,
             expires_at,
         )
@@ -550,7 +522,7 @@ mod tests {
             found.certificate_pem.as_deref(),
             Some("-----BEGIN CERTIFICATE-----\nfake\n-----END CERTIFICATE-----\n")
         );
-        assert_eq!(found.cert_serial.as_deref(), Some("deadbeef"));
+        assert_eq!(found.cert_serial.as_deref(), Some(serial.as_str()));
         assert!(found.cert_issued_at.is_some());
         assert!(found.cert_expires_at.is_some());
 
@@ -559,7 +531,7 @@ mod tests {
                 &mut client,
                 -1,
                 "-----BEGIN CERTIFICATE-----\nfake\n-----END CERTIFICATE-----\n",
-                "00000000",
+                &unique_slug("00000000"),
                 issued_at,
                 expires_at,
             ),
@@ -634,71 +606,39 @@ mod tests {
         );
     }
 
+    /// M5-10's own replacement for M5-6's bearer-token lookup: a device
+    /// is found by its certificate's serial number, and an unknown
+    /// serial is an ordinary `Ok(None)`, not an error.
     #[test]
-    fn issue_bearer_token_round_trips_and_never_stores_the_plaintext() {
+    fn find_device_by_cert_serial_round_trips_and_returns_none_for_unknown() {
         let mut client = connect().expect("connect");
-        let tenant = create_tenant(&mut client, &unique_slug("bearer-token")).expect("tenant");
+        let tenant = create_tenant(&mut client, &unique_slug("cert-serial")).expect("tenant");
         let device = register_device(&mut client, tenant.id, &unique_slug("device-key"))
             .expect("register_device");
-        assert!(
-            device.bearer_token_hash.is_none(),
-            "a freshly registered device has no bearer token yet"
-        );
+        assert!(device.cert_serial.is_none());
 
-        let token = issue_bearer_token(&mut client, device.id).expect("issue_bearer_token");
-        assert!(!token.is_empty());
+        // Unique per run -- see `unique_slug`'s own doc comment.
+        let serial = unique_slug("deadbeef");
+        issue_device_certificate(
+            &mut client,
+            device.id,
+            "-----BEGIN CERTIFICATE-----\nfake\n-----END CERTIFICATE-----\n",
+            &serial,
+            OffsetDateTime::now_utc(),
+            OffsetDateTime::now_utc() + time::Duration::days(397),
+        )
+        .expect("issue_device_certificate");
 
-        let found = find_device_by_bearer_token(&mut client, &token)
-            .expect("find_device_by_bearer_token")
-            .expect("device must be found by its own token");
+        let found = find_device_by_cert_serial(&mut client, &serial)
+            .expect("find_device_by_cert_serial")
+            .expect("device must be found by its own serial");
         assert_eq!(found.id, device.id);
-        assert_ne!(
-            found.bearer_token_hash.as_deref(),
-            Some(token.as_str()),
-            "the stored hash must never equal the plaintext token"
-        );
-    }
 
-    #[test]
-    fn find_device_by_bearer_token_returns_none_for_an_unknown_token() {
-        let mut client = connect().expect("connect");
         assert!(
-            find_device_by_bearer_token(&mut client, "this-token-was-never-issued")
-                .expect("find_device_by_bearer_token")
+            find_device_by_cert_serial(&mut client, &unique_slug("never-issued"))
+                .expect("find_device_by_cert_serial")
                 .is_none()
         );
-    }
-
-    /// Rotation: issuing a new token for the same device invalidates
-    /// the old one, the same way rotating an API key does.
-    #[test]
-    fn issuing_a_new_bearer_token_invalidates_the_previous_one() {
-        let mut client = connect().expect("connect");
-        let tenant = create_tenant(&mut client, &unique_slug("bearer-rotate")).expect("tenant");
-        let device = register_device(&mut client, tenant.id, &unique_slug("device-key"))
-            .expect("register_device");
-
-        let first = issue_bearer_token(&mut client, device.id).expect("first issue");
-        let second = issue_bearer_token(&mut client, device.id).expect("second issue");
-        assert_ne!(first, second);
-
-        assert!(
-            find_device_by_bearer_token(&mut client, &first)
-                .expect("find first")
-                .is_none(),
-            "the first token must no longer resolve to any device"
-        );
-        let found_second = find_device_by_bearer_token(&mut client, &second)
-            .expect("find second")
-            .expect("second token must resolve");
-        assert_eq!(found_second.id, device.id);
-    }
-
-    #[test]
-    fn issue_bearer_token_fails_for_an_unknown_device() {
-        let mut client = connect().expect("connect");
-        let result = issue_bearer_token(&mut client, -1);
-        assert!(matches!(result, Err(Error::NotFound(_))));
     }
 
     /// M5-7 (ADR-0010): a freshly created tenant starts on-demand

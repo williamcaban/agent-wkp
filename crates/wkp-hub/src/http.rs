@@ -43,6 +43,7 @@ use crate::control_plane::{self, grants};
 use crate::hub_ca::HubCa;
 use serde::{Deserialize, Serialize};
 use tiny_http::{Method, Response, StatusCode};
+use x509_parser::prelude::{FromDer, X509Certificate};
 
 /// One incoming request, reduced to the only two things any handler in
 /// this module ever reads: its headers and its body.
@@ -291,27 +292,59 @@ pub(crate) fn git_http_path(path: &str) -> Option<(String, String)> {
 /// already takes, M5-3), and only then hands the request off to `git
 /// http-backend` (`wkp_git::http_backend`, this crate's own plumbing
 /// for it).
+/// The three pieces [`git_http_path`] parses out of a request's URL,
+/// bundled into one argument so [`handle_git_http`] stays under
+/// clippy's `too_many_arguments` -- always produced and consumed
+/// together, never independently.
+#[derive(Clone, Copy)]
+pub(crate) struct GitHttpRoute<'a> {
+    pub(crate) tenant_slug: &'a str,
+    pub(crate) suffix: &'a str,
+    pub(crate) query: &'a str,
+}
+
 pub(crate) fn handle_git_http(
     request: &Incoming,
     method: &str,
-    tenant_slug: &str,
-    suffix: &str,
-    query: &str,
+    route: &GitHttpRoute,
     repos_root: &std::path::Path,
     image: &str,
+    peer_cert: Option<&rustls_pki_types::CertificateDer<'_>>,
 ) -> Rendered {
+    let GitHttpRoute {
+        tenant_slug,
+        suffix,
+        query,
+    } = *route;
     let method_str = match method {
         "GET" => "GET",
         "POST" => "POST",
         _ => return Rendered::status_only(405),
     };
 
-    let Some(token) = request
-        .header("Authorization")
-        .and_then(|v| v.strip_prefix("Bearer ").map(|t| t.trim().to_string()))
-    else {
+    // M5-10 (ADR-0011): authenticates via the TLS client certificate,
+    // not a bearer token. `RevocationAwareClientCertVerifier`
+    // (`crate::hub_ca`) already fully verified this certificate --
+    // chain, expiry, and the control plane's `revoked_at` state -- as
+    // part of completing the handshake; a certificate reaching here at
+    // all is proof of that. A connection with no certificate at all is
+    // the ordinary case for the RFC 8628/`/verify` routes on this same
+    // listener (client auth is requested but not mandatory at the TLS
+    // layer, see `PeerCertAcceptor`'s own doc comment); for this route
+    // it's simply unauthenticated, the same 401 a missing bearer token
+    // used to get.
+    let Some(peer_cert) = peer_cert else {
         return Rendered::status_only(401);
     };
+    let (_, cert) = match X509Certificate::from_der(peer_cert) {
+        Ok(parsed) => parsed,
+        Err(_) => return Rendered::status_only(401),
+    };
+    let cert_serial: String = cert
+        .raw_serial()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
 
     let mut client = match control_plane::connect() {
         Ok(c) => c,
@@ -320,14 +353,20 @@ pub(crate) fn handle_git_http(
             return Rendered::status_only(500);
         }
     };
-    let device = match control_plane::find_device_by_bearer_token(&mut client, &token) {
+    let device = match control_plane::find_device_by_cert_serial(&mut client, &cert_serial) {
         Ok(Some(d)) => d,
         Ok(None) => return Rendered::status_only(401),
         Err(e) => {
-            eprintln!("wkp-hub: git-http: bearer token lookup failed: {e}");
+            eprintln!("wkp-hub: git-http: certificate lookup failed: {e}");
             return Rendered::status_only(500);
         }
     };
+    // Defense in depth: the verifier already rejected a revoked
+    // device's certificate at the handshake (ADR-0011's addendum makes
+    // that the primary guarantee, per-handshake). Checking again here
+    // costs nothing and matches the same belt-and-suspenders posture
+    // `wkp-shell`'s SSH path (M5-3) already takes over its own
+    // `AuthorizedKeysCommand` pre-filtering.
     if device.revoked_at.is_some() {
         return Rendered::status_only(401);
     }

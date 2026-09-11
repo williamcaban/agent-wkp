@@ -53,17 +53,6 @@ time = "0.3"
 # endpoints has no real concurrency need an async framework would
 # justify.
 tiny_http = "0.12.0"
-# M5-6: hashing a device's HTTPS bearer token before storing it
-# (CLAUDE.md's secrets rule extends naturally to "never store the
-# plaintext of a credential you validate later," the same reasoning a
-# password hash follows -- SHA-256, not a slow password hash, is the
-# right tool here specifically because this secret is high-entropy and
-# machine-generated, not user-chosen: there is no offline dictionary
-# attack a slow hash would need to defend against). Already present in
-# this workspace's dependency tree transitively (`age`/`ssh-key`'s own
-# use); this just makes it a direct dependency instead of duplicating
-# a hash implementation.
-sha2 = "0.11.0"
 # M5-7 (ADR-0009/0010): the front door proxies a git-http request to
 # the resolved tenant's own pod over the shared network rather than
 # running `git http-backend` itself -- was a dev-only dependency (M5-2's
@@ -109,6 +98,21 @@ rustls = { version = "0.23", default-features = false, features = ["std", "ring"
 # without an intermediate re-parse.
 rcgen = { version = "0.14.10", default-features = false, features = ["ring", "pem", "x509-parser"] }
 rustls-pki-types = "1"
+# M5-10 (ADR-0011): `RevocationAwareClientCertVerifier` (`src/hub_ca.rs`)
+# needs to read a presented client certificate's serial number back out
+# of its DER at handshake time, to look it up in the control plane's
+# `devices.cert_serial`. Already resolved in this workspace's
+# `Cargo.lock` -- `rcgen`'s own `x509-parser` feature above pulls it in
+# transitively for CSR parsing -- so this makes it a direct dependency
+# rather than a second, hand-rolled ASN.1 parser: the exact same
+# "mature, audited library over novel security-critical code" call
+# ADR-0011 already made for TLS itself (see `axum`/`axum-server`'s own
+# comment below). `default-features = false`: this crate only ever
+# reads an already chain-validated certificate's serial number, never
+# builds or cryptographically verifies one itself (`rustls` already did
+# that by the time this runs) -- no need for the `verify`/`validate`
+# features.
+x509-parser = { version = "0.18", default-features = false }
 # M5-8 (ADR-0011): the front door's HTTP listener, and only the front
 # door's. The rest of this crate stays deliberately synchronous
 # (`postgres`, `wkp-git`'s subprocesses, `ureq`) and `serve-tenant`
@@ -139,6 +143,19 @@ axum-server = { version = "0.8.0", default-features = false, features = ["tls-ru
 # it is being converted to async -- it runs on the blocking pool
 # instead. Feature set kept to what that actually needs.
 tokio = { version = "1", default-features = false, features = ["rt-multi-thread", "net", "time"] }
+# M5-10 (ADR-0011): `front_door::PeerCertAcceptor` wraps `axum-server`'s
+# `RustlsAcceptor` to read the peer certificate off the completed
+# handshake (`tokio_rustls::server::TlsStream::get_ref`) and inject it
+# as a per-connection request extension (`axum::Extension` +
+# `tower_layer::Layer`) -- both already in this workspace's `Cargo.lock`
+# transitively (`axum-server`'s own dependency tree), made direct here
+# because `front_door.rs` names their types explicitly rather than only
+# through `axum-server`'s own re-exports. `tower-layer` rather than the
+# full `tower` crate: only the `Layer` trait itself is needed, not
+# `tower`'s service/middleware machinery this crate has no other use
+# for.
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring"] }
+tower-layer = "0.3"
 
 [dev-dependencies]
 # M5-4: `tenant_repo`'s own tests and `tests/post_receive_hook.rs` need a

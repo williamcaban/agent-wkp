@@ -34,10 +34,14 @@ use axum::body::Bytes;
 use axum::extract::{Request, State};
 use axum::response::Response;
 use axum::routing::{get, post};
-use axum::Router;
-use axum_server::tls_rustls::RustlsConfig;
+use axum::{Extension, Router};
+use axum_server::accept::Accept;
+use axum_server::tls_rustls::{RustlsAcceptor, RustlsConfig};
+use rustls_pki_types::CertificateDer;
 use std::path::PathBuf;
 use std::sync::Arc;
+use tokio::io::{AsyncRead, AsyncWrite};
+use tower_layer::Layer;
 
 /// The most of a request body the front door will buffer. `tiny_http`
 /// read bodies unbounded before this; a cap is strictly better against
@@ -87,6 +91,13 @@ pub fn serve_on(
     let tls = RustlsConfig::from_config(Arc::new(tls));
 
     let app = router(repos_root, image, ca.clone());
+    // M5-10 (ADR-0011): wraps the plain `RustlsAcceptor` to pull the
+    // peer certificate (if any) out of each connection's completed TLS
+    // handshake and inject it as a request extension -- see
+    // `PeerCertAcceptor`'s own doc comment for why this, rather than
+    // `handle_git_http` reaching for it some other way, is where that
+    // has to happen.
+    let acceptor = PeerCertAcceptor::new(RustlsAcceptor::new(tls));
 
     // `enable_all` rather than a hand-picked reactor set: `axum-server`
     // needs both the I/O driver (for the listener) and the timer.
@@ -95,14 +106,91 @@ pub fn serve_on(
         .build()?;
     runtime.block_on(async move {
         // Tokio requires a non-blocking listener when adopting one from
-        // `std`; `axum_server::from_tcp_rustls` hands it straight to
+        // `std`; `axum_server::from_tcp` hands it straight to
         // `tokio::net::TcpListener::from_std`.
         listener.set_nonblocking(true)?;
-        axum_server::from_tcp_rustls(listener, tls)?
+        axum_server::from_tcp(listener)?
+            .acceptor(acceptor)
             .serve(app.into_make_service())
             .await
     })?;
     Ok(())
+}
+
+/// The end-entity (leaf) certificate a client presented during the TLS
+/// handshake, if any -- `None` for a connection that completed the
+/// handshake with no certificate at all, which
+/// [`RevocationAwareClientCertVerifier`](crate::hub_ca) permits (client
+/// auth is requested but not mandatory at the TLS layer; see that
+/// type's own doc comment). Injected once per connection by
+/// [`PeerCertAcceptor`], read by [`git_http`] via axum's `Extension`
+/// extractor.
+///
+/// A certificate that *is* present here was already fully verified --
+/// chain, expiry, and the control plane's `revoked_at` state -- by the
+/// time the handshake completed; nothing downstream needs to re-check
+/// any of that, only which device it names.
+#[derive(Clone)]
+struct PeerCertificate(Option<CertificateDer<'static>>);
+
+/// Wraps [`RustlsAcceptor`] to extract the peer certificate from each
+/// connection's completed handshake and inject it as a request
+/// extension every request on that connection can read.
+///
+/// **Why here, and not inside a handler or the `ClientCertVerifier`
+/// itself.** `rustls`'s `ClientCertVerifier` (`crate::hub_ca`) runs
+/// during the handshake and has no way to hand data forward to the
+/// HTTP layer -- it can only accept or reject the connection.
+/// `axum`/`axum-server` expose the verified peer certificate on the
+/// underlying `tokio_rustls::server::TlsStream` (`stream.get_ref().1`),
+/// which is only reachable at the point a connection is accepted, not
+/// from inside a `Router` handler. This acceptor is that point: it
+/// reads the certificate once per connection (not once per request --
+/// an HTTP/1.1 keep-alive connection can carry several requests) and
+/// wraps the per-connection `Service` with an [`Extension`] layer so
+/// every request downstream sees the same value, the pattern
+/// `axum-server`'s own `rustls_session` example documents for exactly
+/// this class of "need data from the TLS layer in a handler" need.
+#[derive(Clone)]
+struct PeerCertAcceptor {
+    inner: RustlsAcceptor,
+}
+
+impl PeerCertAcceptor {
+    fn new(inner: RustlsAcceptor) -> Self {
+        PeerCertAcceptor { inner }
+    }
+}
+
+impl<I, S> Accept<I, S> for PeerCertAcceptor
+where
+    I: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    S: Send + 'static,
+{
+    type Stream = tokio_rustls::server::TlsStream<I>;
+    type Service = axum::middleware::AddExtension<S, PeerCertificate>;
+    type Future = std::pin::Pin<
+        Box<
+            dyn std::future::Future<Output = std::io::Result<(Self::Stream, Self::Service)>> + Send,
+        >,
+    >;
+
+    fn accept(&self, stream: I, service: S) -> Self::Future {
+        let inner = self.inner.clone();
+        Box::pin(async move {
+            let (stream, service) = inner.accept(stream, service).await?;
+            let peer_cert = PeerCertificate(
+                stream
+                    .get_ref()
+                    .1
+                    .peer_certificates()
+                    .and_then(|certs| certs.first())
+                    .cloned(),
+            );
+            let service = Extension(peer_cert).layer(service);
+            Ok((stream, service))
+        })
+    }
 }
 
 /// The front door's routes. Public to this crate so a test can drive
@@ -231,7 +319,11 @@ async fn verify_submit(State(state): State<Arc<FrontDoorState>>, request: Reques
     }
 }
 
-async fn git_http(State(state): State<Arc<FrontDoorState>>, request: Request) -> Response {
+async fn git_http(
+    State(state): State<Arc<FrontDoorState>>,
+    Extension(PeerCertificate(peer_cert)): Extension<PeerCertificate>,
+    request: Request,
+) -> Response {
     let (method, path, query, incoming) = match split(request).await {
         Ok(parts) => parts,
         Err(response) => return *response,
@@ -240,14 +332,18 @@ async fn git_http(State(state): State<Arc<FrontDoorState>>, request: Request) ->
         return into_response(Rendered::not_found());
     };
     blocking(move || {
+        let route = http::GitHttpRoute {
+            tenant_slug: &tenant_slug,
+            suffix: &suffix,
+            query: &query,
+        };
         http::handle_git_http(
             &incoming,
             &method,
-            &tenant_slug,
-            &suffix,
-            &query,
+            &route,
             &state.repos_root,
             &state.image,
+            peer_cert.as_ref(),
         )
     })
     .await
@@ -257,6 +353,7 @@ async fn git_http(State(state): State<Arc<FrontDoorState>>, request: Request) ->
 mod tests {
     use super::*;
     use crate::control_plane::{self, create_tenant};
+    use rustls_pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer};
     use std::io::{Read, Write};
     use std::net::TcpListener;
 
@@ -289,6 +386,13 @@ mod tests {
     struct TestFrontDoor {
         port: u16,
         root_pem: String,
+        /// The same CA the running server uses (`HubCa` derives
+        /// `Clone`) -- so a test can mint and sign a device certificate
+        /// directly (`ca.sign_device_csr`) without going through the
+        /// RFC 8628 HTTP flow, the same way this module already seeds a
+        /// tenant directly via `control_plane::create_tenant` rather
+        /// than an admin HTTP endpoint.
+        ca: HubCa,
         _ca_dir: tempfile::TempDir,
     }
 
@@ -308,15 +412,17 @@ mod tests {
             .tempdir()
             .expect("temp dir")
             .keep();
+        let server_ca = ca.clone();
         std::thread::spawn(move || {
             // The image name is irrelevant here: no test in this module
             // reaches the tenant-pod cold-start path.
-            let _ = serve_on(listener, &ca, repos_root, "unused".to_string());
+            let _ = serve_on(listener, &server_ca, repos_root, "unused".to_string());
         });
 
         TestFrontDoor {
             port,
             root_pem,
+            ca,
             _ca_dir: ca_dir,
         }
     }
@@ -325,19 +431,43 @@ mod tests {
     /// nothing else -- `rustls` directly rather than a new
     /// dev-dependency, and deliberately no public trust bundle (issue
     /// #122's own acceptance criterion, and the reason there is no
-    /// `webpki-roots` anywhere in this crate).
+    /// `webpki-roots` anywhere in this crate). Panics on any failure,
+    /// including a rejected TLS handshake -- the right behavior for
+    /// every caller except the M5-10 tests that deliberately expect a
+    /// handshake to fail, which call [`tls_request_with_identity`]
+    /// directly instead.
     fn tls_request(front_door: &TestFrontDoor, request: &str) -> (u16, String) {
+        tls_request_with_identity(front_door, request, None).expect("the TLS request must succeed")
+    }
+
+    /// Like [`tls_request`], but optionally presents a client
+    /// certificate (M5-10, ADR-0011) and returns `Err` instead of
+    /// panicking if the handshake itself is rejected -- the shape
+    /// `RevocationAwareClientCertVerifier` rejecting a certificate
+    /// takes (the connection never completes, so there is no HTTP
+    /// response to parse at all), distinct from a connection that
+    /// completed and got an ordinary 401/404 from `handle_git_http`.
+    fn tls_request_with_identity(
+        front_door: &TestFrontDoor,
+        request: &str,
+        client_identity: Option<(Vec<CertificateDer<'static>>, PrivateKeyDer<'static>)>,
+    ) -> std::io::Result<(u16, String)> {
         let mut roots = rustls::RootCertStore::empty();
         for cert in pem_certs(&front_door.root_pem) {
             roots.add(cert).expect("trust the hub's own root");
         }
-        let config = rustls::ClientConfig::builder_with_provider(Arc::new(
+        let builder = rustls::ClientConfig::builder_with_provider(Arc::new(
             rustls::crypto::ring::default_provider(),
         ))
         .with_safe_default_protocol_versions()
         .expect("protocol versions")
-        .with_root_certificates(roots)
-        .with_no_client_auth();
+        .with_root_certificates(roots);
+        let config = match client_identity {
+            Some((chain, key)) => builder
+                .with_client_auth_cert(chain, key)
+                .expect("valid client-auth certificate/key material"),
+            None => builder.with_no_client_auth(),
+        };
 
         let server_name = rustls_pki_types::ServerName::try_from("localhost").expect("server name");
         let mut connection = rustls::ClientConnection::new(Arc::new(config), server_name)
@@ -363,8 +493,7 @@ mod tests {
 
         stream
             .write_all(request.as_bytes())
-            .expect("write the request over TLS");
-        stream.flush().expect("flush");
+            .and_then(|_| stream.flush())?;
         let mut raw = Vec::new();
         // `UnexpectedEof` is how a server that closed the connection
         // without a TLS close_notify shows up; the response itself is
@@ -372,7 +501,7 @@ mod tests {
         match stream.read_to_end(&mut raw) {
             Ok(_) => {}
             Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {}
-            Err(e) => panic!("reading the response failed: {e}"),
+            Err(e) => return Err(e),
         }
 
         let text = String::from_utf8_lossy(&raw).into_owned();
@@ -385,7 +514,7 @@ mod tests {
             .and_then(|line| line.split_whitespace().nth(1))
             .and_then(|code| code.parse::<u16>().ok())
             .unwrap_or_else(|| panic!("no status line in response: {head:?}"));
-        (status, body.to_string())
+        Ok((status, body.to_string()))
     }
 
     fn pem_certs(pem: &str) -> Vec<rustls_pki_types::CertificateDer<'static>> {
@@ -450,14 +579,23 @@ mod tests {
         )
     }
 
-    fn get(front_door: &TestFrontDoor, path: &str, bearer: Option<&str>) -> (u16, String) {
-        let auth = bearer
-            .map(|t| format!("Authorization: Bearer {t}\r\n"))
-            .unwrap_or_default();
-        tls_request(
+    /// A GET, optionally presenting a client certificate (M5-10,
+    /// ADR-0011) -- the certificate-based replacement for M5-6's own
+    /// `Authorization: Bearer` header. Panics if the handshake itself
+    /// is rejected; callers expecting that (an untrusted-CA, expired,
+    /// or revoked certificate) call [`tls_request_with_identity`]
+    /// directly instead, to assert on the `Err` rather than panic.
+    fn get(
+        front_door: &TestFrontDoor,
+        path: &str,
+        client_identity: Option<(Vec<CertificateDer<'static>>, PrivateKeyDer<'static>)>,
+    ) -> (u16, String) {
+        tls_request_with_identity(
             front_door,
-            &format!("GET {path} HTTP/1.1\r\nHost: localhost\r\n{auth}Connection: close\r\n\r\n"),
+            &format!("GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"),
+            client_identity,
         )
+        .expect("the TLS request must succeed")
     }
 
     /// #122's own acceptance criterion for TLS termination: the front
@@ -645,48 +783,121 @@ mod tests {
         assert_eq!(parsed["error"], "invalid_csr");
     }
 
-    /// M5-6's own fixture, unchanged apart from the transport: a real
-    /// bare repo under a fresh `repos_root`, a tenant row, and a device
-    /// with a freshly issued bearer token.
+    /// A real device certificate, signed by `front_door`'s own CA and
+    /// registered through the same control-plane calls
+    /// `handle_verify_submit` makes for a real enrollment, along with
+    /// the rustls-ready key material needed to present it in a TLS
+    /// client-auth handshake. Built directly via `rcgen`, not through
+    /// `wkp_crypto::signing_identity` -- that module has no reason to
+    /// expose its key in a TLS-library-ready form; only these git-http
+    /// auth tests need that.
+    fn issue_device_cert(
+        front_door: &TestFrontDoor,
+        tenant_id: i64,
+    ) -> (
+        control_plane::Device,
+        Vec<CertificateDer<'static>>,
+        PrivateKeyDer<'static>,
+    ) {
+        let key_pair =
+            rcgen::KeyPair::generate_for(&rcgen::PKCS_ED25519).expect("generate key pair");
+        let csr_pem = rcgen::CertificateParams::default()
+            .serialize_request(&key_pair)
+            .expect("serialize_request")
+            .pem()
+            .expect("pem");
+        let signed = front_door
+            .ca
+            .sign_device_csr(&csr_pem, "test device")
+            .expect("sign_device_csr");
+        let public_key = wkp_crypto::signing_identity::openssh_public_key_from_raw_ed25519(
+            &signed.public_key_raw,
+        )
+        .expect("openssh_public_key_from_raw_ed25519");
+
+        let mut client = control_plane::connect().expect("connect");
+        let device = control_plane::register_device(&mut client, tenant_id, &public_key)
+            .expect("register_device");
+        control_plane::issue_device_certificate(
+            &mut client,
+            device.id,
+            &signed.certificate_pem,
+            &signed.serial_hex,
+            signed.not_before,
+            signed.not_after,
+        )
+        .expect("issue_device_certificate");
+
+        let cert_chain = pem_certs(&signed.certificate_pem);
+        let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(key_pair.serialize_der()));
+        (device, cert_chain, key)
+    }
+
+    /// An already-expired device certificate, signed directly against
+    /// `front_door`'s own CA. `HubCa::sign_device_csr` has no
+    /// configurable validity window -- production code never has a
+    /// reason to mint anything but a currently-valid certificate -- so
+    /// this duplicates its signing shape (via the same public
+    /// `HubCa::issuer` seam) with an explicit past `not_before`/
+    /// `not_after` instead, test-only. Not registered in the control
+    /// plane at all: an expired certificate must be rejected by
+    /// ordinary TLS chain validation before the verifier's own
+    /// revocation lookup ever runs, so there is nothing to seed.
+    fn issue_expired_device_cert(
+        front_door: &TestFrontDoor,
+    ) -> (Vec<CertificateDer<'static>>, PrivateKeyDer<'static>) {
+        let key_pair =
+            rcgen::KeyPair::generate_for(&rcgen::PKCS_ED25519).expect("generate key pair");
+        let issuer = front_door.ca.issuer().expect("issuer");
+        let mut params = rcgen::CertificateParams::default();
+        params.is_ca = rcgen::IsCa::ExplicitNoCa;
+        params.not_before = time::OffsetDateTime::now_utc() - time::Duration::days(30);
+        params.not_after = time::OffsetDateTime::now_utc() - time::Duration::days(1);
+        let cert = params.signed_by(&key_pair, &issuer).expect("signed_by");
+
+        let cert_chain = pem_certs(&cert.pem());
+        let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(key_pair.serialize_der()));
+        (cert_chain, key)
+    }
+
+    /// M5-6's own fixture shape, unchanged apart from the credential
+    /// (M5-10, ADR-0011: a hub-signed client certificate, not a bearer
+    /// token): a real bare repo under a fresh `repos_root`, a tenant
+    /// row, and a device holding a freshly issued certificate.
     struct GitHttpFixture {
         front_door: TestFrontDoor,
         tenant_slug: String,
-        token: String,
+        device_id: i64,
+        cert_chain: Vec<CertificateDer<'static>>,
+        key: PrivateKeyDer<'static>,
     }
 
     fn set_up_git_http_fixture() -> GitHttpFixture {
+        let front_door = start_front_door();
         let tenant_slug = unique_slug("git-https");
         let mut client = control_plane::connect().expect("connect");
         let tenant = create_tenant(&mut client, &tenant_slug).expect("create_tenant");
-        let device = control_plane::register_device(
-            &mut client,
-            tenant.id,
-            &unique_slug("ssh-ed25519 AAAA...git-https"),
-        )
-        .expect("register_device");
-        let token =
-            control_plane::issue_bearer_token(&mut client, device.id).expect("issue_bearer_token");
+        let (device, cert_chain, key) = issue_device_cert(&front_door, tenant.id);
 
         GitHttpFixture {
-            front_door: start_front_door(),
+            front_door,
             tenant_slug,
-            token,
+            device_id: device.id,
+            cert_chain,
+            key,
         }
     }
 
-    /// M5-6's own explicit acceptance criterion (a valid, active
-    /// device's token is accepted) still holds after M5-7 changed what
-    /// happens *next* on acceptance (the front door proxies to the
-    /// resolved tenant's own pod instead of serving `git http-backend`
-    /// itself) and after M5-8 changed the transport underneath it.
-    /// What this proves directly: a valid, active,
-    /// correctly-tenant-matched token is never rejected by
-    /// `handle_git_http`'s own auth checks (401/404) -- whatever
-    /// happens after that (a successful proxy, or a 502/503 because no
-    /// pod is actually running here) is a separate concern, covered by
+    /// M5-10's own explicit acceptance criterion: a valid device
+    /// certificate's push/fetch succeeds. What this proves directly: a
+    /// valid, active, correctly-tenant-matched certificate is never
+    /// rejected by the TLS handshake or by `handle_git_http`'s own
+    /// auth checks (401/404) -- whatever happens after that (a
+    /// successful proxy, or a 502/503 because no pod is actually
+    /// running here) is a separate concern, covered by
     /// `deploy/hub/test-pod-lifecycle.sh` against a real pod.
     #[test]
-    fn a_valid_active_devices_token_passes_auth_and_reaches_the_proxy_step() {
+    fn a_valid_active_devices_certificate_passes_auth_and_reaches_the_proxy_step() {
         let fixture = set_up_git_http_fixture();
         let (status, _) = get(
             &fixture.front_door,
@@ -694,12 +905,15 @@ mod tests {
                 "/{}.git/info/refs?service=git-upload-pack",
                 fixture.tenant_slug
             ),
-            Some(&fixture.token),
+            Some((fixture.cert_chain, fixture.key)),
         );
-        assert_ne!(status, 401, "a valid, active token must not be rejected");
+        assert_ne!(
+            status, 401,
+            "a valid, active certificate must not be rejected"
+        );
         assert_ne!(
             status, 404,
-            "a token correctly matched to its own tenant must not 404"
+            "a certificate correctly matched to its own tenant must not 404"
         );
         // The cold-start attempt above creates a real (empty, since
         // this module's own test setup passes a deliberately invalid
@@ -710,7 +924,7 @@ mod tests {
     }
 
     #[test]
-    fn git_http_rejects_a_request_with_no_bearer_token() {
+    fn git_http_rejects_a_request_with_no_client_certificate() {
         let fixture = set_up_git_http_fixture();
         let (status, _) = get(
             &fixture.front_door,
@@ -723,53 +937,105 @@ mod tests {
         assert_eq!(status, 401);
     }
 
+    /// M5-10's own explicit acceptance criterion: a certificate not
+    /// signed by the hub's own CA is rejected -- at the TLS handshake
+    /// itself, never reaching `handle_git_http` at all (there is no
+    /// HTTP response to check a status code on).
     #[test]
-    fn git_http_rejects_an_unknown_token() {
+    fn git_http_rejects_a_certificate_from_an_untrusted_ca() {
         let fixture = set_up_git_http_fixture();
-        let (status, _) = get(
+        let other_dir = tempfile::tempdir().expect("temp dir");
+        let unrelated_ca = HubCa::ensure(other_dir.path()).expect("an unrelated CA");
+        let key_pair =
+            rcgen::KeyPair::generate_for(&rcgen::PKCS_ED25519).expect("generate key pair");
+        let csr_pem = rcgen::CertificateParams::default()
+            .serialize_request(&key_pair)
+            .expect("serialize_request")
+            .pem()
+            .expect("pem");
+        let signed = unrelated_ca
+            .sign_device_csr(&csr_pem, "test device")
+            .expect("sign_device_csr");
+        let cert_chain = pem_certs(&signed.certificate_pem);
+        let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(key_pair.serialize_der()));
+
+        let result = tls_request_with_identity(
             &fixture.front_door,
             &format!(
-                "/{}.git/info/refs?service=git-upload-pack",
+                "GET /{}.git/info/refs?service=git-upload-pack HTTP/1.1\r\n\
+                 Host: localhost\r\nConnection: close\r\n\r\n",
                 fixture.tenant_slug
             ),
-            Some("this-token-was-never-issued"),
+            Some((cert_chain, key)),
         );
-        assert_eq!(status, 401);
+        assert!(
+            result.is_err(),
+            "a certificate from an unrelated CA must fail the handshake, not just 401"
+        );
     }
 
-    /// M5-6's own explicit acceptance criterion: a revoked device's
-    /// token is rejected.
+    /// M5-10's own explicit acceptance criterion: an expired
+    /// certificate is rejected, at the handshake -- ordinary TLS chain
+    /// validation, before the verifier's own revocation lookup ever
+    /// runs (there is nothing to look up: this certificate was never
+    /// registered in the control plane at all).
     #[test]
-    fn git_http_rejects_a_revoked_devices_token() {
+    fn git_http_rejects_an_expired_certificate() {
+        let fixture = set_up_git_http_fixture();
+        let (cert_chain, key) = issue_expired_device_cert(&fixture.front_door);
+
+        let result = tls_request_with_identity(
+            &fixture.front_door,
+            &format!(
+                "GET /{}.git/info/refs?service=git-upload-pack HTTP/1.1\r\n\
+                 Host: localhost\r\nConnection: close\r\n\r\n",
+                fixture.tenant_slug
+            ),
+            Some((cert_chain, key)),
+        );
+        assert!(
+            result.is_err(),
+            "an expired certificate must fail the handshake"
+        );
+    }
+
+    /// M5-10's own explicit acceptance criterion: a revoked device's
+    /// certificate is rejected -- checked at the verifier itself
+    /// (ADR-0011's addendum: fail-closed, per-handshake), so this
+    /// fails the handshake outright rather than getting an ordinary
+    /// 401 from `handle_git_http`.
+    #[test]
+    fn git_http_rejects_a_revoked_devices_certificate() {
         let fixture = set_up_git_http_fixture();
         let mut client = control_plane::connect().expect("connect");
-        let device = control_plane::find_device_by_bearer_token(&mut client, &fixture.token)
-            .expect("find_device_by_bearer_token")
-            .expect("device must exist");
-        control_plane::revoke_device(&mut client, device.id).expect("revoke_device");
+        control_plane::revoke_device(&mut client, fixture.device_id).expect("revoke_device");
 
-        let (status, _) = get(
+        let result = tls_request_with_identity(
             &fixture.front_door,
             &format!(
-                "/{}.git/info/refs?service=git-upload-pack",
+                "GET /{}.git/info/refs?service=git-upload-pack HTTP/1.1\r\n\
+                 Host: localhost\r\nConnection: close\r\n\r\n",
                 fixture.tenant_slug
             ),
-            Some(&fixture.token),
+            Some((fixture.cert_chain, fixture.key)),
         );
-        assert_eq!(status, 401);
+        assert!(
+            result.is_err(),
+            "a revoked device's certificate must fail the handshake"
+        );
     }
 
-    /// A token valid for one tenant must never reach another tenant's
-    /// repo -- `handle_git_http`'s own explicit check, unchanged by the
-    /// move to a TLS listener.
+    /// A certificate valid for one tenant must never reach another
+    /// tenant's repo -- `handle_git_http`'s own explicit check,
+    /// unchanged by the move from bearer tokens to certificates.
     #[test]
-    fn git_http_rejects_a_token_used_against_a_different_tenant() {
+    fn git_http_rejects_a_certificate_used_against_a_different_tenant() {
         let fixture = set_up_git_http_fixture();
         let other_tenant_slug = unique_slug("git-https-other-tenant");
         let (status, _) = get(
             &fixture.front_door,
             &format!("/{other_tenant_slug}.git/info/refs?service=git-upload-pack"),
-            Some(&fixture.token),
+            Some((fixture.cert_chain, fixture.key)),
         );
         assert_eq!(status, 404);
     }

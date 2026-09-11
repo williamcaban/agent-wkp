@@ -4150,15 +4150,17 @@ dependencies = [
  "rustls-pki-types",
  "serde",
  "serde_json",
- "sha2 0.11.0",
  "tempfile",
  "time",
  "tiny_http",
  "tokio",
+ "tokio-rustls",
+ "tower-layer",
  "ureq",
  "wkp-core",
  "wkp-crypto",
  "wkp-git",
+ "x509-parser",
 ]
 
 [[package]]
