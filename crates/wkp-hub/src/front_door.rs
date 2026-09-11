@@ -59,6 +59,10 @@ struct FrontDoorState {
     /// this state outlives `serve_on`'s own stack frame for as long as
     /// the server runs. `HubCa` derives `Clone` for exactly this.
     ca: HubCa,
+    /// ADR-0012: resolved once when the server starts, not per request
+    /// -- `handle_git_http`'s on-demand cold-start path (`git_http`
+    /// below) is the only thing that ever calls it.
+    orchestrator: Arc<dyn crate::tenant_pod::PodOrchestrator>,
 }
 
 /// Run the front door on `port`, terminating TLS with a certificate
@@ -90,7 +94,9 @@ pub fn serve_on(
     tls.alpn_protocols = vec![b"http/1.1".to_vec()];
     let tls = RustlsConfig::from_config(Arc::new(tls));
 
-    let app = router(repos_root, image, ca.clone());
+    let orchestrator: Arc<dyn crate::tenant_pod::PodOrchestrator> =
+        Arc::from(crate::tenant_pod::orchestrator()?);
+    let app = router(repos_root, image, ca.clone(), orchestrator);
     // M5-10 (ADR-0011): wraps the plain `RustlsAcceptor` to pull the
     // peer certificate (if any) out of each connection's completed TLS
     // handshake and inject it as a request extension -- see
@@ -195,11 +201,17 @@ where
 
 /// The front door's routes. Public to this crate so a test can drive
 /// the same router the real `serve` does, rather than a stand-in.
-fn router(repos_root: PathBuf, image: String, ca: HubCa) -> Router {
+fn router(
+    repos_root: PathBuf,
+    image: String,
+    ca: HubCa,
+    orchestrator: Arc<dyn crate::tenant_pod::PodOrchestrator>,
+) -> Router {
     let state = Arc::new(FrontDoorState {
         repos_root,
         image,
         ca,
+        orchestrator,
     });
     Router::new()
         .route("/device/code", post(device_code))
@@ -343,6 +355,7 @@ async fn git_http(
             &route,
             &state.repos_root,
             &state.image,
+            state.orchestrator.as_ref(),
             peer_cert.as_ref(),
         )
     })
@@ -920,7 +933,9 @@ mod tests {
         // image name) podman pod even though the actual `podman run`
         // inside it fails -- cleaned up here rather than leaking one
         // `wkp-tenant-<slug>` pod per test run indefinitely.
-        let _ = crate::tenant_pod::stop_pod(&fixture.tenant_slug);
+        if let Ok(orchestrator) = crate::tenant_pod::orchestrator() {
+            let _ = orchestrator.stop_pod(&fixture.tenant_slug);
+        }
     }
 
     #[test]

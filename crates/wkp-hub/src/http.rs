@@ -309,6 +309,7 @@ pub(crate) fn handle_git_http(
     route: &GitHttpRoute,
     repos_root: &std::path::Path,
     image: &str,
+    orchestrator: &dyn crate::tenant_pod::PodOrchestrator,
     peer_cert: Option<&rustls_pki_types::CertificateDer<'_>>,
 ) -> Rendered {
     let GitHttpRoute {
@@ -403,7 +404,7 @@ pub(crate) fn handle_git_http(
     // or failing the first request outright -- a fresh container needs
     // a moment to actually start listening.
     if !tenant.pod_running {
-        if let Err(e) = crate::tenant_pod::start_pod(image, repos_root, tenant_slug) {
+        if let Err(e) = orchestrator.start_pod(image, repos_root, tenant_slug) {
             eprintln!("wkp-hub: git-http: failed to start tenant pod: {e}");
             return Rendered::status_only(503);
         }

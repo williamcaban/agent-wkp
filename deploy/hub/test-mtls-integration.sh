@@ -43,9 +43,12 @@ NETWORK_NAME="wkp-hub-tenants"
 CONTAINER_DATABASE_URL="$(printf '%s' "$DATABASE_URL" | sed -E 's#@(localhost|127\.0\.0\.1):#@host.containers.internal:#')"
 
 WORKDIR="$(mktemp -d)"
+PODMAN_SOCK="$WORKDIR/podman.sock"
+service_pid=""
 cleanup() {
     podman exec "$CONTAINER_NAME" /usr/local/bin/wkp-hub stop-pod "$TENANT" >/dev/null 2>&1 || true
     podman rm -f "$CONTAINER_NAME" >/dev/null 2>&1 || true
+    [ -n "$service_pid" ] && kill "$service_pid" >/dev/null 2>&1 || true
     rm -rf "$WORKDIR"
 }
 trap cleanup EXIT
@@ -55,10 +58,39 @@ log() { printf '==> %s\n' "$*"; }
 log "ensuring the shared tenant network exists"
 podman network exists "$NETWORK_NAME" || podman network create "$NETWORK_NAME" >/dev/null
 
+# ADR-0012: the front door's own `wkp-hub serve` process starts/stops
+# tenant pods on demand via the `PodmanOrchestrator` backend, which
+# talks to `podman-remote` inside the container -- pointed at *this*
+# host-side API socket, not a container-runtime daemon nested inside
+# the container itself (ADR-0009's own pod-per-tenant model needs pods
+# as the *host's* siblings, reachable the same way whether started by
+# this script's own `podman` or by the containerized front door).
+log "starting a podman API socket for the front door's own pod orchestration (ADR-0012)"
+podman system service --time=0 "unix://${PODMAN_SOCK}" &
+service_pid=$!
+for _ in $(seq 1 20); do
+    [ -S "$PODMAN_SOCK" ] && break
+    sleep 0.5
+done
+[ -S "$PODMAN_SOCK" ] || { echo "FAIL: podman API socket never appeared at $PODMAN_SOCK" >&2; exit 1; }
+
 log "starting wkp-hub container on the shared network"
+# `--security-opt label=disable`: found by hand -- SELinux (Enforcing
+# by default on a Fedora host/runner) denies the container's own
+# `podman` (really `podman-remote`) permission to even `connect()` the
+# bind-mounted host socket otherwise ("permission denied" at the
+# socket dial, not an ordinary Unix DAC failure -- confirmed by hand
+# that plain file permissions on the socket were never the actual
+# blocker, only its SELinux label crossing into this container's own
+# confined domain). Standard, narrowly-scoped escape hatch for exactly
+# this "share the container-runtime socket into one container" shape;
+# does not disable SELinux for anything else on the host.
 podman run -d --name "$CONTAINER_NAME" --network "$NETWORK_NAME" -p "${HTTPS_PORT}:8443" \
+    --security-opt label=disable \
     -e DATABASE_URL="$CONTAINER_DATABASE_URL" \
     -e WKP_HUB_TENANT_IMAGE="$IMAGE" \
+    -e CONTAINER_HOST="unix:///run/podman/podman.sock" \
+    -v "${PODMAN_SOCK}:/run/podman/podman.sock" \
     "$IMAGE" >/dev/null
 
 # If the front door (or sshd) fails to start at all, the container
@@ -72,7 +104,15 @@ if [ "$(podman inspect --format '{{.State.Running}}' "$CONTAINER_NAME" 2>/dev/nu
 fi
 
 hub_exec() {
-    podman exec -e DATABASE_URL="$CONTAINER_DATABASE_URL" "$CONTAINER_NAME" "$@"
+    # `CONTAINER_HOST` (ADR-0012): needed by `start-pod`/`stop-pod`
+    # (`tenant_pod::orchestrator`) whenever this function calls them --
+    # spelled out explicitly here rather than relied on from `podman
+    # run`'s own `-e`, matching this function's existing `DATABASE_URL`
+    # pattern below.
+    podman exec \
+        -e DATABASE_URL="$CONTAINER_DATABASE_URL" \
+        -e CONTAINER_HOST="unix:///run/podman/podman.sock" \
+        "$CONTAINER_NAME" "$@"
 }
 
 log "waiting for the control plane's schema"
@@ -114,9 +154,9 @@ hub_exec /usr/local/bin/wkp-hub ca-cert > "$WORKDIR/ca-cert.pem"
 log "registering a device over the real RFC 8628 + CSR flow (M5-9)"
 CLIENT_DIR="$WORKDIR/client"
 mkdir -p "$CLIENT_DIR"
-"$WKP_BIN" --path "$CLIENT_DIR" hub register \
+"$WKP_BIN" hub register \
     --hub-url "https://127.0.0.1:${HTTPS_PORT}" --tenant "$TENANT" \
-    --ca-cert "$WORKDIR/ca-cert.pem" > "$WORKDIR/register.log" 2>&1 &
+    --ca-cert "$WORKDIR/ca-cert.pem" --path "$CLIENT_DIR" > "$WORKDIR/register.log" 2>&1 &
 register_pid=$!
 
 user_code=""
