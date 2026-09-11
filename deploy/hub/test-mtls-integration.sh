@@ -75,20 +75,26 @@ done
 [ -S "$PODMAN_SOCK" ] || { echo "FAIL: podman API socket never appeared at $PODMAN_SOCK" >&2; exit 1; }
 
 log "starting wkp-hub container on the shared network"
-# `REPOS_ROOT` (ADR-0012, found by hand this run): a tenant's pod is a
-# *host-level sibling* of this front-door container, created by the
-# real host podman through the socket above -- its own bind mount
-# (`tenant_pod.rs`'s `repo_mount_arg`) is a path on the *host*
-# filesystem, not inside this container's private one. Without this,
-# `wkp-hub tenant create` (run inside the front door via `hub_exec`)
-# writes the bare repo into a path that only exists in the front
-# door's own ephemeral container filesystem, invisible to the host,
-# and the tenant pod's bind mount of that same path fails outright
-# ("statfs ...: no such file or directory"). Bind-mounting a real host
-# directory at the same fixed `/srv/wkp-hub/repos` path both the front
-# door and every tenant pod already agree on (`tenant_pod.rs`'s own
-# module doc) is what actually makes that path exist on the host, not
-# just inside one container.
+# `REPOS_ROOT` (ADR-0012, found by hand -- twice; see below): a
+# tenant's pod is a *host-level sibling* of this front-door container,
+# created by the real host podman through the socket above. That means
+# the `-v <repos_root>/<slug>.git:...` argument `tenant_pod.rs`'s
+# `start_pod` builds is resolved by the *host's* own podman, against
+# the *host's* filesystem -- not against this container's private
+# filesystem, even though the front door's own `wkp-hub serve` process
+# (which writes the bare repo, via `tenant create`) is running inside
+# this container. Mounting a host directory at the container-internal
+# path `/srv/wkp-hub/repos` (first attempt, wrong) does not make that
+# path exist on the *host* at all -- the host's real directory is
+# still wherever `$WORKDIR` actually is, so the host's own podman
+# still can't find it ("statfs ...: no such file or directory",
+# unchanged even after that first fix). The only way both observers --
+# this container's own `wkp-hub serve`, and the host's own podman
+# building a sibling pod's mount args -- agree on one path is to give
+# it the *same literal path* on both sides: mount `$REPOS_ROOT` at
+# that identical absolute path inside the container too, and point
+# `WKP_HUB_REPOS_ROOT` (the same override `main.rs`'s own `repos_root`
+# already reads) at it instead of leaving the container-only default.
 REPOS_ROOT="$WORKDIR/repos"
 mkdir -p "$REPOS_ROOT"
 # `--security-opt label=disable`: found by hand -- SELinux (Enforcing
@@ -109,9 +115,10 @@ podman run -d --name "$CONTAINER_NAME" --network "$NETWORK_NAME" -p "${HTTPS_POR
     --security-opt label=disable \
     -e DATABASE_URL="$CONTAINER_DATABASE_URL" \
     -e WKP_HUB_TENANT_IMAGE="$IMAGE" \
+    -e WKP_HUB_REPOS_ROOT="$REPOS_ROOT" \
     -e CONTAINER_HOST="unix:///run/podman/podman.sock" \
     -v "${PODMAN_SOCK}:/run/podman/podman.sock" \
-    -v "${REPOS_ROOT}:/srv/wkp-hub/repos" \
+    -v "${REPOS_ROOT}:${REPOS_ROOT}" \
     "$IMAGE" >/dev/null
 
 # If the front door (or sshd) fails to start at all, the container
@@ -125,7 +132,8 @@ if [ "$(podman inspect --format '{{.State.Running}}' "$CONTAINER_NAME" 2>/dev/nu
 fi
 
 hub_exec() {
-    # `CONTAINER_HOST` (ADR-0012): needed by `start-pod`/`stop-pod`
+    # `CONTAINER_HOST`/`WKP_HUB_REPOS_ROOT` (ADR-0012): needed by
+    # `start-pod`/`stop-pod`/`tenant create`
     # (`tenant_pod::orchestrator`) whenever this function calls them --
     # spelled out explicitly here rather than relied on from `podman
     # run`'s own `-e`, matching this function's existing `DATABASE_URL`
@@ -133,6 +141,7 @@ hub_exec() {
     podman exec \
         -e DATABASE_URL="$CONTAINER_DATABASE_URL" \
         -e CONTAINER_HOST="unix:///run/podman/podman.sock" \
+        -e WKP_HUB_REPOS_ROOT="$REPOS_ROOT" \
         "$CONTAINER_NAME" "$@"
 }
 
