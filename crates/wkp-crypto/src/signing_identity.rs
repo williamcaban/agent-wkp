@@ -61,14 +61,14 @@ impl SigningIdentity {
             .map_err(Error::SshKey)
     }
 
-    /// Builds a PKCS#10 certificate signing request (CSR), PEM-encoded,
-    /// for this identity's own ed25519 keypair -- what `wkp hub
-    /// register` (M5-9, ADR-0011) submits to the hub's CA instead of a
-    /// bare public key. Not a second key: this re-encodes the exact
-    /// same private key bytes [`public_key_openssh`](Self::public_key_openssh)
-    /// already exposes, just into the PKCS#8 form `rcgen` needs to
-    /// build and sign the request.
-    pub fn to_csr_pem(&self) -> Result<String, Error> {
+    /// Re-encodes this identity's own ed25519 private key bytes (the
+    /// exact same ones [`public_key_openssh`](Self::public_key_openssh)
+    /// derives its public half from) into an `rcgen::KeyPair` -- not a
+    /// second key, just a different in-memory representation. Shared by
+    /// [`to_csr_pem`](Self::to_csr_pem) and
+    /// [`to_pkcs8_pem`](Self::to_pkcs8_pem), the two consumers that need
+    /// this key in PKCS#8-adjacent form rather than OpenSSH's.
+    fn to_rcgen_keypair(&self) -> Result<rcgen::KeyPair, Error> {
         let ed25519 = self.0.key_data().ed25519().ok_or_else(|| {
             Error::Certificate("signing identity is not an ed25519 key".to_string())
         })?;
@@ -79,17 +79,43 @@ impl SigningIdentity {
                 .to_pkcs8_der()
                 .map_err(|e| Error::Certificate(format!("PKCS#8 encoding failed: {e}")))?
         };
-        let key_pair = rcgen::KeyPair::from_pkcs8_der_and_sign_algo(
+        rcgen::KeyPair::from_pkcs8_der_and_sign_algo(
             &rustls_pki_types::PrivatePkcs8KeyDer::from(pkcs8_der.as_bytes().to_vec()),
             &rcgen::PKCS_ED25519,
         )
-        .map_err(|e| Error::Certificate(e.to_string()))?;
+        .map_err(|e| Error::Certificate(e.to_string()))
+    }
+
+    /// Builds a PKCS#10 certificate signing request (CSR), PEM-encoded,
+    /// for this identity's own ed25519 keypair -- what `wkp hub
+    /// register` (M5-9, ADR-0011) submits to the hub's CA instead of a
+    /// bare public key.
+    pub fn to_csr_pem(&self) -> Result<String, Error> {
+        let key_pair = self.to_rcgen_keypair()?;
 
         rcgen::CertificateParams::default()
             .serialize_request(&key_pair)
             .map_err(|e| Error::Certificate(e.to_string()))?
             .pem()
             .map_err(|e| Error::Certificate(e.to_string()))
+    }
+
+    /// This identity's own private key, PEM-encoded PKCS#8 -- the form
+    /// `git`'s own TLS backend (`http.sslKey`) needs to actually
+    /// present the certificate the hub's CA issues (M5-9/M5-10,
+    /// ADR-0011) during an mTLS handshake. Not a second key, and not
+    /// what [`ensure`] stores or reads: the OpenSSH format `ensure`'s
+    /// keystore-or-file storage uses is what `ssh_key` itself works
+    /// with, but is opaque to `git`/`curl`'s OpenSSL-backed TLS stack
+    /// (confirmed empirically: `openssl pkey -in <openssh-format-file>`
+    /// fails to parse it at all). This method exists so a caller
+    /// (`wkp hub register`) can write out a second, `git`-consumable
+    /// *encoding* of the identical already-stored key -- callers must
+    /// treat the result as secret material exactly like
+    /// [`to_secret_string`](Self::to_secret_string), a `0600` file,
+    /// never argv or an environment variable.
+    pub fn to_pkcs8_pem(&self) -> Result<String, Error> {
+        Ok(self.to_rcgen_keypair()?.serialize_pem())
     }
 }
 
@@ -272,6 +298,19 @@ mod tests {
         let csr_pem = identity.to_csr_pem().expect("to_csr_pem");
         assert!(csr_pem.contains("BEGIN CERTIFICATE REQUEST"));
         assert!(csr_pem.contains("END CERTIFICATE REQUEST"));
+    }
+
+    /// `git`'s own TLS backend needs `http.sslKey` in a form OpenSSL
+    /// recognizes -- a plain PKCS#8 `-----BEGIN PRIVATE KEY-----` block,
+    /// not `ensure`'s own OpenSSH-format storage (confirmed empirically
+    /// unusable for this: `openssl pkey -in <that file>` fails to parse
+    /// it at all, "unsupported ... Input structure: EncryptedPrivateKeyInfo").
+    #[test]
+    fn to_pkcs8_pem_produces_a_pkcs8_private_key_openssl_can_load() {
+        let identity = SigningIdentity::generate().expect("generate");
+        let pem = identity.to_pkcs8_pem().expect("to_pkcs8_pem");
+        assert!(pem.contains("BEGIN PRIVATE KEY"));
+        assert!(pem.contains("END PRIVATE KEY"));
     }
 
     /// The hub (M5-9) derives `devices.public_key` from a CSR's raw

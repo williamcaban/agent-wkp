@@ -4095,6 +4095,7 @@ version = "0.1.0"
 dependencies = [
  "notify",
  "rustix",
+ "rustls",
  "serde",
  "serde_json",
  "tempfile",
