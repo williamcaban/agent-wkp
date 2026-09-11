@@ -76,6 +76,38 @@ sha2 = "0.11.0"
 # a tenant pod's own address ever needs -- it's plain HTTP inside the
 # shared podman network, not a public endpoint).
 ureq = { version = "3.4.1", default-features = false, features = ["json", "gzip"] }
+# M5-8 (ADR-0011): real TLS termination for the front door. Already in
+# this workspace's `Cargo.lock` at 0.23.44 (`ureq`'s own optional TLS
+# stack, which `default-features = false` above leaves unbuilt); this
+# makes it a direct dependency so `src/tls.rs` can drive the handshake
+# itself. `default-features = false` + `ring`: pin the crypto provider
+# to `ring`, the one already in this tree, rather than letting the
+# default pull in `aws-lc-rs`/`aws-lc-sys` -- a C library with `unsafe`
+# FFI, which is exactly the tradeoff ADR-0011 rejected OpenSSL over.
+# No `webpki-roots` feature and no public trust bundle anywhere: the
+# hub is its own private CA (issue #122's own acceptance criterion),
+# which also sidesteps the CDLA-Permissive-2.0 license note on `ureq`
+# above.
+rustls = { version = "0.23", default-features = false, features = ["std", "ring", "tls12", "logging"] }
+# M5-8 (ADR-0011): the hub's own private CA -- generating the root
+# certificate and minting the TLS server leaf it presents. Pure Rust,
+# so `#![forbid(unsafe_code)]` holds without shelling out to OpenSSL
+# (ADR-0011 option 4 vs. option 5). `default-features = false` +
+# `ring`: same crypto-provider pinning as `rustls` above (rcgen's own
+# default is `ring` today, but stating it means a future default flip
+# to `aws-lc-rs` can't silently pull a C library in). `pem` for the
+# on-disk PEM encoding the CA files use. `x509-parser` so
+# `rcgen::Issuer::from_ca_cert_pem` can rebuild the issuer from the
+# root certificate actually on disk, rather than from a reconstructed
+# copy of the parameters it was generated with -- the reconstruction
+# would silently start minting leaves with a mismatched issuer DN the
+# day someone edits that constant, and every already-issued
+# certificate would stop chaining. `rustls-pki-types` is rcgen's and
+# rustls' shared DER wrapper type, named directly here so `hub_ca` can
+# hand a `CertificateDer`/`PrivateKeyDer` from one to the other
+# without an intermediate re-parse.
+rcgen = { version = "0.14.10", default-features = false, features = ["ring", "pem", "x509-parser"] }
+rustls-pki-types = "1"
 
 [dev-dependencies]
 # M5-4: `tenant_repo`'s own tests and `tests/post_receive_hook.rs` need a
