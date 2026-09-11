@@ -6,10 +6,12 @@
 # mechanism ADR-0010 picked), stops it, then proves the reaper stops an
 # idle one on its own.
 #
-# Not wired into CI yet (a separate, later PR does that, alongside
-# front-door networking) -- this script exists so the pod-lifecycle
-# code has a real, repeatable end-to-end check independent of unit
-# tests, the same split M5-5's own test-ssh-integration.sh established.
+# Wired into CI as the `hub-pod-isolation` job
+# (`.github/workflows/rust-ci.yml`), alongside its own sibling
+# `test-cross-tenant-isolation.sh` -- this script exists so the
+# pod-lifecycle code has a real, repeatable end-to-end check
+# independent of unit tests, the same split M5-5's own
+# test-ssh-integration.sh established.
 #
 # Expects: `wkp-hub` built and on PATH (or WKP_HUB_BIN pointing at it),
 # `podman`, `git`, `psql` on PATH; DATABASE_URL pointing at a reachable
@@ -17,12 +19,15 @@
 # (default localhost/wkp-hub, override via WKP_HUB_IMAGE).
 #
 # **Known gap in a rootless sandbox with no systemd user session/D-Bus**
-# (this repo's own dev sandbox, confirmed by hand while building this):
-# `aardvark-dns` (the DNS backend for podman's user-defined networks)
-# fails to start there, so the network-alias steps below reliably fail
-# in that specific environment. A real CI runner or production host is
-# expected not to have this constraint -- this script targets that
-# environment, not a workaround for the sandbox one.
+# (this repo's own dev sandbox, previously confirmed by hand): `aardvark-dns`
+# (the DNS backend for podman's user-defined networks) has failed to
+# start there in the past, which would make the network-alias steps
+# below fail in that specific environment -- though this was found to
+# no longer reproduce as of 2026-09-11 (this exact script ran clean,
+# alias and all, in that same sandbox while developing
+# test-cross-tenant-isolation.sh). A real CI runner or production host
+# is expected not to have this constraint either way -- this script
+# targets that environment, not a workaround for the sandbox one.
 set -euo pipefail
 
 WKP_HUB_BIN="${WKP_HUB_BIN:-wkp-hub}"
