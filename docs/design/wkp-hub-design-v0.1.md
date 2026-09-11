@@ -17,7 +17,10 @@
   disproportionate new surface for what SSH was still buying. HTTPS
   becomes the only transport; device keys move from SSH public keys to
   mutual TLS certificates issued by the hub's own private CA
-  (`rustls` + `rcgen`, pure Rust, no OpenSSL). See
+  (`rustls` + `rcgen`, pure Rust, no OpenSSL). **Code removal completed
+  2026-09-11 (#125)**, sequenced after M5-13's mTLS integration test
+  proved green in CI, per ADR-0011's own requirement to never leave a
+  window with neither transport functional. See
   `docs/adr/0011-drop-ssh-mtls-transport.md`; not yet implemented.
   M5-3/M5-5's already-merged SSH-path code is scheduled for removal
   once the mTLS replacement is built and proven working, not before.
@@ -345,9 +348,9 @@ The one property a continuous engine wins is sub-second propagation between conc
 
 ### 6.4 Registration and tiering
 
-- `wkp hub register` runs the OAuth 2.0 Device Authorization Grant ([RFC 8628](https://www.rfc-editor.org/rfc/rfc8628)) so the CLI never handles a password or a browser redirect; the device then generates an `ed25519` key stored in the OS keystore (macOS Keychain; Linux `secret-service` via the freedesktop API, falling back to `ssh-agent`) and uploads only the public key.
+- `wkp hub register` runs the OAuth 2.0 Device Authorization Grant ([RFC 8628](https://www.rfc-editor.org/rfc/rfc8628)) so the CLI never handles a password or a browser redirect; the device then generates an `ed25519` key stored in the OS keystore (macOS Keychain; Linux `secret-service` via the freedesktop API, falling back to `ssh-agent`). **(2026-09-11, ADR-0011)** The device submits a CSR built from that key rather than uploading a raw public key; the hub's own CA signs it and returns a certificate.
 - The store's `origin` is set to the hub; local mode continues to work unchanged. Sync is opportunistic: `wkpd` (if present) or the SessionStart hook attempts a fetch with a short timeout and never blocks the session on network availability.
-- Multiple workstations are simply multiple clones with their own device keys. Revoking a device on the hub removes its key from `AuthorizedKeysCommand` output (section 8.1) and takes effect on the next connection.
+- Multiple workstations are simply multiple clones with their own device keys. **(2026-09-11, ADR-0011)** Revoking a device on the hub sets its `revoked_at` state in the control plane; the mTLS `ClientCertVerifier` (section 8.1) checks that on every TLS handshake, so revocation takes effect on the next connection -- the SSH-era `AuthorizedKeysCommand` mechanism this line originally described no longer exists.
 
 ---
 
@@ -418,7 +421,7 @@ Prompt injection through agent-consumed content is **established** as a practica
 
 ### 8.1 D7: OpenSSH + git's own server binaries as the transport front end
 
-**Superseded (2026-09-11) for the SSH half only.** ADR-0011 drops the SSH transport described below: the pod-per-tenant model (ADR-0009/0010) leaves no local repo for `wkp-shell` to exec `git-receive-pack`/`git-upload-pack` against, and bridging an SSH session to a tenant pod's `git http-backend` over the network was judged not worth the new protocol-translation surface it would require. HTTPS (the second half of this decision, unaffected) becomes the only transport; SSH device keys are replaced by mutual TLS device certificates from the hub's own private CA (`rustls` + `rcgen`). The reasoning below is kept for history, not as current design -- see `docs/adr/0011-drop-ssh-mtls-transport.md`.
+**Superseded (2026-09-11) for the SSH half only, code removed 2026-09-11 (#125).** ADR-0011 dropped the SSH transport described below: the pod-per-tenant model (ADR-0009/0010) leaves no local repo for `wkp-shell` to exec `git-receive-pack`/`git-upload-pack` against, and bridging an SSH session to a tenant pod's `git http-backend` over the network was judged not worth the new protocol-translation surface it would require. HTTPS (the second half of this decision, unaffected) is now the only transport; SSH device keys are replaced by mutual TLS device certificates from the hub's own private CA (`rustls` + `rcgen`). `sshd`, `wkp-shell`, and the `authorized-keys-command`/`git-shell` CLI subcommands described below no longer exist in this codebase -- the reasoning is kept for history, not as current design. 8.3's hardening table below is written for the two-transport design and is correspondingly out of date for its SSH-specific rows (Network's port 22, Auth's "Key-only SSH") -- see `docs/adr/0011-drop-ssh-mtls-transport.md`.
 
 **Decision.** The hub's git endpoint is unmodified `sshd` with `AuthorizedKeysCommand` (looks up the presented public key in the control plane and returns an `authorized_keys` line with `command=`, `restrict` options) and a small `wkp-shell` that maps the key to a tenant and executes only `git-receive-pack` / `git-upload-pack` on that tenant's bare repository ([sshd_config](https://man.openbsd.org/sshd_config), [git-shell](https://git-scm.com/docs/git-shell)). HTTPS transport uses `git http-backend`, the CGI program shipped with git ([git-http-backend](https://git-scm.com/docs/git-http-backend)), behind a reverse proxy that validates a device-scoped bearer token and sets `REMOTE_USER`.
 
