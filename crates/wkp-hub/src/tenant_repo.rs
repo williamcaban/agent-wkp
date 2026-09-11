@@ -4,10 +4,10 @@
 //! Two halves:
 //!
 //! - [`provision_tenant_repo`]: creates the bare repo at
-//!   [`crate::wkp_shell::tenant_repo_path`]'s fixed convention (the
-//!   contract M5-3 already defined), hardens it (`receive.fsckObjects`,
-//!   `transfer.fsckObjects` -- design 8.3's own hardening table), and
-//!   installs a `post-receive` hook that indexes on every push.
+//!   [`tenant_repo_path`]'s fixed convention, hardens it
+//!   (`receive.fsckObjects`, `transfer.fsckObjects` -- design 8.3's own
+//!   hardening table), and installs a `post-receive` hook that indexes
+//!   on every push.
 //! - [`index_tenant`]: what that hook actually runs. Reads every
 //!   tracked path at `HEAD` straight from the object database (no
 //!   working tree exists in a bare repo to read from instead), and
@@ -26,12 +26,21 @@
 //! client chose not to encrypt yet, or couldn't -- still not this hub's
 //! content to index).
 
-use crate::wkp_shell::tenant_repo_path;
 use std::path::{Path, PathBuf};
+
+/// The one, fixed bare-repo path a tenant's git operations ever
+/// operate on -- never derived from anything a connecting client says.
+/// Originally `wkp_shell`'s own contract (M5-3, SSH `git-shell`
+/// invocations honored it too); moved here when #125 (ADR-0011)
+/// removed the SSH transport, since this module -- provisioning and
+/// indexing a tenant's repo -- is where it actually belongs.
+pub fn tenant_repo_path(repos_root: &Path, tenant_slug: &str) -> PathBuf {
+    repos_root.join(format!("{tenant_slug}.git"))
+}
 
 /// `hooks/post-receive`'s own content: hardcodes this tenant's slug (a
 /// bare repo is dedicated to exactly one tenant, per
-/// [`crate::wkp_shell::tenant_repo_path`]'s convention) rather than
+/// [`tenant_repo_path`]'s convention) rather than
 /// trying to pass it as an argument -- git invokes post-receive hooks
 /// with no arguments at all, ref-update info arrives on stdin instead,
 /// which indexing has no use for (it always (re)indexes the whole tree
