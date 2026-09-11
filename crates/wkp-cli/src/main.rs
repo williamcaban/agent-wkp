@@ -205,27 +205,28 @@ fn main() {
                 }
             }
         }
-        Some("hub") => {
-            match args.next().as_deref() {
-                Some("register") => match hub_register::parse_hub_register_args(args) {
-                    Ok(opts) => match hub_register::run_hub_register(&opts) {
-                        Ok(summary) => println!("{summary}"),
-                        Err(msg) => {
-                            eprintln!("wkp: hub register failed: {msg}");
-                            std::process::exit(1);
-                        }
-                    },
+        Some("hub") => match args.next().as_deref() {
+            Some("register") => match hub_register::parse_hub_register_args(args) {
+                Ok(opts) => match hub_register::run_hub_register(&opts) {
+                    Ok(summary) => println!("{summary}"),
                     Err(msg) => {
-                        eprintln!("wkp: {msg}");
+                        eprintln!("wkp: hub register failed: {msg}");
                         std::process::exit(1);
                     }
                 },
-                _ => {
-                    eprintln!("wkp: usage: wkp hub register --hub-url <url> --tenant <slug> [--path <dir>]");
+                Err(msg) => {
+                    eprintln!("wkp: {msg}");
                     std::process::exit(1);
                 }
+            },
+            _ => {
+                eprintln!(
+                    "wkp: usage: wkp hub register --hub-url <url> --tenant <slug> \
+                         --ca-cert <path> [--path <dir>]"
+                );
+                std::process::exit(1);
             }
-        }
+        },
         Some("forget") => {
             if let Err(msg) = wkp_git::ensure_min_git_version() {
                 eprintln!("{msg}");

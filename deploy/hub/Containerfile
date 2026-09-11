@@ -99,5 +99,7 @@ RUN chmod 755 /usr/local/bin/wkp-hub /usr/local/bin/entrypoint.sh \
     && chmod 755 /usr/local/bin/wkp-hub-akc.sh \
     && chmod 600 /etc/ssh/sshd_config
 
-EXPOSE 22
+# M5-13 (ADR-0011): the HTTPS/mTLS front door, alongside SSH until
+# #125 removes the latter.
+EXPOSE 22 8443
 ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]

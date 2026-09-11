@@ -530,8 +530,38 @@ fn main() {
                     }
                 }
             }
+            // M5-13 (ADR-0011): revoking by row id, not just by
+            // public key -- a device that enrolled via the real CSR
+            // flow (#123) is identified by `device_id` in `wkp hub
+            // register`'s own summary output, and the mTLS integration
+            // test (unlike M5-5's own SSH test, which minted a raw key
+            // pair itself and so already had the public key on hand)
+            // has no easy way to recover a public-key string from that
+            // flow's output. `control_plane::revoke_device` already
+            // takes an id, not a key -- this is just a second admin
+            // entry point onto the exact same function `revoke` above
+            // calls, not new revocation logic.
+            Some("revoke-id") => {
+                let Some(device_id_str) = args.next() else {
+                    eprintln!("wkp-hub: usage: wkp-hub device revoke-id <device-id>");
+                    std::process::exit(1);
+                };
+                let Ok(device_id) = device_id_str.parse::<i64>() else {
+                    eprintln!("wkp-hub: device revoke-id: <device-id> must be an integer");
+                    std::process::exit(1);
+                };
+                let result = control_plane::connect()
+                    .and_then(|mut client| control_plane::revoke_device(&mut client, device_id));
+                match result {
+                    Ok(()) => println!("wkp-hub: revoked device {device_id}"),
+                    Err(e) => {
+                        eprintln!("wkp-hub: device revoke-id failed: {e}");
+                        std::process::exit(1);
+                    }
+                }
+            }
             _ => {
-                eprintln!("wkp-hub: usage: wkp-hub device register|revoke ...");
+                eprintln!("wkp-hub: usage: wkp-hub device register|revoke|revoke-id ...");
                 std::process::exit(1);
             }
         },
@@ -555,7 +585,7 @@ fn main() {
                 "wkp-hub: usage: wkp-hub serve [--port <port>] | \
                  serve-tenant --tenant <slug> [--port <port>] | migrate | ca-cert | \
                  tenant create <slug> | device register <tenant-slug> <public-key> | \
-                 device revoke <public-key> | \
+                 device revoke <public-key> | device revoke-id <device-id> | \
                  authorized-keys-command <public-key> | \
                  git-shell <tenant-slug> | index-tenant <tenant-slug> | \
                  provision-repo <tenant-slug> | start-pod <tenant-slug> | \

@@ -34,14 +34,22 @@ rustix = { version = "1.1.4", default-features = false, features = ["net", "proc
 # library is the safer choice, not a shortcut.
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
-# `default-features = false`: ureq's defaults pull in rustls (for TLS),
-# which transitively pulls `webpki-roots`, whose CDLA-Permissive-2.0
-# license this workspace's deny.toml doesn't allow. Not needed anyway --
-# every hub URL this milestone's scope covers is a CI/local `http://`
-# target (docs/plan/milestones.md's M5 scope notes: real hosted
-# deployment, and so real TLS, is later work). Revisit if/when a real
-# `https://` hub target lands.
-ureq = { version = "3.4.1", default-features = false, features = ["json", "gzip"] }
+# M5-13 (ADR-0011): `wkp hub register` now targets a real `https://`
+# hub (M5-8's front door is TLS-only, no plain-HTTP listener at all) --
+# the "revisit if/when a real https:// hub target lands" this comment
+# used to end on. `rustls-no-provider`, not the `rustls` convenience
+# feature: the latter also pulls in `rustls-webpki-roots`
+# (CDLA-Permissive-2.0, which this workspace's `deny.toml` disallows,
+# same reasoning `wkp-hub/Cargo.toml`'s own `ureq` entry already gives)
+# *and* the public web PKI is actively the wrong trust anchor here --
+# the hub is always its own private CA (ADR-0011), never a publicly
+# trusted one. `rustls-no-provider` leaves the crypto provider
+# unconfigured, wired explicitly in `hub_register.rs` to `ring` (see
+# the `rustls`/`rustls-pki-types` entries below) -- the same pinning
+# `wkp-hub`'s own `rustls`/`rcgen` entries already use, for the same
+# reason (no `aws-lc-rs`, a C library with `unsafe` FFI).
+ureq = { version = "3.4.1", default-features = false, features = ["rustls-no-provider", "json", "gzip"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "tls12", "logging"] }
 
 [dev-dependencies]
 tempfile = "3.27.0"
