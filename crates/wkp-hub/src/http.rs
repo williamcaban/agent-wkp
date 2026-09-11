@@ -2,9 +2,9 @@
 //! M5-2): `POST /device/code`, `POST /device/token`, and the human
 //! verification page (`GET`/`POST /verify`).
 //!
-//! `tiny_http`, not an async web framework: matches `control_plane`'s
-//! own design decision to stay blocking rather than pull an async
-//! runtime into this crate's call sites -- a handful of low-traffic,
+//! Every handler here is blocking, and stays blocking: it matches
+//! `control_plane`'s own design decision not to pull an async runtime
+//! into this crate's call sites -- a handful of low-traffic,
 //! infrequent-by-nature endpoints (device registration is a
 //! once-per-device event, not a hot path) has no real concurrency need
 //! an async framework would justify. One Postgres connection per
@@ -13,6 +13,22 @@
 //! kind of production hardening this milestone's own scope notes
 //! (`docs/plan/milestones.md`) defer past a CI-testable slice, the
 //! same posture already taken for TLS in `control_plane::connect`.
+//!
+//! M5-8 (ADR-0011): the *front door* no longer listens here. Its
+//! listener moved to [`crate::front_door`] (`axum` + `axum-server` on
+//! `rustls`, so client-facing TLS is terminated by a mature library
+//! rather than something this project hand-rolled); every handler
+//! below is unchanged and is called from there on a blocking-pool
+//! thread. What stayed: [`serve_single_tenant`], the mode a tenant's
+//! own pod runs -- plain HTTP inside the shared podman network, never
+//! client-facing (ADR-0009/0010 make the front door the sole
+//! TLS-terminating process), so it has nothing to gain from an async
+//! TLS stack and keeps `tiny_http`.
+//!
+//! Both listeners hand a handler the same [`Incoming`]: the request's
+//! headers and body, and nothing else, since that is all any handler
+//! here ever looked at. That is what lets one set of handlers serve
+//! two transports without either one's request type leaking into them.
 //!
 //! `/device/code` and `/device/token` speak JSON (RFC 8628's own wire
 //! format, and this is a CLI-to-server exchange, not a browser).
@@ -27,29 +43,87 @@ use crate::control_plane::{self, grants};
 use serde::{Deserialize, Serialize};
 use tiny_http::{Method, Response, StatusCode};
 
-pub fn serve(port: u16, repos_root: std::path::PathBuf, image: String) -> Result<(), String> {
-    let server = tiny_http::Server::http(("0.0.0.0", port)).map_err(|e| e.to_string())?;
-    eprintln!("wkp-hub: listening on http://0.0.0.0:{port}");
-    for request in server.incoming_requests() {
-        handle(request, &repos_root, &image);
+/// One incoming request, reduced to the only two things any handler in
+/// this module ever reads: its headers and its body.
+///
+/// Deliberately transport-independent -- [`serve_single_tenant`]'s
+/// `tiny_http` listener and [`crate::front_door`]'s `axum` one both
+/// build one of these, so neither framework's request type appears in
+/// a handler signature and the handlers themselves are identical
+/// across both.
+///
+/// The body is read up front rather than lazily. That is forced by the
+/// async front door (extracting a body is an `await`, and the handlers
+/// it calls run on a blocking thread where there is nothing to await
+/// on), and it is what any HTTP framework does anyway; the visible
+/// consequence is that a request rejected by
+/// [`handle_git_http`]'s auth checks has had its body read before the
+/// rejection, rather than after.
+pub(crate) struct Incoming {
+    headers: Vec<(String, String)>,
+    body: Vec<u8>,
+}
+
+impl Incoming {
+    pub(crate) fn new(headers: Vec<(String, String)>, body: Vec<u8>) -> Self {
+        Incoming { headers, body }
     }
-    Ok(())
+
+    fn from_tiny_http(request: &mut tiny_http::Request) -> Self {
+        let headers = request
+            .headers()
+            .iter()
+            .map(|h| {
+                (
+                    h.field.as_str().as_str().to_string(),
+                    h.value.as_str().to_string(),
+                )
+            })
+            .collect();
+        let mut body = Vec::new();
+        let _ = request.as_reader().read_to_end(&mut body);
+        Incoming { headers, body }
+    }
+
+    /// The body as text. Lossy on invalid UTF-8 rather than an error:
+    /// the only callers are the JSON and form-encoded endpoints, where
+    /// a mangled byte means the parse fails or the database lookup
+    /// misses -- both already-handled outcomes, never a panic on
+    /// attacker-controlled input.
+    fn body_string(&self) -> String {
+        String::from_utf8_lossy(&self.body).into_owned()
+    }
+
+    /// The exact body bytes -- M5-6's git-over-HTTP routes carry binary
+    /// pack data, which a lossy conversion would corrupt the same way
+    /// `wkp_git::read_blob`'s own doc comment explains for a private
+    /// item's ciphertext.
+    fn body_bytes(&self) -> &[u8] {
+        &self.body
+    }
+
+    fn header(&self, name: &str) -> Option<String> {
+        self.headers
+            .iter()
+            .find(|(field, _)| field.eq_ignore_ascii_case(name))
+            .map(|(_, value)| value.clone())
+    }
 }
 
 /// A rendered response: status, content type, extra headers, body.
-/// Every handler returns one of these rather than touching
-/// `tiny_http::Response` directly, so the dispatcher is the only place
-/// that needs to know how to actually send one.
-struct Rendered {
-    status: u16,
-    content_type: String,
+/// Every handler returns one of these rather than touching a
+/// framework's own response type directly, so each listener is the
+/// only place that needs to know how to actually send one.
+pub(crate) struct Rendered {
+    pub(crate) status: u16,
+    pub(crate) content_type: String,
     /// Anything beyond `Content-Type` -- empty for every JSON/HTML
     /// response this module renders itself; populated when relaying a
     /// [`wkp_git::http_backend::CgiResponse`] (M5-6), whose headers
     /// (`Cache-Control`, `Expires`, ...) come from `git http-backend`
     /// itself, not something this crate decides.
-    extra_headers: Vec<(String, String)>,
-    body: Vec<u8>,
+    pub(crate) extra_headers: Vec<(String, String)>,
+    pub(crate) body: Vec<u8>,
 }
 
 impl Rendered {
@@ -92,10 +166,23 @@ impl Rendered {
         }
     }
 
+    /// The `404` body an unrecognized path gets -- shared by
+    /// [`serve_single_tenant`]'s dispatcher and the front door's
+    /// (`crate::front_door`), so both listeners answer an unknown route
+    /// identically.
+    pub(crate) fn not_found() -> Self {
+        Rendered::json(
+            404,
+            &ErrorBody {
+                error: "not_found".to_string(),
+            },
+        )
+    }
+
     /// A bare status code with no body -- `401`/`403` for the bearer-
     /// token checks M5-6's own routes make before ever calling `git
     /// http-backend` at all.
-    fn status_only(status: u16) -> Self {
+    pub(crate) fn status_only(status: u16) -> Self {
         Rendered {
             status,
             content_type: "text/plain".to_string(),
@@ -105,47 +192,11 @@ impl Rendered {
     }
 }
 
-fn handle(mut request: tiny_http::Request, repos_root: &std::path::Path, image: &str) {
-    let method = request.method().clone();
-    let url = request.url().to_string();
-    let path = url.split('?').next().unwrap_or("").to_string();
-    let query = url
-        .split_once('?')
-        .map(|(_, q)| q.to_string())
-        .unwrap_or_default();
-
-    let rendered = if let Some((tenant_slug, suffix)) = git_http_path(&path) {
-        handle_git_http(
-            &mut request,
-            &method,
-            &tenant_slug,
-            &suffix,
-            &query,
-            repos_root,
-            image,
-        )
-    } else {
-        match (&method, path.as_str()) {
-            (Method::Post, "/device/code") => handle_device_code(&mut request),
-            (Method::Post, "/device/token") => handle_device_token(&mut request),
-            (Method::Get, "/verify") => handle_verify_page(&query),
-            (Method::Post, "/verify") => handle_verify_submit(&mut request),
-            _ => Rendered::json(
-                404,
-                &ErrorBody {
-                    error: "not_found".to_string(),
-                },
-            ),
-        }
-    };
-    respond(request, rendered);
-}
-
 /// Sends a [`Rendered`] response back over `request` -- the one place
 /// that needs to know how to actually talk to `tiny_http::Response`,
-/// shared by [`handle`] (the front door's authenticated routes) and
-/// [`serve_single_tenant`] (M5-7's own no-auth, one-repo mode a
-/// tenant's pod runs).
+/// used by [`serve_single_tenant`] (M5-7's own no-auth, one-repo mode a
+/// tenant's pod runs). The front door has its own equivalent for
+/// `axum` (`crate::front_door::into_response`).
 fn respond(request: tiny_http::Request, rendered: Rendered) {
     let status = StatusCode(rendered.status);
     let content_type_header =
@@ -198,9 +249,10 @@ pub fn serve_single_tenant(
                 continue;
             }
         };
+        let incoming = Incoming::from_tiny_http(&mut request);
         let rendered = match git_http_path(&path) {
             Some((slug, suffix)) if slug == tenant_slug => serve_git_http(
-                &mut request,
+                &incoming,
                 method_str,
                 &slug,
                 &suffix,
@@ -220,7 +272,7 @@ pub fn serve_single_tenant(
 /// client constructs against a `https://.../<tenant-slug>.git` remote,
 /// matching `wkp-shell`'s own `<slug>.git` bare-repo naming convention
 /// (M5-3/M5-4) so both transports name the same repo the same way.
-fn git_http_path(path: &str) -> Option<(String, String)> {
+pub(crate) fn git_http_path(path: &str) -> Option<(String, String)> {
     let rest = path.strip_prefix('/')?;
     let (repo, suffix) = rest.split_once('/')?;
     let tenant_slug = repo.strip_suffix(".git")?;
@@ -228,31 +280,6 @@ fn git_http_path(path: &str) -> Option<(String, String)> {
         return None;
     }
     Some((tenant_slug.to_string(), suffix.to_string()))
-}
-
-fn read_body(request: &mut tiny_http::Request) -> String {
-    let mut body = String::new();
-    let _ = request.as_reader().read_to_string(&mut body);
-    body
-}
-
-/// Like [`read_body`], but the exact bytes rather than a lossy-UTF8
-/// `String` -- M5-6's git-over-HTTP routes carry binary pack data,
-/// which a lossy conversion would corrupt the same way
-/// `wkp_git::read_blob`'s own doc comment explains for a private
-/// item's ciphertext.
-fn read_body_bytes(request: &mut tiny_http::Request) -> Vec<u8> {
-    let mut body = Vec::new();
-    let _ = request.as_reader().read_to_end(&mut body);
-    body
-}
-
-fn find_header(request: &tiny_http::Request, name: &'static str) -> Option<String> {
-    request
-        .headers()
-        .iter()
-        .find(|h| h.field.equiv(name))
-        .map(|h| h.value.as_str().to_string())
 }
 
 /// M5-6 (design 8.1): validates a device-scoped bearer token against
@@ -263,9 +290,9 @@ fn find_header(request: &tiny_http::Request, name: &'static str) -> Option<Strin
 /// already takes, M5-3), and only then hands the request off to `git
 /// http-backend` (`wkp_git::http_backend`, this crate's own plumbing
 /// for it).
-fn handle_git_http(
-    request: &mut tiny_http::Request,
-    method: &Method,
+pub(crate) fn handle_git_http(
+    request: &Incoming,
+    method: &str,
     tenant_slug: &str,
     suffix: &str,
     query: &str,
@@ -273,12 +300,13 @@ fn handle_git_http(
     image: &str,
 ) -> Rendered {
     let method_str = match method {
-        Method::Get => "GET",
-        Method::Post => "POST",
+        "GET" => "GET",
+        "POST" => "POST",
         _ => return Rendered::status_only(405),
     };
 
-    let Some(token) = find_header(request, "Authorization")
+    let Some(token) = request
+        .header("Authorization")
         .and_then(|v| v.strip_prefix("Bearer ").map(|t| t.trim().to_string()))
     else {
         return Rendered::status_only(401);
@@ -344,15 +372,14 @@ fn handle_git_http(
         }
     }
 
-    let content_type = find_header(request, "Content-Type");
-    let body = read_body_bytes(request);
+    let content_type = request.header("Content-Type");
     proxy_to_tenant_pod(
         tenant_slug,
         suffix,
         query,
         method_str,
         content_type.as_deref(),
-        &body,
+        request.body_bytes(),
     )
 }
 
@@ -439,7 +466,7 @@ fn proxy_to_tenant_pod(
 /// at all -- the front door already made that decision before ever
 /// proxying here).
 fn serve_git_http(
-    request: &mut tiny_http::Request,
+    request: &Incoming,
     method_str: &str,
     tenant_slug: &str,
     suffix: &str,
@@ -447,8 +474,7 @@ fn serve_git_http(
     repos_root: &std::path::Path,
     remote_user: &str,
 ) -> Rendered {
-    let content_type = find_header(request, "Content-Type");
-    let body = read_body_bytes(request);
+    let content_type = request.header("Content-Type");
     let path_info = format!("/{tenant_slug}.git/{suffix}");
     let cgi_request = wkp_git::http_backend::CgiRequest {
         method: method_str,
@@ -456,7 +482,7 @@ fn serve_git_http(
         query_string: query,
         content_type: content_type.as_deref(),
         remote_user,
-        body: &body,
+        body: request.body_bytes(),
     };
 
     match wkp_git::http_backend::run_http_backend(repos_root, &cgi_request) {
@@ -492,8 +518,8 @@ struct DeviceCodeResponse {
 /// public key and its chosen tenant are both already decided by the
 /// client (see the module doc comment and `grants`'s own doc comment
 /// for why) -- this just persists the grant and hands back the codes.
-fn handle_device_code(request: &mut tiny_http::Request) -> Rendered {
-    let body = read_body(request);
+pub(crate) fn handle_device_code(request: &Incoming) -> Rendered {
+    let body = request.body_string();
     let parsed: DeviceCodeRequest = match serde_json::from_str(&body) {
         Ok(p) => p,
         Err(e) => {
@@ -573,8 +599,8 @@ struct TokenSuccessResponse {
 /// (RFC 8628's own error code) until a human has approved via
 /// `/verify`; `expired_token` (also RFC 8628's own) once the grant's
 /// TTL has passed with no approval; a real result once approved.
-fn handle_device_token(request: &mut tiny_http::Request) -> Rendered {
-    let body = read_body(request);
+pub(crate) fn handle_device_token(request: &Incoming) -> Rendered {
+    let body = request.body_string();
     let parsed: TokenRequest = match serde_json::from_str(&body) {
         Ok(p) => p,
         Err(e) => {
@@ -668,7 +694,7 @@ fn handle_device_token(request: &mut tiny_http::Request) -> Rendered {
 /// `user_code` from the query string if the device flow's own
 /// `verification_uri_complete` convention (RFC 8628 §3.3.1) supplied
 /// one -- entirely optional, a human can also type the code by hand.
-fn handle_verify_page(query: &str) -> Rendered {
+pub(crate) fn handle_verify_page(query: &str) -> Rendered {
     let prefilled = query
         .split('&')
         .find_map(|pair| pair.strip_prefix("user_code="))
@@ -696,8 +722,8 @@ fn handle_verify_page(query: &str) -> Rendered {
 /// step ([`grants::approve_grant`]) is exactly the same call whether
 /// this body came from a real browser or (this task's own acceptance
 /// criterion) a scripted stand-in for one.
-fn handle_verify_submit(request: &mut tiny_http::Request) -> Rendered {
-    let body = read_body(request);
+pub(crate) fn handle_verify_submit(request: &Incoming) -> Rendered {
+    let body = request.body_string();
     let Some(user_code) = body
         .split('&')
         .find_map(|pair| pair.strip_prefix("user_code="))
@@ -776,7 +802,6 @@ fn html_escape(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::control_plane::create_tenant;
     use std::net::TcpListener;
 
     fn unique_slug(prefix: &str) -> String {
@@ -787,55 +812,12 @@ mod tests {
         format!("{prefix}-{nanos}")
     }
 
-    /// Starts a real server on an OS-assigned free port, in a
-    /// background thread, and returns its base URL -- every test in
-    /// this module drives real HTTP requests against it, not handler
-    /// functions called directly, so a test failure here is evidence
-    /// the actual wire protocol works, not just the Rust functions
-    /// behind it.
-    fn start_test_server() -> String {
-        start_test_server_with_repos_root(
-            tempfile::Builder::new()
-                .prefix("wkp-hub-http-test-unused-repos-root-")
-                .tempdir()
-                .expect("temp dir")
-                .keep(),
-        )
-    }
-
-    /// Like [`start_test_server`], but with a caller-chosen
-    /// `repos_root` -- M5-6's git-http tests need a real bare repo on
-    /// disk, and passing this explicitly (rather than the process-wide
-    /// `WKP_HUB_REPOS_ROOT` env var `main.rs`'s own CLI uses) means
-    /// concurrently running tests never race over a shared global.
-    fn start_test_server_with_repos_root(repos_root: std::path::PathBuf) -> String {
-        let listener = TcpListener::bind("127.0.0.1:0").expect("bind an ephemeral port");
-        let port = listener.local_addr().expect("local_addr").port();
-        drop(listener); // release it so tiny_http can bind the same port itself
-
-        std::thread::spawn(move || {
-            // The image name is irrelevant to every test that uses
-            // this helper: none of them reach the cold-start path
-            // (the four rejection tests return before it; the one
-            // success-path test only checks that auth passes, per its
-            // own doc comment).
-            let _ = serve(port, repos_root, "unused".to_string());
-        });
-        // tiny_http's Server::http binds synchronously before returning,
-        // but `serve` doesn't hand that moment back to this thread -- a
-        // short, bounded retry loop on the first real request (below)
-        // covers the brief window before the listener is actually up,
-        // rather than a blind sleep.
-        format!("http://127.0.0.1:{port}")
-    }
-
     /// A `ureq` agent configured to hand back every response as `Ok`,
     /// regardless of HTTP status -- this module's own endpoints use
-    /// ordinary 4xx/5xx status codes for real, expected outcomes
-    /// (`authorization_pending`, an unknown tenant, ...), not just
-    /// unexpected failures, so tests need to read those bodies the
-    /// same way a real `wkp hub register` polling loop would, not
-    /// treat every non-2xx as a Rust `Err` to unwrap around.
+    /// ordinary 4xx/5xx status codes for real, expected outcomes, not
+    /// just unexpected failures, so tests need to read those bodies
+    /// rather than treat every non-2xx as a Rust `Err` to unwrap
+    /// around.
     fn test_agent() -> ureq::Agent {
         ureq::Agent::config_builder()
             .http_status_as_error(false)
@@ -843,206 +825,7 @@ mod tests {
             .into()
     }
 
-    fn get_with_retry(agent: &ureq::Agent, url: &str) {
-        for attempt in 0..20 {
-            match agent.get(url).call() {
-                Ok(_) => return,
-                Err(_) if attempt < 19 => std::thread::sleep(std::time::Duration::from_millis(50)),
-                Err(e) => panic!("request to {url} never succeeded: {e}"),
-            }
-        }
-    }
-
-    /// M5-2's own acceptance criterion: a scripted stand-in for the
-    /// human approval step (a direct HTTP POST to `/verify`) drives a
-    /// full register round trip -- device-code request, a still-pending
-    /// poll, the scripted "approval", then a successful poll -- against
-    /// a real running server and a real Postgres database.
-    #[test]
-    fn full_device_registration_round_trip_over_real_http() {
-        let base = start_test_server();
-        let agent = test_agent();
-        // Block until the server is actually accepting connections (see
-        // start_test_server's own comment).
-        get_with_retry(&agent, &format!("{base}/verify"));
-
-        let mut client = control_plane::connect().expect("connect (seeding the tenant directly)");
-        let tenant = create_tenant(&mut client, &unique_slug("http-round-trip")).expect("tenant");
-        let public_key = unique_slug("ssh-ed25519 AAAA...http-round-trip");
-
-        let mut code_http_response = agent
-            .post(format!("{base}/device/code"))
-            .send_json(serde_json::json!({
-                "tenant_slug": tenant.slug,
-                "public_key": public_key,
-            }))
-            .expect("POST /device/code");
-        assert_eq!(code_http_response.status(), 200);
-        let code_response: serde_json::Value = code_http_response
-            .body_mut()
-            .read_json()
-            .expect("parse device/code response");
-        let device_code = code_response["device_code"]
-            .as_str()
-            .expect("device_code")
-            .to_string();
-        let user_code = code_response["user_code"]
-            .as_str()
-            .expect("user_code")
-            .to_string();
-        assert!(code_response["verification_uri"].as_str().is_some());
-        assert!(code_response["interval"].as_i64().unwrap() > 0);
-
-        // Not yet approved: polling now must report authorization_pending.
-        let mut pending_http_response = agent
-            .post(format!("{base}/device/token"))
-            .send_json(serde_json::json!({ "device_code": device_code }))
-            .expect("POST /device/token before approval");
-        assert_eq!(pending_http_response.status(), 400);
-        let pending_body: serde_json::Value = pending_http_response
-            .body_mut()
-            .read_json()
-            .expect("parse pending response");
-        assert_eq!(pending_body["error"], "authorization_pending");
-
-        // The scripted stand-in for the human clicking "approve": a
-        // direct, real HTTP POST to /verify, exactly like a plain HTML
-        // form (no JavaScript) would send.
-        let verify_response = agent
-            .post(format!("{base}/verify"))
-            .header("Content-Type", "application/x-www-form-urlencoded")
-            .send(format!("user_code={user_code}"))
-            .expect("POST /verify");
-        assert_eq!(verify_response.status(), 200);
-
-        // Now polling must report success.
-        let mut approved_http_response = agent
-            .post(format!("{base}/device/token"))
-            .send_json(serde_json::json!({ "device_code": device_code }))
-            .expect("POST /device/token after approval");
-        assert_eq!(approved_http_response.status(), 200);
-        let approved_body: serde_json::Value = approved_http_response
-            .body_mut()
-            .read_json()
-            .expect("parse token response");
-        assert_eq!(approved_body["status"], "approved");
-        assert_eq!(approved_body["tenant_slug"], tenant.slug);
-
-        // The real, load-bearing assertion: the device actually landed
-        // in the control plane, under the right tenant, from the
-        // registered public key -- not just that the HTTP responses
-        // looked right.
-        let registered = control_plane::find_device_by_public_key(&mut client, &public_key)
-            .expect("find_device_by_public_key")
-            .expect("device must actually be registered");
-        assert_eq!(registered.tenant_id, tenant.id);
-        assert!(registered.revoked_at.is_none());
-    }
-
-    #[test]
-    fn device_code_request_for_an_unknown_tenant_is_refused() {
-        let base = start_test_server();
-        let agent = test_agent();
-        get_with_retry(&agent, &format!("{base}/verify"));
-
-        let response = agent
-            .post(format!("{base}/device/code"))
-            .send_json(serde_json::json!({
-                "tenant_slug": unique_slug("never-created-tenant"),
-                "public_key": unique_slug("ssh-ed25519 AAAA...unknown-tenant"),
-            }))
-            .expect("POST /device/code");
-        assert_eq!(response.status(), 404, "an unknown tenant must not succeed");
-    }
-
-    /// M5-6's own fixture: a real bare repo under a fresh `repos_root`,
-    /// a tenant row, and a device with a freshly issued bearer token --
-    /// everything `handle_git_http` needs to have something real to
-    /// authorize against and serve.
-    struct GitHttpFixture {
-        base: String,
-        tenant_slug: String,
-        token: String,
-    }
-
-    fn set_up_git_http_fixture() -> GitHttpFixture {
-        let repos_root = tempfile::Builder::new()
-            .prefix("wkp-hub-http-git-test-repos-")
-            .tempdir()
-            .expect("temp dir")
-            .keep();
-        let tenant_slug = unique_slug("git-http");
-        wkp_git::init_bare_repo(&repos_root.join(format!("{tenant_slug}.git")))
-            .expect("init_bare_repo");
-
-        let mut client = control_plane::connect().expect("connect");
-        let tenant = create_tenant(&mut client, &tenant_slug).expect("create_tenant");
-        let device = control_plane::register_device(
-            &mut client,
-            tenant.id,
-            &unique_slug("ssh-ed25519 AAAA...git-http"),
-        )
-        .expect("register_device");
-        let token =
-            control_plane::issue_bearer_token(&mut client, device.id).expect("issue_bearer_token");
-
-        let base = start_test_server_with_repos_root(repos_root);
-        let agent = test_agent();
-        get_with_retry(&agent, &format!("{base}/verify"));
-
-        GitHttpFixture {
-            base,
-            tenant_slug,
-            token,
-        }
-    }
-
-    /// M5-6's own explicit acceptance criterion (a valid, active
-    /// device's token is accepted) still holds after M5-7 changed what
-    /// happens *next* on acceptance: the front door now proxies to the
-    /// resolved tenant's own pod (ADR-0009) instead of serving
-    /// `git http-backend` itself, so a plain `cargo test` run (no real
-    /// podman pod for this tenant) cannot complete an actual push/clone
-    /// the way M5-6's original version of this test did -- that
-    /// end-to-end proof now belongs to
-    /// `deploy/hub/test-pod-lifecycle.sh`, run against a real running
-    /// pod. What this test still proves directly: a valid,
-    /// active, correctly-tenant-matched token is never rejected by
-    /// this module's own auth checks (401/404) -- whatever happens
-    /// after that (a successful proxy, or a 502/503 because no pod is
-    /// actually running here) is a separate concern.
-    #[test]
-    fn a_valid_active_devices_token_passes_auth_and_reaches_the_proxy_step() {
-        let fixture = set_up_git_http_fixture();
-        let agent = test_agent();
-        let response = agent
-            .get(format!(
-                "{}/{}.git/info/refs?service=git-upload-pack",
-                fixture.base, fixture.tenant_slug
-            ))
-            .header("Authorization", format!("Bearer {}", fixture.token))
-            .call()
-            .expect("GET /info/refs");
-        assert_ne!(
-            response.status(),
-            401,
-            "a valid, active token must not be rejected"
-        );
-        assert_ne!(
-            response.status(),
-            404,
-            "a token correctly matched to its own tenant must not 404"
-        );
-        // The cold-start attempt above creates a real (empty, since
-        // `serve()`'s own test setup passes a deliberately invalid
-        // image name -- see that call site's own comment) podman pod
-        // even though the actual `podman run` inside it fails --
-        // cleaned up here rather than leaking one `wkp-tenant-<slug>`
-        // pod per test run indefinitely.
-        let _ = crate::tenant_pod::stop_pod(&fixture.tenant_slug);
-    }
-
-    /// Test-only exception to CLAUDE.md's "no `Command::new(\"git\")`
+    /// Test-only exception to CLAUDE.md's "no `Command::new("git")`
     /// outside `wkp-git`", the same documented pattern
     /// `wkp-cli/tests/encryption_filter.rs` and `wkp-hub`'s own
     /// `tenant_repo.rs`/`post_receive_hook.rs` tests already use for
@@ -1056,77 +839,22 @@ mod tests {
         assert!(status.success(), "git {args:?} failed: {status:?}");
     }
 
+    /// The URL shape both listeners route on, exercised directly --
+    /// M5-8 moved the front door's dispatcher to `crate::front_door`,
+    /// so this parser is now shared rather than owned by one of them.
     #[test]
-    fn git_http_rejects_a_request_with_no_bearer_token() {
-        let fixture = set_up_git_http_fixture();
-        let agent = test_agent();
-        let response = agent
-            .get(format!(
-                "{}/{}.git/info/refs?service=git-upload-pack",
-                fixture.base, fixture.tenant_slug
-            ))
-            .call()
-            .expect("GET /info/refs");
-        assert_eq!(response.status(), 401);
-    }
-
-    #[test]
-    fn git_http_rejects_an_unknown_token() {
-        let fixture = set_up_git_http_fixture();
-        let agent = test_agent();
-        let response = agent
-            .get(format!(
-                "{}/{}.git/info/refs?service=git-upload-pack",
-                fixture.base, fixture.tenant_slug
-            ))
-            .header("Authorization", "Bearer this-token-was-never-issued")
-            .call()
-            .expect("GET /info/refs");
-        assert_eq!(response.status(), 401);
-    }
-
-    /// M5-6's own explicit acceptance criterion: a revoked device's
-    /// token is rejected, independent of M5-5's SSH-path test.
-    #[test]
-    fn git_http_rejects_a_revoked_devices_token() {
-        let fixture = set_up_git_http_fixture();
-        let mut client = control_plane::connect().expect("connect");
-        let device = control_plane::find_device_by_bearer_token(&mut client, &fixture.token)
-            .expect("find_device_by_bearer_token")
-            .expect("device must exist");
-        control_plane::revoke_device(&mut client, device.id).expect("revoke_device");
-
-        let agent = test_agent();
-        let response = agent
-            .get(format!(
-                "{}/{}.git/info/refs?service=git-upload-pack",
-                fixture.base, fixture.tenant_slug
-            ))
-            .header("Authorization", format!("Bearer {}", fixture.token))
-            .call()
-            .expect("GET /info/refs");
-        assert_eq!(response.status(), 401);
-    }
-
-    /// A token valid for one tenant must never reach another tenant's
-    /// repo, even though both live under the same `repos_root` --
-    /// `handle_git_http`'s own explicit check, not something
-    /// `git http-backend` itself would enforce.
-    #[test]
-    fn git_http_rejects_a_token_used_against_a_different_tenant() {
-        let fixture = set_up_git_http_fixture();
-        let other_tenant_slug = unique_slug("git-http-other-tenant");
-
-        let agent = test_agent();
-        let response = agent
-            .get(format!(
-                "{}/{}.git/info/refs?service=git-upload-pack",
-                fixture.base, other_tenant_slug
-            ))
-            .header("Authorization", format!("Bearer {}", fixture.token))
-            .call()
-            .expect("GET /info/refs");
-        assert_eq!(response.status(), 404);
+    fn git_http_path_recognizes_a_real_git_remote_url() {
+        assert_eq!(
+            git_http_path("/acme.git/info/refs"),
+            Some(("acme".to_string(), "info/refs".to_string()))
+        );
+        assert_eq!(
+            git_http_path("/acme.git/git-upload-pack"),
+            Some(("acme".to_string(), "git-upload-pack".to_string()))
+        );
+        assert_eq!(git_http_path("/verify"), None);
+        assert_eq!(git_http_path("/device/code"), None);
+        assert_eq!(git_http_path("/acme.git/"), None);
     }
 
     /// M5-7 (ADR-0010): the mode a tenant's own pod runs -- serves its

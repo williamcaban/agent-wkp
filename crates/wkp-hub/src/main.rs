@@ -8,7 +8,9 @@
 //! Implementation lands starting in M5; see `docs/plan/milestones.md`.
 
 mod control_plane;
+mod front_door;
 mod http;
+mod hub_ca;
 mod tenant_pod;
 mod tenant_repo;
 mod wkp_shell;
@@ -39,6 +41,22 @@ fn tenant_image() -> String {
     std::env::var(TENANT_IMAGE_ENV).unwrap_or_else(|_| DEFAULT_TENANT_IMAGE.to_string())
 }
 
+/// Where the hub's own root CA lives (M5-8, ADR-0011) -- its
+/// certificate and, at `0600`, its private key. A path, not the secret
+/// itself: CLAUDE.md's rule is that a secret never touches argv or the
+/// environment, and this names a directory the same way
+/// [`REPOS_ROOT_ENV`] above names one. On the hub's persistent volume,
+/// so a restart loads the same root rather than minting a new one and
+/// invalidating every certificate already issued.
+const CA_DIR_ENV: &str = "WKP_HUB_CA_DIR";
+const DEFAULT_CA_DIR: &str = "/srv/wkp-hub/ca";
+
+fn ca_dir() -> std::path::PathBuf {
+    std::env::var(CA_DIR_ENV)
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|_| std::path::PathBuf::from(DEFAULT_CA_DIR))
+}
+
 /// A minimal admin CLI over M5-1's control plane -- `migrate` (ensure
 /// the schema exists), `tenant create`, `device register`/`revoke`.
 /// Genuinely useful operator tooling on its own (provisioning a tenant
@@ -63,7 +81,20 @@ fn main() {
                 .and_then(|_| args.next())
                 .and_then(|p| p.parse::<u16>().ok())
                 .unwrap_or(8080);
-            if let Err(e) = http::serve(port, repos_root(), tenant_image()) {
+            // M5-8 (ADR-0011): the front door terminates TLS with a
+            // certificate the hub's own CA mints, generating and
+            // persisting that CA on first start. Deliberately fatal if
+            // the CA can't be established -- there is no
+            // "fall back to plain HTTP" path, which is the whole point
+            // of this task.
+            let ca = match hub_ca::HubCa::ensure(&ca_dir()) {
+                Ok(ca) => ca,
+                Err(e) => {
+                    eprintln!("wkp-hub: {e}");
+                    std::process::exit(1);
+                }
+            };
+            if let Err(e) = front_door::serve(port, &ca, repos_root(), tenant_image()) {
                 eprintln!("wkp-hub: serve failed: {e}");
                 std::process::exit(1);
             }
@@ -532,10 +563,25 @@ fn main() {
                 std::process::exit(1);
             }
         },
+        // M5-8 (ADR-0011): print the CA's root certificate, generating
+        // it if this hub has never started before. A device has to pin
+        // this to verify the front door at all, and there is no other
+        // supported way to get it out of the hub -- the key file next
+        // to it is `0600` and never leaves, but the certificate is
+        // public information by construction. #123's CSR enrollment
+        // will hand the same bytes back over HTTPS; this is the
+        // operator-side path for bootstrapping before that exists.
+        Some("ca-cert") => match hub_ca::HubCa::ensure(&ca_dir()) {
+            Ok(ca) => print!("{}", ca.root_cert_pem()),
+            Err(e) => {
+                eprintln!("wkp-hub: {e}");
+                std::process::exit(1);
+            }
+        },
         _ => {
             eprintln!(
                 "wkp-hub: usage: wkp-hub serve [--port <port>] | \
-                 serve-tenant --tenant <slug> [--port <port>] | migrate | \
+                 serve-tenant --tenant <slug> [--port <port>] | migrate | ca-cert | \
                  tenant create <slug> | device register <tenant-slug> <public-key> | \
                  device revoke <public-key> | device issue-token <public-key> | \
                  authorized-keys-command <public-key> | \
