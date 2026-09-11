@@ -36,6 +36,7 @@ set -euo pipefail
 IMAGE="${WKP_HUB_IMAGE:-localhost/wkp-hub}"
 WKP_BIN="${WKP_BIN:-wkp}"
 CONTAINER_NAME="wkp-hub-mtls-integration-test"
+GIT_CLIENT_CONTAINER="wkp-hub-mtls-git-client"
 HTTPS_PORT="${WKP_HUB_TEST_HTTPS_PORT:-8443}"
 TENANT="mtls-integration-test"
 NETWORK_NAME="wkp-hub-tenants"
@@ -48,6 +49,7 @@ service_pid=""
 cleanup() {
     podman exec "$CONTAINER_NAME" /usr/local/bin/wkp-hub stop-pod "$TENANT" >/dev/null 2>&1 || true
     podman rm -f "$CONTAINER_NAME" >/dev/null 2>&1 || true
+    podman rm -f "$GIT_CLIENT_CONTAINER" >/dev/null 2>&1 || true
     [ -n "$service_pid" ] && kill "$service_pid" >/dev/null 2>&1 || true
     rm -rf "$WORKDIR"
 }
@@ -75,6 +77,28 @@ done
 [ -S "$PODMAN_SOCK" ] || { echo "FAIL: podman API socket never appeared at $PODMAN_SOCK" >&2; exit 1; }
 
 log "starting wkp-hub container on the shared network"
+# `REPOS_ROOT` (ADR-0012, found by hand -- twice; see below): a
+# tenant's pod is a *host-level sibling* of this front-door container,
+# created by the real host podman through the socket above. That means
+# the `-v <repos_root>/<slug>.git:...` argument `tenant_pod.rs`'s
+# `start_pod` builds is resolved by the *host's* own podman, against
+# the *host's* filesystem -- not against this container's private
+# filesystem, even though the front door's own `wkp-hub serve` process
+# (which writes the bare repo, via `tenant create`) is running inside
+# this container. Mounting a host directory at the container-internal
+# path `/srv/wkp-hub/repos` (first attempt, wrong) does not make that
+# path exist on the *host* at all -- the host's real directory is
+# still wherever `$WORKDIR` actually is, so the host's own podman
+# still can't find it ("statfs ...: no such file or directory",
+# unchanged even after that first fix). The only way both observers --
+# this container's own `wkp-hub serve`, and the host's own podman
+# building a sibling pod's mount args -- agree on one path is to give
+# it the *same literal path* on both sides: mount `$REPOS_ROOT` at
+# that identical absolute path inside the container too, and point
+# `WKP_HUB_REPOS_ROOT` (the same override `main.rs`'s own `repos_root`
+# already reads) at it instead of leaving the container-only default.
+REPOS_ROOT="$WORKDIR/repos"
+mkdir -p "$REPOS_ROOT"
 # `--security-opt label=disable`: found by hand -- SELinux (Enforcing
 # by default on a Fedora host/runner) denies the container's own
 # `podman` (really `podman-remote`) permission to even `connect()` the
@@ -84,13 +108,19 @@ log "starting wkp-hub container on the shared network"
 # blocker, only its SELinux label crossing into this container's own
 # confined domain). Standard, narrowly-scoped escape hatch for exactly
 # this "share the container-runtime socket into one container" shape;
-# does not disable SELinux for anything else on the host.
+# does not disable SELinux for anything else on the host. Also means
+# this container's own view of `$REPOS_ROOT` needs no relabel flag of
+# its own -- it isn't SELinux-confined at all, so it can't conflict
+# with whatever private `:Z` label a tenant pod's own later mount of
+# the same host directory sets.
 podman run -d --name "$CONTAINER_NAME" --network "$NETWORK_NAME" -p "${HTTPS_PORT}:8443" \
     --security-opt label=disable \
     -e DATABASE_URL="$CONTAINER_DATABASE_URL" \
     -e WKP_HUB_TENANT_IMAGE="$IMAGE" \
+    -e WKP_HUB_REPOS_ROOT="$REPOS_ROOT" \
     -e CONTAINER_HOST="unix:///run/podman/podman.sock" \
     -v "${PODMAN_SOCK}:/run/podman/podman.sock" \
+    -v "${REPOS_ROOT}:${REPOS_ROOT}" \
     "$IMAGE" >/dev/null
 
 # If the front door (or sshd) fails to start at all, the container
@@ -104,7 +134,8 @@ if [ "$(podman inspect --format '{{.State.Running}}' "$CONTAINER_NAME" 2>/dev/nu
 fi
 
 hub_exec() {
-    # `CONTAINER_HOST` (ADR-0012): needed by `start-pod`/`stop-pod`
+    # `CONTAINER_HOST`/`WKP_HUB_REPOS_ROOT` (ADR-0012): needed by
+    # `start-pod`/`stop-pod`/`tenant create`
     # (`tenant_pod::orchestrator`) whenever this function calls them --
     # spelled out explicitly here rather than relied on from `podman
     # run`'s own `-e`, matching this function's existing `DATABASE_URL`
@@ -112,6 +143,7 @@ hub_exec() {
     podman exec \
         -e DATABASE_URL="$CONTAINER_DATABASE_URL" \
         -e CONTAINER_HOST="unix:///run/podman/podman.sock" \
+        -e WKP_HUB_REPOS_ROOT="$REPOS_ROOT" \
         "$CONTAINER_NAME" "$@"
 }
 
@@ -199,7 +231,7 @@ fi
 log "pre-starting the tenant's pod (test-pod-lifecycle.sh's own job for start/stop/reap mechanics -- this just needs one running)"
 hub_exec /usr/local/bin/wkp-hub start-pod "$TENANT"
 
-log "pushing a shared item over HTTPS with mTLS -- this must succeed"
+log "preparing a shared item to push"
 cat > "$CLIENT_DIR/shared.md" <<'EOF'
 ---
 visibility: shared
@@ -214,13 +246,52 @@ git -C "$CLIENT_DIR" -c user.email=test@example.com -c user.name=test add -A .wk
 git -C "$CLIENT_DIR" -c user.email=test@example.com -c user.name=test \
     commit -q -m "mtls integration test"
 
+# Runs `git` inside a throwaway Fedora 43 container rather than the
+# runner's own `git`, for the mTLS-authenticated calls specifically
+# (init/add/commit above and below need no TLS at all, so they stay on
+# the runner's own git). Found by hand, tracked as #136: `ubuntu-latest`
+# ships a `git` linked against GnuTLS, not OpenSSL (a longstanding
+# Debian/Ubuntu packaging choice), and GnuTLS's own client-certificate
+# loading in curl cannot parse this device identity's Ed25519 key at
+# all ("error reading X.509 key or certificate file") -- confirmed by
+# hand to be specific to Ed25519 client certs (an ECDSA one completes a
+# full handshake fine through the same GnuTLS-linked git/curl). This is
+# a **real product gap for actual Ubuntu/Debian users**, not just this
+# CI job -- #136 tracks the real fix (re-keying the shared device
+# identity, or a second mTLS-only key).
+#
+# The `wkp-hub` image itself (`fedora-minimal:41`) does *not* work
+# around this either, also found by hand: its own git is OpenSSL-linked
+# but fails the same key with a *different* OpenSSL-level error
+# ("unable to set private key file ... type PEM") -- an older-OpenSSL
+# PKCS8-Ed25519 quirk distinct from, but just as real as, the GnuTLS
+# one. Only a newer OpenSSL (confirmed: `fedora-minimal:43`, matching
+# this exact key/cert combination against a real local hub) loads it
+# cleanly, hence the separate image and version pin here rather than
+# reusing `$IMAGE`.
+#
+# Until #136's real fix lands, this workaround only proves the *hub's
+# own* mTLS mechanism (cert issuance, revocation-at-handshake) works
+# correctly -- it does not, and cannot, prove the device identity's
+# current key algorithm actually works for a real Ubuntu/Debian user.
+GIT_CLIENT_IMAGE="quay.io/fedora/fedora-minimal:43"
+podman run -d --name "$GIT_CLIENT_CONTAINER" --network host \
+    --security-opt label=disable \
+    -v "${WORKDIR}:${WORKDIR}" \
+    --entrypoint sleep \
+    "$GIT_CLIENT_IMAGE" infinity >/dev/null
+podman exec "$GIT_CLIENT_CONTAINER" \
+    microdnf install -y -q --setopt=install_weak_deps=0 git-core >/dev/null
+
 git_mtls() {
-    git -c "http.sslCert=$CLIENT_DIR/.wkp/hub-device-cert.pem" \
+    podman exec "$GIT_CLIENT_CONTAINER" git \
+        -c "http.sslCert=$CLIENT_DIR/.wkp/hub-device-cert.pem" \
         -c "http.sslKey=$CLIENT_DIR/.wkp/hub-device-key.pem" \
         -c "http.sslCAInfo=$WORKDIR/ca-cert.pem" \
         "$@"
 }
 
+log "pushing a shared item over HTTPS with mTLS -- this must succeed"
 git_mtls -C "$CLIENT_DIR" push --quiet "https://127.0.0.1:${HTTPS_PORT}/${TENANT}.git" main
 log "PASS: push succeeded for an active, registered device"
 
