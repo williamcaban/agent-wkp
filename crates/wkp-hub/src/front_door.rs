@@ -76,17 +76,40 @@ pub fn serve(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let listener = std::net::TcpListener::bind(("0.0.0.0", port))?;
     eprintln!("wkp-hub: listening on https://0.0.0.0:{port}");
-    serve_on(listener, ca, repos_root, image)
+    // `true`: the real, production entry point always wants M5-12's
+    // active-connection revocation reset live -- see `serve_on`'s own
+    // doc comment on the parameter for why this isn't the default
+    // every caller gets.
+    serve_on(listener, ca, repos_root, image, true)
 }
 
 /// Like [`serve`], but on a listener the caller already bound -- which
 /// is how a test gets an OS-assigned free port *and* knows its number
 /// before the server starts accepting on it.
+///
+/// `spawn_revocation_listener`: whether to start M5-12's own `LISTEN`
+/// subscriber thread (`listen_for_revocations`), which holds one
+/// Postgres connection open for as long as this front door runs --
+/// forever, in every test that calls this function, since none of them
+/// have a clean shutdown path (the same pre-existing leak this test
+/// suite's own front-door-serving thread already has). Found by hand:
+/// with every one of this module's ~10 front-door tests each opening
+/// its own such connection and never releasing it, a real CI run of
+/// the full suite started intermittently breaking an *unrelated* test
+/// with a connection that died with no response ever written --
+/// consistent with Postgres connection-limit pressure from this
+/// accumulating across the whole test binary's lifetime, not a bug in
+/// the revocation mechanism itself (never reproduced locally, matched
+/// timing or not). Only the handful of tests that actually exercise
+/// revocation-of-an-open-connection need this `true`; every other
+/// front-door test correctly passes `false` via [`start_front_door`]'s
+/// own default.
 pub fn serve_on(
     listener: std::net::TcpListener,
     ca: &HubCa,
     repos_root: PathBuf,
     image: String,
+    spawn_revocation_listener: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut tls = (*ca.server_tls_config()?).clone();
     // `RustlsConfig::from_config` does not set ALPN for us (its own
@@ -100,13 +123,20 @@ pub fn serve_on(
     let app = router(repos_root, image, ca.clone(), orchestrator);
 
     // M5-12 (ADR-0011 addendum): the in-memory open-connection registry
-    // PeerCertAcceptor populates below, and the long-lived `LISTEN`
-    // subscriber (its own dedicated OS thread, not a `tokio` task --
-    // see `listen_for_revocations`'s own doc comment for why) that
-    // force-closes an entry when `control_plane::revoke_device` fires
-    // its `NOTIFY`.
+    // PeerCertAcceptor populates below, and (when requested -- see this
+    // function's own doc comment on `spawn_revocation_listener`) the
+    // long-lived `LISTEN` subscriber (its own dedicated OS thread, not
+    // a `tokio` task -- see `listen_for_revocations`'s own doc comment
+    // for why) that force-closes an entry when
+    // `control_plane::revoke_device` fires its `NOTIFY`. The registry
+    // itself is always created and wired into `PeerCertAcceptor`
+    // regardless -- only the background `NOTIFY` subscriber is
+    // conditional, so a connection is still registered and *can* be
+    // closed directly (`ConnectionRegistry::close_device`/`close_all`)
+    // even without this thread; it just won't react to a real
+    // `NOTIFY` on its own.
     let registry = ConnectionRegistry::new();
-    {
+    if spawn_revocation_listener {
         let registry = Arc::clone(&registry);
         // Same `DATABASE_URL` env var `control_plane::connect` reads
         // -- read directly here rather than through that function
@@ -459,7 +489,27 @@ mod tests {
         _ca_dir: tempfile::TempDir,
     }
 
+    /// `false`: this module's own tests never revoke an *already-open*
+    /// connection except the handful that explicitly need to (which
+    /// call [`start_front_door_with_revocation_listener`] instead) --
+    /// see `serve_on`'s own doc comment on `spawn_revocation_listener`
+    /// for why every other test deliberately skips it (a real,
+    /// found-by-hand Postgres connection-pressure issue from ~10 tests
+    /// each leaking one permanent `LISTEN` connection otherwise).
     fn start_front_door() -> TestFrontDoor {
+        start_front_door_with(false)
+    }
+
+    /// Like [`start_front_door`], but with M5-12's real `LISTEN`
+    /// subscriber actually running -- for the handful of tests that
+    /// specifically need a `NOTIFY`-triggered force-close to happen on
+    /// its own, not just `ConnectionRegistry::close_device`/`close_all`
+    /// called directly.
+    fn start_front_door_with_revocation_listener() -> TestFrontDoor {
+        start_front_door_with(true)
+    }
+
+    fn start_front_door_with(spawn_revocation_listener: bool) -> TestFrontDoor {
         let ca_dir = tempfile::Builder::new()
             .prefix("wkp-hub-front-door-test-ca-")
             .tempdir()
@@ -479,7 +529,13 @@ mod tests {
         std::thread::spawn(move || {
             // The image name is irrelevant here: no test in this module
             // reaches the tenant-pod cold-start path.
-            let _ = serve_on(listener, &server_ca, repos_root, "unused".to_string());
+            let _ = serve_on(
+                listener,
+                &server_ca,
+                repos_root,
+                "unused".to_string(),
+                spawn_revocation_listener,
+            );
         });
 
         TestFrontDoor {
@@ -1255,7 +1311,7 @@ mod tests {
     /// test deliberately never makes.
     #[test]
     fn revoking_a_device_force_closes_its_already_open_connection() {
-        let front_door = start_front_door();
+        let front_door = start_front_door_with_revocation_listener();
         let mut client = control_plane::connect().expect("connect");
         let tenant = create_tenant(&mut client, &unique_slug("revoke-open-conn")).expect("tenant");
         let (device, cert_chain, key) = issue_device_cert(&front_door, tenant.id);
@@ -1295,7 +1351,7 @@ mod tests {
     /// ordinary single-device revoke.
     #[test]
     fn reset_all_connections_closes_every_open_connection() {
-        let front_door = start_front_door();
+        let front_door = start_front_door_with_revocation_listener();
         let mut client = control_plane::connect().expect("connect");
         let tenant =
             create_tenant(&mut client, &unique_slug("reset-all-open-conns")).expect("tenant");
