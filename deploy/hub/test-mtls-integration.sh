@@ -75,6 +75,22 @@ done
 [ -S "$PODMAN_SOCK" ] || { echo "FAIL: podman API socket never appeared at $PODMAN_SOCK" >&2; exit 1; }
 
 log "starting wkp-hub container on the shared network"
+# `REPOS_ROOT` (ADR-0012, found by hand this run): a tenant's pod is a
+# *host-level sibling* of this front-door container, created by the
+# real host podman through the socket above -- its own bind mount
+# (`tenant_pod.rs`'s `repo_mount_arg`) is a path on the *host*
+# filesystem, not inside this container's private one. Without this,
+# `wkp-hub tenant create` (run inside the front door via `hub_exec`)
+# writes the bare repo into a path that only exists in the front
+# door's own ephemeral container filesystem, invisible to the host,
+# and the tenant pod's bind mount of that same path fails outright
+# ("statfs ...: no such file or directory"). Bind-mounting a real host
+# directory at the same fixed `/srv/wkp-hub/repos` path both the front
+# door and every tenant pod already agree on (`tenant_pod.rs`'s own
+# module doc) is what actually makes that path exist on the host, not
+# just inside one container.
+REPOS_ROOT="$WORKDIR/repos"
+mkdir -p "$REPOS_ROOT"
 # `--security-opt label=disable`: found by hand -- SELinux (Enforcing
 # by default on a Fedora host/runner) denies the container's own
 # `podman` (really `podman-remote`) permission to even `connect()` the
@@ -84,13 +100,18 @@ log "starting wkp-hub container on the shared network"
 # blocker, only its SELinux label crossing into this container's own
 # confined domain). Standard, narrowly-scoped escape hatch for exactly
 # this "share the container-runtime socket into one container" shape;
-# does not disable SELinux for anything else on the host.
+# does not disable SELinux for anything else on the host. Also means
+# this container's own view of `$REPOS_ROOT` needs no relabel flag of
+# its own -- it isn't SELinux-confined at all, so it can't conflict
+# with whatever private `:Z` label a tenant pod's own later mount of
+# the same host directory sets.
 podman run -d --name "$CONTAINER_NAME" --network "$NETWORK_NAME" -p "${HTTPS_PORT}:8443" \
     --security-opt label=disable \
     -e DATABASE_URL="$CONTAINER_DATABASE_URL" \
     -e WKP_HUB_TENANT_IMAGE="$IMAGE" \
     -e CONTAINER_HOST="unix:///run/podman/podman.sock" \
     -v "${PODMAN_SOCK}:/run/podman/podman.sock" \
+    -v "${REPOS_ROOT}:/srv/wkp-hub/repos" \
     "$IMAGE" >/dev/null
 
 # If the front door (or sshd) fails to start at all, the container
