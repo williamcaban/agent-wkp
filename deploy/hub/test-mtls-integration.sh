@@ -229,7 +229,7 @@ fi
 log "pre-starting the tenant's pod (test-pod-lifecycle.sh's own job for start/stop/reap mechanics -- this just needs one running)"
 hub_exec /usr/local/bin/wkp-hub start-pod "$TENANT"
 
-log "pushing a shared item over HTTPS with mTLS -- this must succeed"
+log "preparing a shared item to push"
 cat > "$CLIENT_DIR/shared.md" <<'EOF'
 ---
 visibility: shared
@@ -251,7 +251,20 @@ git_mtls() {
         "$@"
 }
 
-git_mtls -C "$CLIENT_DIR" push --quiet "https://127.0.0.1:${HTTPS_PORT}/${TENANT}.git" main
+# Diagnostic only, temporary: an Ed25519 client certificate is real
+# surface for a runner's own git/curl/OpenSSL build to disagree with
+# what this sandbox's own (much newer) OpenSSL happily parses and
+# presents -- printed once here, and GIT_CURL_VERBOSE on this first
+# push only, so a genuine environment-specific TLS failure shows its
+# actual OpenSSL-level reason instead of curl's generic wrapper
+# message alone.
+log "git/curl/openssl versions on this runner (diagnostic)"
+git --version
+curl --version | head -1
+openssl version
+
+log "pushing a shared item over HTTPS with mTLS -- this must succeed"
+GIT_CURL_VERBOSE=1 git_mtls -C "$CLIENT_DIR" push "https://127.0.0.1:${HTTPS_PORT}/${TENANT}.git" main
 log "PASS: push succeeded for an active, registered device"
 
 log "fetching the same item back into a fresh clone -- this must succeed"
