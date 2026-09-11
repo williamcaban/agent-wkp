@@ -141,8 +141,15 @@ axum-server = { version = "0.8.0", default-features = false, features = ["tls-ru
 # existing handler this crate re-serves through `axum` is blocking
 # (Postgres, `git http-backend`, `ureq` to a tenant pod) and none of
 # it is being converted to async -- it runs on the blocking pool
-# instead. Feature set kept to what that actually needs.
-tokio = { version = "1", default-features = false, features = ["rt-multi-thread", "net", "time"] }
+# instead. "sync"/"macros"/"io-util" (M5-12): `connection_registry.rs`
+# needs `tokio::sync::Notify` (via `tokio-util`'s `CancellationToken`,
+# below) and its own `#[tokio::test]`/`tokio::io::duplex` test
+# coverage -- both were already present transitively (`axum-server`'s
+# own dependency tree pulls them in via Cargo's feature unification),
+# made direct here since this crate's own code now names them
+# explicitly, matching this dependency's existing "declare what's
+# actually used" convention.
+tokio = { version = "1", default-features = false, features = ["rt-multi-thread", "net", "time", "sync", "macros", "io-util"] }
 # M5-10 (ADR-0011): `front_door::PeerCertAcceptor` wraps `axum-server`'s
 # `RustlsAcceptor` to read the peer certificate off the completed
 # handshake (`tokio_rustls::server::TlsStream::get_ref`) and inject it
@@ -156,6 +163,14 @@ tokio = { version = "1", default-features = false, features = ["rt-multi-thread"
 # for.
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring"] }
 tower-layer = "0.3"
+# M5-12 (ADR-0011 addendum): `connection_registry.rs`'s own
+# cancel-a-specific-open-connection mechanism. Already present
+# transitively (`hyper-util`/`tower`'s own dependency tree) -- made
+# direct because this crate now names `CancellationToken` explicitly.
+# `default-features = false, features = []`: `CancellationToken` isn't
+# gated behind any `tokio-util` feature at all (unlike its `codec`/
+# `io-util`/`compat` utilities, which this crate has no use for).
+tokio-util = { version = "0.7", default-features = false }
 
 [dev-dependencies]
 # M5-4: `tenant_repo`'s own tests and `tests/post_receive_hook.rs` need a

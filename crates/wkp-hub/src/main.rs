@@ -11,6 +11,7 @@
 //! in favor of mTLS over HTTPS and its code removed -- see
 //! `docs/adr/0011-drop-ssh-mtls-transport.md`.
 
+mod connection_registry;
 mod control_plane;
 mod front_door;
 mod http;
@@ -509,6 +510,44 @@ fn main() {
                 std::process::exit(1);
             }
         },
+        // M5-12 (ADR-0011 addendum): the reset-all tier -- force-closes
+        // *every* currently-open, certificate-authenticated connection
+        // across every tenant and device, not just one (that's `device
+        // revoke`/`revoke-id` above, unaffected by this command). A
+        // top-level subcommand, not nested under `device`, since this
+        // isn't about any one device -- it resets the front door's own
+        // connection registry globally. `--by <label>` is required, not
+        // optional with a default: an unattributed reset-all is exactly
+        // the audit gap this command's own `connection_reset_events`
+        // row exists to close (issue #128's own acceptance criterion).
+        Some("reset-all-connections") => {
+            let mut performed_by: Option<String> = None;
+            while let Some(arg) = args.next() {
+                match arg.as_str() {
+                    "--by" => performed_by = args.next(),
+                    other => {
+                        eprintln!("wkp-hub: reset-all-connections: unrecognized argument {other}");
+                        std::process::exit(1);
+                    }
+                }
+            }
+            let Some(performed_by) = performed_by else {
+                eprintln!("wkp-hub: usage: wkp-hub reset-all-connections --by <label>");
+                std::process::exit(1);
+            };
+            let result = control_plane::connect().and_then(|mut client| {
+                control_plane::reset_all_connections(&mut client, &performed_by)
+            });
+            match result {
+                Ok(()) => println!(
+                    "wkp-hub: reset-all-connections requested, performed by {performed_by:?}"
+                ),
+                Err(e) => {
+                    eprintln!("wkp-hub: reset-all-connections failed: {e}");
+                    std::process::exit(1);
+                }
+            }
+        }
         // M5-8 (ADR-0011): print the CA's root certificate, generating
         // it if this hub has never started before. A device has to pin
         // this to verify the front door at all, and there is no other
@@ -530,6 +569,7 @@ fn main() {
                  serve-tenant --tenant <slug> [--port <port>] | migrate | ca-cert | \
                  tenant create <slug> | device register <tenant-slug> <public-key> | \
                  device revoke <public-key> | device revoke-id <device-id> | \
+                 reset-all-connections --by <label> | \
                  index-tenant <tenant-slug> | \
                  provision-repo <tenant-slug> | start-pod <tenant-slug> | \
                  stop-pod <tenant-slug> | reap-idle-pods [--idle-minutes <n>]"

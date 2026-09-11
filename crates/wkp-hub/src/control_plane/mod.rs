@@ -87,6 +87,10 @@ pub enum Error {
     /// A `/dev/urandom` read failed while generating a grant's
     /// `device_code`/`user_code` ([`grants`]).
     Io(std::io::Error),
+    /// A caller-supplied argument fails a basic sanity check before any
+    /// query even runs -- e.g. [`reset_all_connections`]'s empty
+    /// `performed_by`.
+    InvalidInput(String),
 }
 
 impl std::fmt::Display for Error {
@@ -102,6 +106,7 @@ impl std::fmt::Display for Error {
             Error::Postgres(e) => write!(f, "postgres error: {e}"),
             Error::NotFound(what) => write!(f, "not found: {what}"),
             Error::Io(e) => write!(f, "I/O error: {e}"),
+            Error::InvalidInput(what) => write!(f, "invalid input: {what}"),
         }
     }
 }
@@ -363,12 +368,75 @@ pub fn issue_device_certificate(
 /// Revokes a device (sets `revoked_at` to now, if not already set).
 /// Idempotent: revoking an already-revoked device leaves its original
 /// `revoked_at` untouched rather than overwriting it with a later
-/// timestamp.
+/// timestamp, and does not re-fire the notification below (M5-10's
+/// per-handshake check and M5-12's force-close already both took
+/// effect the first time).
+///
+/// M5-12 (ADR-0011 addendum): if this revoke actually changed the row
+/// *and* the device has a certificate (an admin-CLI-registered device
+/// with no CSR/cert, M5-9's raw-public-key bypass, has nothing an open
+/// mTLS connection could even be keyed on), issues a Postgres `NOTIFY`
+/// on [`crate::connection_registry::NOTIFY_CHANNEL`] with the device's
+/// own certificate serial as payload, in the same transaction as the
+/// `UPDATE` -- so a rolled-back revoke (the row wasn't actually
+/// changed, e.g. an idempotent no-op) never fires a notification for
+/// nothing, and the front door's `LISTEN` subscriber only ever hears
+/// about a revoke that's already durably committed.
 pub fn revoke_device(client: &mut Client, device_id: i64) -> Result<(), Error> {
-    client.execute(
-        "UPDATE devices SET revoked_at = now() WHERE id = $1 AND revoked_at IS NULL",
+    let mut tx = client.transaction()?;
+    let row = tx.query_opt(
+        "UPDATE devices SET revoked_at = now() \
+         WHERE id = $1 AND revoked_at IS NULL \
+         RETURNING cert_serial",
         &[&device_id],
     )?;
+    if let Some(row) = row {
+        let cert_serial: Option<String> = row.get("cert_serial");
+        if let Some(cert_serial) = cert_serial {
+            // `pg_notify(text, text)`, not the `NOTIFY channel,
+            // 'payload'` SQL command -- the command form takes its
+            // payload as a string *literal*, not a bind parameter, so
+            // building it would mean hand-escaping `cert_serial`
+            // ourselves; the function form takes ordinary `$1`/`$2`
+            // parameters like any other query.
+            tx.execute(
+                "SELECT pg_notify($1, $2)",
+                &[&crate::connection_registry::NOTIFY_CHANNEL, &cert_serial],
+            )?;
+        }
+    }
+    tx.commit()?;
+    Ok(())
+}
+
+/// M5-12's reset-all tier: force-closes *every* currently-open
+/// connection across every tenant and device, not just one -- the
+/// "assume broader compromise" admin action, always separately invoked
+/// and separately audited (this function's own `connection_reset_events`
+/// row), never a side effect of an ordinary [`revoke_device`] call.
+/// `performed_by` is a free-text label (see that table's own doc
+/// comment for why); never empty, since an unattributed reset-all is
+/// exactly the audit gap issue #128 asked this table to close.
+pub fn reset_all_connections(client: &mut Client, performed_by: &str) -> Result<(), Error> {
+    let performed_by = performed_by.trim();
+    if performed_by.is_empty() {
+        return Err(Error::InvalidInput(
+            "reset_all_connections requires a non-empty performed_by".to_string(),
+        ));
+    }
+    let mut tx = client.transaction()?;
+    tx.execute(
+        "INSERT INTO connection_reset_events (performed_by) VALUES ($1)",
+        &[&performed_by],
+    )?;
+    tx.execute(
+        "SELECT pg_notify($1, $2)",
+        &[
+            &crate::connection_registry::NOTIFY_CHANNEL,
+            &crate::connection_registry::RESET_ALL_PAYLOAD,
+        ],
+    )?;
+    tx.commit()?;
     Ok(())
 }
 

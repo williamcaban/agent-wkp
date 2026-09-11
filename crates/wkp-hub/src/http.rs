@@ -303,6 +303,25 @@ pub(crate) struct GitHttpRoute<'a> {
     pub(crate) query: &'a str,
 }
 
+/// Hex-encodes a peer certificate's own serial, read back off its
+/// *signed DER* (never re-derived from pre-signing bytes -- see
+/// `hub_ca::sign_device_csr`'s own doc comment for the DER-padding bug
+/// that taught this lesson). Shared by this module's own cert-serial
+/// lookup below and `front_door::PeerCertAcceptor`
+/// (M5-12, `connection_registry`), so both ever agree on the exact
+/// same string [`control_plane::find_device_by_cert_serial`] indexes
+/// on and [`crate::connection_registry::ConnectionRegistry`] keys on.
+/// `None` for a certificate that doesn't even parse as X.509.
+pub(crate) fn cert_serial_hex(der: &[u8]) -> Option<String> {
+    let (_, cert) = X509Certificate::from_der(der).ok()?;
+    Some(
+        cert.raw_serial()
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect(),
+    )
+}
+
 pub(crate) fn handle_git_http(
     request: &Incoming,
     method: &str,
@@ -337,15 +356,9 @@ pub(crate) fn handle_git_http(
     let Some(peer_cert) = peer_cert else {
         return Rendered::status_only(401);
     };
-    let (_, cert) = match X509Certificate::from_der(peer_cert) {
-        Ok(parsed) => parsed,
-        Err(_) => return Rendered::status_only(401),
+    let Some(cert_serial) = cert_serial_hex(peer_cert) else {
+        return Rendered::status_only(401);
     };
-    let cert_serial: String = cert
-        .raw_serial()
-        .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect();
 
     let mut client = match control_plane::connect() {
         Ok(c) => c,

@@ -28,6 +28,7 @@
 //! and everything else through [`crate::http::git_http_path`], so a
 //! request that reached `handle_git_http` before still does.
 
+use crate::connection_registry::{CancellableStream, ConnectionRegistry};
 use crate::http::{self, Incoming, Rendered};
 use crate::hub_ca::HubCa;
 use axum::body::Bytes;
@@ -97,13 +98,36 @@ pub fn serve_on(
     let orchestrator: Arc<dyn crate::tenant_pod::PodOrchestrator> =
         Arc::from(crate::tenant_pod::orchestrator()?);
     let app = router(repos_root, image, ca.clone(), orchestrator);
+
+    // M5-12 (ADR-0011 addendum): the in-memory open-connection registry
+    // PeerCertAcceptor populates below, and the long-lived `LISTEN`
+    // subscriber (its own dedicated OS thread, not a `tokio` task --
+    // see `listen_for_revocations`'s own doc comment for why) that
+    // force-closes an entry when `control_plane::revoke_device` fires
+    // its `NOTIFY`.
+    let registry = ConnectionRegistry::new();
+    {
+        let registry = Arc::clone(&registry);
+        // Same `DATABASE_URL` env var `control_plane::connect` reads
+        // -- read directly here rather than through that function
+        // since this thread needs the raw string, not a `Client`
+        // (`postgres::Client::connect` is what `listen_for_revocations`
+        // itself calls, once per reconnect attempt).
+        let database_url = std::env::var("DATABASE_URL")
+            .map_err(|_| "DATABASE_URL must be set for the revocation LISTEN subscriber")?;
+        std::thread::spawn(move || {
+            crate::connection_registry::listen_for_revocations(database_url, registry)
+        });
+    }
+
     // M5-10 (ADR-0011): wraps the plain `RustlsAcceptor` to pull the
     // peer certificate (if any) out of each connection's completed TLS
     // handshake and inject it as a request extension -- see
     // `PeerCertAcceptor`'s own doc comment for why this, rather than
     // `handle_git_http` reaching for it some other way, is where that
-    // has to happen.
-    let acceptor = PeerCertAcceptor::new(RustlsAcceptor::new(tls));
+    // has to happen. M5-12: also where a certificate-bearing
+    // connection registers itself for force-close.
+    let acceptor = PeerCertAcceptor::new(RustlsAcceptor::new(tls), registry);
 
     // `enable_all` rather than a hand-picked reactor set: `axum-server`
     // needs both the I/O driver (for the listener) and the timer.
@@ -160,11 +184,15 @@ struct PeerCertificate(Option<CertificateDer<'static>>);
 #[derive(Clone)]
 struct PeerCertAcceptor {
     inner: RustlsAcceptor,
+    /// M5-12 (ADR-0011 addendum): a certificate-bearing connection
+    /// registers itself here so a later revocation can force-close it;
+    /// see [`CancellableStream`]'s own doc comment for the mechanism.
+    registry: Arc<ConnectionRegistry>,
 }
 
 impl PeerCertAcceptor {
-    fn new(inner: RustlsAcceptor) -> Self {
-        PeerCertAcceptor { inner }
+    fn new(inner: RustlsAcceptor, registry: Arc<ConnectionRegistry>) -> Self {
+        PeerCertAcceptor { inner, registry }
     }
 }
 
@@ -173,7 +201,7 @@ where
     I: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     S: Send + 'static,
 {
-    type Stream = tokio_rustls::server::TlsStream<I>;
+    type Stream = CancellableStream<tokio_rustls::server::TlsStream<I>>;
     type Service = axum::middleware::AddExtension<S, PeerCertificate>;
     type Future = std::pin::Pin<
         Box<
@@ -183,16 +211,38 @@ where
 
     fn accept(&self, stream: I, service: S) -> Self::Future {
         let inner = self.inner.clone();
+        let registry = Arc::clone(&self.registry);
         Box::pin(async move {
             let (stream, service) = inner.accept(stream, service).await?;
-            let peer_cert = PeerCertificate(
-                stream
-                    .get_ref()
-                    .1
-                    .peer_certificates()
-                    .and_then(|certs| certs.first())
-                    .cloned(),
+            let cert = stream
+                .get_ref()
+                .1
+                .peer_certificates()
+                .and_then(|certs| certs.first())
+                .cloned();
+            // A connection with no certificate at all (the RFC 8628
+            // enrollment routes) has nothing to register -- there is
+            // no device identity a revocation could ever be issued
+            // against for it. A certificate present but not parseable
+            // as X.509 here shouldn't happen (the handshake itself
+            // already required a chain rustls accepted), but is
+            // treated the same as "no cert" rather than failing the
+            // connection outright -- `handle_git_http`'s own re-parse
+            // is still the actual authority on whether this
+            // connection may do anything.
+            let (token, guard) = match cert.as_deref().and_then(http::cert_serial_hex) {
+                Some(cert_serial) => {
+                    let (token, guard) = registry.register(cert_serial);
+                    (Some(token), Some(guard))
+                }
+                None => (None, None),
+            };
+            let stream = CancellableStream::new(
+                stream,
+                token.unwrap_or_else(tokio_util::sync::CancellationToken::new),
+                guard,
             );
+            let peer_cert = PeerCertificate(cert);
             let service = Extension(peer_cert).layer(service);
             Ok((stream, service))
         })
@@ -1064,5 +1114,219 @@ mod tests {
         let (status, body) = get(&front_door, "/no/such/route", None);
         assert_eq!(status, 404);
         assert!(body.contains("not_found"), "body: {body}");
+    }
+
+    /// Opens a real mTLS connection, completes one request/response
+    /// over it *without* `Connection: close` -- so the connection
+    /// stays open afterward, per HTTP/1.1's own default -- and hands
+    /// back the still-live `rustls::ClientConnection` + `TcpStream`
+    /// for a test to keep using. `PeerCertAcceptor` registers a
+    /// connection in [`ConnectionRegistry`] as soon as its handshake
+    /// completes (M5-12), which happens lazily on this first
+    /// read/write -- by the time this function returns, the
+    /// connection is both open *and* already registered.
+    fn open_persistent_connection(
+        front_door: &TestFrontDoor,
+        path: &str,
+        client_identity: (Vec<CertificateDer<'static>>, PrivateKeyDer<'static>),
+    ) -> (rustls::ClientConnection, std::net::TcpStream) {
+        let mut roots = rustls::RootCertStore::empty();
+        for cert in pem_certs(&front_door.root_pem) {
+            roots.add(cert).expect("trust the hub's own root");
+        }
+        let builder = rustls::ClientConfig::builder_with_provider(Arc::new(
+            rustls::crypto::ring::default_provider(),
+        ))
+        .with_safe_default_protocol_versions()
+        .expect("protocol versions")
+        .with_root_certificates(roots);
+        let (chain, key) = client_identity;
+        let config = builder
+            .with_client_auth_cert(chain, key)
+            .expect("valid client-auth certificate/key material");
+
+        let server_name = rustls_pki_types::ServerName::try_from("localhost").expect("server name");
+        let mut connection = rustls::ClientConnection::new(Arc::new(config), server_name)
+            .expect("client connection");
+
+        let mut socket = None;
+        for attempt in 0..40 {
+            match std::net::TcpStream::connect(("127.0.0.1", front_door.port)) {
+                Ok(s) => {
+                    socket = Some(s);
+                    break;
+                }
+                Err(e) if attempt < 39 => {
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                    let _ = e;
+                }
+                Err(e) => panic!("could not connect to the front door: {e}"),
+            }
+        }
+        let mut socket = socket.expect("connected");
+
+        {
+            let mut stream = rustls::Stream::new(&mut connection, &mut socket);
+            let request = format!("GET {path} HTTP/1.1\r\nHost: localhost\r\n\r\n");
+            stream
+                .write_all(request.as_bytes())
+                .and_then(|_| stream.flush())
+                .expect("write the request");
+            let raw = read_available(&mut stream).expect("read the response");
+            let head = String::from_utf8_lossy(&raw);
+            let status = head
+                .lines()
+                .next()
+                .and_then(|l| l.split_whitespace().nth(1))
+                .and_then(|c| c.parse::<u16>().ok())
+                .unwrap_or_else(|| panic!("no status line in response: {head:?}"));
+            assert_eq!(status, 200, "response: {head}");
+        }
+
+        (connection, socket)
+    }
+
+    /// Reads whatever the peer sends within a short bounded window,
+    /// then stops -- deliberately not `read_to_end` (which would block
+    /// forever on a connection the peer is keeping open per HTTP/1.1
+    /// keep-alive) and deliberately not exact `Content-Length`
+    /// parsing (every response `open_persistent_connection` reads is
+    /// small enough to arrive well within the window in practice, on
+    /// a loopback connection with nothing else contending for it).
+    /// `Err` for any signal that the connection itself ended --
+    /// including `UnexpectedEof` (rustls's own error for "the peer
+    /// closed the TCP connection without a TLS `close_notify`", the
+    /// exact shape a force-closed connection's next read takes) -- not
+    /// just an ordinary transport error; only `WouldBlock`/`TimedOut`
+    /// ("nothing new arrived within the window, but nothing said the
+    /// connection ended either") counts as "still open."
+    fn read_available(
+        stream: &mut rustls::Stream<rustls::ClientConnection, std::net::TcpStream>,
+    ) -> std::io::Result<Vec<u8>> {
+        stream
+            .sock
+            .set_read_timeout(Some(std::time::Duration::from_millis(500)))
+            .expect("set_read_timeout");
+        let mut raw = Vec::new();
+        let mut buf = [0u8; 4096];
+        loop {
+            match stream.read(&mut buf) {
+                Ok(0) => {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::UnexpectedEof,
+                        "connection closed (clean EOF)",
+                    ));
+                }
+                Ok(n) => raw.extend_from_slice(&buf[..n]),
+                Err(e)
+                    if e.kind() == std::io::ErrorKind::WouldBlock
+                        || e.kind() == std::io::ErrorKind::TimedOut =>
+                {
+                    return Ok(raw);
+                }
+                Err(e) => return Err(e),
+            }
+        }
+    }
+
+    /// Tries one more read on an already-open connection and reports
+    /// whether it's still usable -- `Ok` for "still open" (whether or
+    /// not any new bytes actually arrived in the window), `Err` for
+    /// "the connection itself ended," which is the shape a
+    /// force-closed connection's next read takes (the underlying TCP
+    /// RST/abort `CancellableStream`'s own `ConnectionAborted` on the
+    /// *server* side produces, observed here as a read failure on the
+    /// client side of the same socket).
+    fn probe_connection(
+        connection: &mut rustls::ClientConnection,
+        socket: &mut std::net::TcpStream,
+    ) -> std::io::Result<Vec<u8>> {
+        let mut stream = rustls::Stream::new(connection, socket);
+        stream.write_all(b"\r\n")?;
+        stream.flush()?;
+        read_available(&mut stream)
+    }
+
+    /// M5-12's own required test: an open, valid connection is
+    /// force-closed within one poll/notify cycle of its device being
+    /// revoked, *without* waiting for a new connection attempt --
+    /// M5-10's own per-handshake check (a separate, already-covered
+    /// guarantee) only ever protects the *next* connection, which this
+    /// test deliberately never makes.
+    #[test]
+    fn revoking_a_device_force_closes_its_already_open_connection() {
+        let front_door = start_front_door();
+        let mut client = control_plane::connect().expect("connect");
+        let tenant = create_tenant(&mut client, &unique_slug("revoke-open-conn")).expect("tenant");
+        let (device, cert_chain, key) = issue_device_cert(&front_door, tenant.id);
+
+        let (mut connection, mut socket) =
+            open_persistent_connection(&front_door, "/verify", (cert_chain, key));
+
+        // The connection must be genuinely usable *before* revocation
+        // -- otherwise a later failure wouldn't prove anything about
+        // revocation specifically.
+        probe_connection(&mut connection, &mut socket).expect("connection usable before revoke");
+
+        control_plane::revoke_device(&mut client, device.id).expect("revoke_device");
+
+        // `NOTIFY` delivery plus this crate's own LISTEN subscriber
+        // reacting to it is not instantaneous -- bounded polling
+        // rather than a fixed sleep, but capped well under
+        // connection_registry::SWEEP_INTERVAL (30s) so this test only
+        // ever exercises the NOTIFY fast path, never the periodic
+        // fallback sweep (a separate concern, not what this test is
+        // about).
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            match probe_connection(&mut connection, &mut socket) {
+                Err(_) => break, // force-closed, as expected
+                Ok(_) if std::time::Instant::now() >= deadline => {
+                    panic!("connection was still usable 10s after its device was revoked")
+                }
+                Ok(_) => std::thread::sleep(std::time::Duration::from_millis(100)),
+            }
+        }
+    }
+
+    /// M5-12's own required test: reset-all closes every open
+    /// connection in a multi-connection fixture -- the "assume broader
+    /// compromise" tier, distinct from (and not triggered by) an
+    /// ordinary single-device revoke.
+    #[test]
+    fn reset_all_connections_closes_every_open_connection() {
+        let front_door = start_front_door();
+        let mut client = control_plane::connect().expect("connect");
+        let tenant =
+            create_tenant(&mut client, &unique_slug("reset-all-open-conns")).expect("tenant");
+        let (_device_a, cert_chain_a, key_a) = issue_device_cert(&front_door, tenant.id);
+        let (_device_b, cert_chain_b, key_b) = issue_device_cert(&front_door, tenant.id);
+
+        let (mut connection_a, mut socket_a) =
+            open_persistent_connection(&front_door, "/verify", (cert_chain_a, key_a));
+        let (mut connection_b, mut socket_b) =
+            open_persistent_connection(&front_door, "/verify", (cert_chain_b, key_b));
+
+        probe_connection(&mut connection_a, &mut socket_a).expect("a usable before reset-all");
+        probe_connection(&mut connection_b, &mut socket_b).expect("b usable before reset-all");
+
+        control_plane::reset_all_connections(&mut client, "test suite")
+            .expect("reset_all_connections");
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let a_closed = probe_connection(&mut connection_a, &mut socket_a).is_err();
+            let b_closed = probe_connection(&mut connection_b, &mut socket_b).is_err();
+            if a_closed && b_closed {
+                break;
+            }
+            if std::time::Instant::now() >= deadline {
+                panic!(
+                    "not every connection was closed 10s after reset-all \
+                     (a_closed={a_closed}, b_closed={b_closed})"
+                );
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
     }
 }

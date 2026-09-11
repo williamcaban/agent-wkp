@@ -98,6 +98,22 @@ CREATE TABLE IF NOT EXISTS device_grants (
     expires_at TIMESTAMPTZ NOT NULL,
     approved_device_id BIGINT REFERENCES devices (id)
 );
+
+-- M5-12 (ADR-0011 addendum): the reset-all tier's own audit trail --
+-- "close every open connection, for every device" is the blunt
+-- "assume broader compromise" hammer, explicitly required (issue
+-- #128's own acceptance criteria) to be an audited action distinct
+-- from an ordinary single-device revoke, which already has no
+-- equivalent log of its own (out of scope here -- that's #124's
+-- concern, unaffected by this table). `performed_by` is free text (an
+-- operator-supplied label, e.g. `--by`, or the OS user running the
+-- CLI) -- this control plane has no notion of an authenticated admin
+-- identity to attribute this to more precisely than that.
+CREATE TABLE IF NOT EXISTS connection_reset_events (
+    id BIGSERIAL PRIMARY KEY,
+    performed_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    performed_by TEXT NOT NULL
+);
 "#;
 
 pub(super) fn create_schema(client: &mut Client) -> Result<(), postgres::Error> {
