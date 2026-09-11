@@ -47,8 +47,10 @@ use std::process::Command;
 pub const NETWORK_NAME: &str = "wkp-hub-tenants";
 
 /// Fixed for every tenant's own pod -- safe precisely because each pod
-/// has its own network namespace; see the module doc comment.
-const SERVE_PORT: u16 = 8080;
+/// has its own network namespace; see the module doc comment. `pub`:
+/// `http.rs`'s own proxy (M5-7 PR 4) needs the exact same value to
+/// address a tenant's pod.
+pub const SERVE_PORT: u16 = 8080;
 
 fn pod_name(tenant_slug: &str) -> String {
     format!("wkp-tenant-{tenant_slug}")
