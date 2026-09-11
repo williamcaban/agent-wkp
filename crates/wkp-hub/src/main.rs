@@ -193,8 +193,8 @@ fn main() {
                 eprintln!("wkp-hub: usage: wkp-hub start-pod <tenant-slug>");
                 std::process::exit(1);
             };
-            let result = tenant_pod::start_pod(&tenant_image(), &repos_root(), &tenant_slug)
-                .map_err(|e| e.to_string())
+            let result = tenant_pod::orchestrator()
+                .and_then(|o| o.start_pod(&tenant_image(), &repos_root(), &tenant_slug))
                 .and_then(|()| {
                     let mut client = control_plane::connect()
                         .map_err(|e: control_plane::Error| e.to_string())?;
@@ -217,8 +217,8 @@ fn main() {
                 eprintln!("wkp-hub: usage: wkp-hub stop-pod <tenant-slug>");
                 std::process::exit(1);
             };
-            let result = tenant_pod::stop_pod(&tenant_slug)
-                .map_err(|e| e.to_string())
+            let result = tenant_pod::orchestrator()
+                .and_then(|o| o.stop_pod(&tenant_slug))
                 .and_then(|()| {
                     let mut client = control_plane::connect()
                         .map_err(|e: control_plane::Error| e.to_string())?;
@@ -244,11 +244,14 @@ fn main() {
                 .and_then(|_| args.next())
                 .and_then(|m| m.parse::<i64>().ok())
                 .unwrap_or(30);
-            let result = control_plane::connect()
-                .map_err(|e| e.to_string())
-                .and_then(|mut client| {
-                    tenant_pod::reap_idle(&mut client, time::Duration::minutes(idle_minutes))
-                });
+            let result = tenant_pod::orchestrator().and_then(|orchestrator| {
+                let mut client = control_plane::connect().map_err(|e| e.to_string())?;
+                tenant_pod::reap_idle(
+                    &mut client,
+                    time::Duration::minutes(idle_minutes),
+                    orchestrator.as_ref(),
+                )
+            });
             match result {
                 Ok(reaped) => {
                     if reaped.is_empty() {

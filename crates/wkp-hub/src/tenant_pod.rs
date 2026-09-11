@@ -38,9 +38,68 @@
 //! or production host is expected not to have this constraint; M5-7 PR
 //! 4/4's own end-to-end test is what actually proves the alias-based
 //! addressing works, not this module's unit tests.
+//!
+//! **Pluggable since ADR-0012.** Every call site (`handle_git_http`'s
+//! on-demand cold start, the `start-pod`/`stop-pod`/`reap-idle-pods`
+//! CLI subcommands, the reaper) depends on the [`PodOrchestrator`]
+//! trait, not on `podman` directly -- ADR-0009 required the mechanism
+//! for reaching a tenant's pod to work the same way under Kubernetes
+//! later, without a rewrite, and a direct `Command::new("podman")` at
+//! every call site would have meant touching all of them again to add
+//! a second backend. [`PodmanOrchestrator`] is the only implementation
+//! today; see [`orchestrator`]'s own doc comment for how a Kubernetes
+//! backend slots in later.
 
 use std::path::Path;
 use std::process::Command;
+
+/// The mechanism a tenant's pod is actually started, stopped, and
+/// queried through -- see the module doc comment (ADR-0012) for why
+/// this exists instead of every call site running `podman` directly.
+pub trait PodOrchestrator: Send + Sync {
+    fn start_pod(&self, image: &str, repos_root: &Path, tenant_slug: &str) -> Result<(), String>;
+    fn stop_pod(&self, tenant_slug: &str) -> Result<(), String>;
+}
+
+/// Selects this process's [`PodOrchestrator`] from
+/// `WKP_HUB_POD_ORCHESTRATOR` (default `"podman"`, ADR-0012). Every
+/// production call site resolves this once and holds onto the result,
+/// rather than re-reading the environment variable per call.
+///
+/// `"kubernetes"` is a reserved name, not a working backend -- there is
+/// no Kubernetes client code in this repo yet (ADR-0012 deliberately
+/// left that implementation for later). Selecting it fails fast at
+/// startup with a clear message; it does not silently fall back to
+/// podman, and there is no stub implementation pretending to work.
+pub fn orchestrator() -> Result<Box<dyn PodOrchestrator>, String> {
+    match std::env::var("WKP_HUB_POD_ORCHESTRATOR") {
+        Err(std::env::VarError::NotPresent) => Ok(Box::new(PodmanOrchestrator)),
+        Ok(v) if v == "podman" => Ok(Box::new(PodmanOrchestrator)),
+        Ok(v) if v == "kubernetes" => Err(
+            "WKP_HUB_POD_ORCHESTRATOR=kubernetes is reserved (ADR-0012) but has no \
+             implementation yet"
+                .to_string(),
+        ),
+        Ok(other) => Err(format!(
+            "unknown WKP_HUB_POD_ORCHESTRATOR {other:?} (expected \"podman\")"
+        )),
+        Err(e) => Err(format!("WKP_HUB_POD_ORCHESTRATOR: {e}")),
+    }
+}
+
+/// The only [`PodOrchestrator`] implemented so far: shells out to
+/// `podman` directly, exactly as this module did before ADR-0012.
+pub struct PodmanOrchestrator;
+
+impl PodOrchestrator for PodmanOrchestrator {
+    fn start_pod(&self, image: &str, repos_root: &Path, tenant_slug: &str) -> Result<(), String> {
+        start_pod(image, repos_root, tenant_slug)
+    }
+
+    fn stop_pod(&self, tenant_slug: &str) -> Result<(), String> {
+        stop_pod(tenant_slug)
+    }
+}
 
 /// The shared user-defined network every tenant pod (and, from M5-7 PR
 /// 4/4 on, the front door itself) joins.
@@ -131,7 +190,7 @@ fn pod_is_running(pod: &str) -> Result<bool, String> {
 /// `crate::control_plane`'s own doc comments already establish (this
 /// module talks to the container runtime, that one only ever records
 /// what happened).
-pub fn start_pod(image: &str, repos_root: &Path, tenant_slug: &str) -> Result<(), String> {
+fn start_pod(image: &str, repos_root: &Path, tenant_slug: &str) -> Result<(), String> {
     let pod = pod_name(tenant_slug);
     if pod_is_running(&pod)? {
         return Ok(());
@@ -189,7 +248,7 @@ pub fn start_pod(image: &str, repos_root: &Path, tenant_slug: &str) -> Result<()
 /// no-op-shaped success from this function's own caller's point of
 /// view (the reaper sweeping a tenant whose pod-state row says
 /// "running" but which crashed out from under it, say).
-pub fn stop_pod(tenant_slug: &str) -> Result<(), String> {
+fn stop_pod(tenant_slug: &str) -> Result<(), String> {
     let pod = pod_name(tenant_slug);
     // `pod rm -f` on a pod that doesn't exist at all returns a nonzero
     // exit and a "no such pod" stderr line -- treated the same as
@@ -207,12 +266,13 @@ pub fn stop_pod(tenant_slug: &str) -> Result<(), String> {
 pub fn reap_idle(
     client: &mut postgres::Client,
     idle_for: time::Duration,
+    orchestrator: &dyn PodOrchestrator,
 ) -> Result<Vec<String>, String> {
     let idle_tenants = crate::control_plane::find_idle_running_tenants(client, idle_for)
         .map_err(|e| e.to_string())?;
     let mut reaped = Vec::new();
     for tenant in idle_tenants {
-        if let Err(e) = stop_pod(&tenant.slug) {
+        if let Err(e) = orchestrator.stop_pod(&tenant.slug) {
             eprintln!(
                 "wkp-hub: reap: failed to stop pod for tenant {}: {e}",
                 tenant.slug
@@ -248,5 +308,38 @@ mod tests {
             mount,
             "/srv/wkp-hub/repos/acme.git:/srv/wkp-hub/repos/acme.git:Z"
         );
+    }
+
+    // No other test in this crate reads or writes
+    // `WKP_HUB_POD_ORCHESTRATOR`, so mutating it here (one test, one
+    // sequential block) doesn't race with anything else `cargo test`
+    // runs in parallel.
+    #[test]
+    fn orchestrator_selects_podman_by_default_and_rejects_unknown_values() {
+        std::env::remove_var("WKP_HUB_POD_ORCHESTRATOR");
+        assert!(orchestrator().is_ok(), "unset must default to podman");
+
+        std::env::set_var("WKP_HUB_POD_ORCHESTRATOR", "podman");
+        assert!(orchestrator().is_ok(), "explicit podman must be accepted");
+
+        std::env::set_var("WKP_HUB_POD_ORCHESTRATOR", "kubernetes");
+        // `Box<dyn PodOrchestrator>` isn't `Debug`, so `unwrap_err`
+        // (which needs the `Ok` side to be `Debug` for its own panic
+        // message) doesn't work here -- match instead.
+        match orchestrator() {
+            Err(err) => assert!(
+                err.contains("kubernetes") && err.contains("ADR-0012"),
+                "kubernetes must fail fast with a clear reserved-name message, got: {err}"
+            ),
+            Ok(_) => panic!("kubernetes must not silently select a working orchestrator"),
+        }
+
+        std::env::set_var("WKP_HUB_POD_ORCHESTRATOR", "nonsense");
+        assert!(
+            orchestrator().is_err(),
+            "an unrecognized value must not silently fall back to podman"
+        );
+
+        std::env::remove_var("WKP_HUB_POD_ORCHESTRATOR");
     }
 }

@@ -39,9 +39,19 @@ RUN cargo build --release -p wkp-hub
 
 FROM quay.io/fedora/fedora-minimal:41
 
+# podman-remote (ADR-0012): `tenant_pod.rs`'s `PodmanOrchestrator`
+# shells out to a binary literally named `podman`, but this container
+# never runs its own container-runtime daemon -- pods it starts are
+# siblings on the *host*, not nested inside this container (ADR-0009's
+# whole point). `podman-remote` is the lean, daemon-free client half of
+# podman, built to always talk to a remote API socket
+# (`CONTAINER_HOST`, set by whatever starts this container -- see
+# entrypoint.sh); symlinked to the plain `podman` name the Rust code
+# already expects, so no code needs to know which one it's talking to.
 RUN microdnf install -y --setopt=install_weak_deps=0 \
-        openssh-server git shadow-utils \
+        openssh-server git shadow-utils podman-remote \
     && microdnf clean all \
+    && ln -s /usr/bin/podman-remote /usr/bin/podman \
     && mkdir -p /etc/wkp-hub /srv/wkp-hub/repos
 
 # The one shared login account every SSH client authenticates as
