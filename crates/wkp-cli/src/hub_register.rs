@@ -49,12 +49,41 @@ pub(crate) fn parse_hub_register_args(
 /// `.wkp/device-identity` for the (unrelated) age encryption identity.
 const SIGNING_IDENTITY_FALLBACK: &str = ".wkp/hub-signing-identity";
 
+/// Where this store keeps the certificate the hub's CA issues (M5-9,
+/// ADR-0011) -- public information, ordinary permissions, unlike the
+/// signing identity above. Overwritten by every successful
+/// registration; there's exactly one certificate this store is
+/// currently using, never a history of past ones.
+const DEVICE_CERT_FILE: &str = ".wkp/hub-device-cert.pem";
+
+/// Where this store keeps the hub's own CA root once a registration
+/// hands it back (M5-9, ADR-0011) -- the same bytes `wkp-hub ca-cert`
+/// prints operator-side, now delivered over the registration flow
+/// itself. Public information. Actually *pinning* against this file
+/// (using it to verify a later connection) is #124's job, not this
+/// one's -- this only ever writes it.
+const CA_CERT_FILE: &str = ".wkp/hub-ca-cert.pem";
+
 /// Printed to stdout so a caller can watch progress; kept separate
 /// from the final [`HubRegisterSummary`] so `wkp hub register`'s
 /// eventual "waiting for approval..." output happens as it happens,
 /// not buffered until the whole polling loop finishes.
 fn report(message: &str) {
     println!("wkp: {message}");
+}
+
+/// Writes `contents` to `path` with ordinary permissions, creating
+/// parent directories as needed -- for the certificate and CA root
+/// (M5-9, ADR-0011), both public information unlike
+/// [`SIGNING_IDENTITY_FALLBACK`]'s private key, which is why this
+/// doesn't need `file_fallback::ensure`'s `0600` construction.
+/// Overwrites on every call: a fresh registration always replaces
+/// whatever was there before.
+fn write_public_file(path: &std::path::Path, contents: &str) -> Result<(), String> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    }
+    std::fs::write(path, contents).map_err(|e| e.to_string())
 }
 
 pub(crate) struct HubRegisterSummary {
@@ -66,8 +95,8 @@ impl std::fmt::Display for HubRegisterSummary {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "wkp: registered with tenant {} (device id {})",
-            self.tenant_slug, self.device_id
+            "wkp: registered with tenant {} (device id {}), certificate stored at {}",
+            self.tenant_slug, self.device_id, DEVICE_CERT_FILE
         )
     }
 }
@@ -86,13 +115,20 @@ struct TokenResponse {
     status: Option<String>,
     tenant_slug: Option<String>,
     device_id: Option<i64>,
+    /// The hub-signed device certificate (M5-9, ADR-0011), once
+    /// `status == "approved"` -- absent on every earlier poll.
+    certificate_pem: Option<String>,
+    /// The hub's own CA root, alongside the certificate above.
+    ca_cert_pem: Option<String>,
     error: Option<String>,
 }
 
 /// `wkp hub register`: generates (or reuses) this store's ed25519 hub
-/// signing identity, requests a device code, prints the human-facing
-/// verification instructions, and polls until approved or the grant
-/// expires.
+/// signing identity, builds a certificate signing request (CSR) for it
+/// (M5-9, ADR-0011 -- the hub's CA signs this instead of accepting a
+/// bare public key), requests a device code, prints the human-facing
+/// verification instructions, and polls until approved (storing the
+/// resulting certificate) or the grant expires.
 pub(crate) fn run_hub_register(opts: &HubRegisterOptions) -> Result<HubRegisterSummary, String> {
     let device_id = wkp_git::sync::device_id(&opts.path)?;
     let identity = wkp_crypto::signing_identity::ensure(
@@ -100,7 +136,7 @@ pub(crate) fn run_hub_register(opts: &HubRegisterOptions) -> Result<HubRegisterS
         &opts.path.join(SIGNING_IDENTITY_FALLBACK),
     )
     .map_err(|e| e.to_string())?;
-    let public_key = identity.public_key_openssh().map_err(|e| e.to_string())?;
+    let csr_pem = identity.to_csr_pem().map_err(|e| e.to_string())?;
 
     let agent = ureq::Agent::config_builder()
         .http_status_as_error(false)
@@ -112,7 +148,7 @@ pub(crate) fn run_hub_register(opts: &HubRegisterOptions) -> Result<HubRegisterS
         .post(&code_url)
         .send_json(serde_json::json!({
             "tenant_slug": opts.tenant_slug,
-            "public_key": public_key,
+            "csr_pem": csr_pem,
         }))
         .map_err(|e| format!("requesting a device code from {code_url}: {e}"))?;
     if code_http_response.status() != 200 {
@@ -164,6 +200,13 @@ pub(crate) fn run_hub_register(opts: &HubRegisterOptions) -> Result<HubRegisterS
             None => {}
         }
         if token.status.as_deref() == Some("approved") {
+            let certificate_pem = token
+                .certificate_pem
+                .ok_or_else(|| "hub approved the grant but sent no certificate_pem".to_string())?;
+            write_public_file(&opts.path.join(DEVICE_CERT_FILE), &certificate_pem)?;
+            if let Some(ca_cert_pem) = token.ca_cert_pem {
+                write_public_file(&opts.path.join(CA_CERT_FILE), &ca_cert_pem)?;
+            }
             return Ok(HubRegisterSummary {
                 tenant_slug: token
                     .tenant_slug

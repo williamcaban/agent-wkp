@@ -33,8 +33,9 @@
 //! needs to redesign how the root is loaded.
 
 use rcgen::{
-    BasicConstraints, CertificateParams, DistinguishedName, DnType, ExtendedKeyUsagePurpose, IsCa,
-    Issuer, KeyPair, KeyUsagePurpose, SanType,
+    BasicConstraints, CertificateParams, CertificateSigningRequestParams, DistinguishedName,
+    DnType, ExtendedKeyUsagePurpose, IsCa, Issuer, KeyPair, KeyUsagePurpose, PublicKeyData,
+    SanType, SerialNumber,
 };
 use rustls_pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use std::fs::{self, OpenOptions};
@@ -60,6 +61,14 @@ const CA_VALIDITY_DAYS: i64 = 3650;
 /// lifetime with a wide margin.
 const SERVER_LEAF_VALIDITY_DAYS: i64 = 397;
 
+/// A device's client certificate (M5-9, ADR-0011), unlike the server
+/// leaf above, is persisted (in `devices.certificate_pem`) and handed
+/// back to the device to keep using -- renewal is out of scope for this
+/// milestone (`docs/plan/milestones.md`), so this matches the server
+/// leaf's own validity window rather than inventing a second number
+/// with no renewal story behind it either.
+const DEVICE_CERT_VALIDITY_DAYS: i64 = 397;
+
 #[derive(Debug)]
 pub enum Error {
     Io(std::io::Error),
@@ -73,6 +82,11 @@ pub enum Error {
     /// the same never-overwrite-an-existing-secret-on-a-read-hiccup
     /// posture `device_identity::get_or_create` takes.
     Incomplete(String),
+    /// [`HubCa::sign_device_csr`] (M5-9, ADR-0011) was handed a CSR
+    /// whose key algorithm isn't ed25519, or whose embedded public key
+    /// isn't the 32 bytes an ed25519 key must be -- untrusted input
+    /// from a device, rejected rather than signed.
+    UnsupportedKeyAlgorithm,
 }
 
 impl std::fmt::Display for Error {
@@ -82,6 +96,9 @@ impl std::fmt::Display for Error {
             Error::Rcgen(e) => write!(f, "hub CA: certificate generation failed: {e}"),
             Error::Rustls(e) => write!(f, "hub CA: TLS configuration failed: {e}"),
             Error::Incomplete(m) => write!(f, "hub CA: {m}"),
+            Error::UnsupportedKeyAlgorithm => {
+                write!(f, "hub CA: CSR key algorithm must be ed25519")
+            }
         }
     }
 }
@@ -111,7 +128,14 @@ impl From<rustls::Error> for Error {
 /// Holds the root's certificate and private key in memory for the
 /// process's lifetime -- the key never leaves this struct except
 /// through [`HubCa::issuer`], and is never rendered by `Debug` (this
-/// type deliberately does not derive it) or logged.
+/// type deliberately does not derive it) or logged. `Clone` is
+/// deliberately derived, though: [`crate::front_door`]'s router needs
+/// an owned copy in its shared `axum` state (M5-9, ADR-0011, for
+/// [`HubCa::sign_device_csr`]), and cloning two `String`s is cheap --
+/// it does not change how many copies of the key exist on disk or who
+/// can reach them, only how many equivalent in-memory copies one
+/// already-trusted process holds.
+#[derive(Clone)]
 pub struct HubCa {
     cert_pem: String,
     /// PKCS#8 PEM. Secret; see the module doc.
@@ -287,6 +311,94 @@ impl HubCa {
         let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(leaf_key.serialize_der()));
         Ok((leaf.der().clone(), key))
     }
+
+    /// Signs `csr_pem`, a device's PKCS#10 certificate signing request,
+    /// minting a client-authentication certificate for the ed25519 key
+    /// it proves possession of (M5-9, ADR-0011).
+    ///
+    /// **Only the CSR's embedded public key and its own self-signature
+    /// are trusted.** `rcgen::CertificateSigningRequestParams::from_pem`
+    /// also parses a requested subject, SANs, key usage, and basic
+    /// constraints out of the CSR -- all attacker-controlled, since the
+    /// CSR comes from an unauthenticated device. Naively signing those
+    /// parsed params (`CertificateSigningRequestParams::signed_by`)
+    /// would let a device request, and receive, a certificate with
+    /// `BasicConstraints: CA:true` of its own choosing. Every field of
+    /// the issued certificate is instead built fresh here, the same way
+    /// [`mint_server_leaf`] builds the front door's own leaf from
+    /// scratch rather than from caller-supplied parameters.
+    pub fn sign_device_csr(
+        &self,
+        csr_pem: &str,
+        common_name: &str,
+    ) -> Result<SignedDeviceCert, Error> {
+        let csr = CertificateSigningRequestParams::from_pem(csr_pem)?;
+        if csr.public_key.algorithm() != &rcgen::PKCS_ED25519 {
+            return Err(Error::UnsupportedKeyAlgorithm);
+        }
+        let public_key_raw: [u8; 32] = csr
+            .public_key
+            .der_bytes()
+            .try_into()
+            .map_err(|_| Error::UnsupportedKeyAlgorithm)?;
+
+        let issuer = self.issuer()?;
+        let serial_bytes = random_serial_bytes()?;
+        let serial_hex = serial_bytes.iter().map(|b| format!("{b:02x}")).collect();
+        let not_before = time::OffsetDateTime::now_utc() - time::Duration::days(1);
+        let not_after =
+            time::OffsetDateTime::now_utc() + time::Duration::days(DEVICE_CERT_VALIDITY_DAYS);
+
+        let mut params = CertificateParams::default();
+        params.serial_number = Some(SerialNumber::from(serial_bytes));
+        params.is_ca = IsCa::ExplicitNoCa;
+        params.key_usages = vec![KeyUsagePurpose::DigitalSignature];
+        params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ClientAuth];
+        let mut dn = DistinguishedName::new();
+        dn.push(DnType::CommonName, common_name);
+        params.distinguished_name = dn;
+        params.not_before = not_before;
+        params.not_after = not_after;
+
+        let cert = params.signed_by(&csr.public_key, &issuer)?;
+        Ok(SignedDeviceCert {
+            certificate_pem: cert.pem(),
+            serial_hex,
+            public_key_raw,
+            not_before,
+            not_after,
+        })
+    }
+}
+
+/// What [`HubCa::sign_device_csr`] hands back: the signed certificate
+/// itself, plus the pieces `crate::http::handle_verify_submit` needs to
+/// both register the device (the raw public key, converted to OpenSSH
+/// form by `wkp_crypto::signing_identity::openssh_public_key_from_raw_ed25519`)
+/// and persist the certificate metadata (`crate::control_plane::issue_device_certificate`).
+pub struct SignedDeviceCert {
+    pub certificate_pem: String,
+    /// Hex-encoded, matching `devices.cert_serial`'s own encoding.
+    pub serial_hex: String,
+    pub public_key_raw: [u8; 32],
+    pub not_before: time::OffsetDateTime,
+    pub not_after: time::OffsetDateTime,
+}
+
+/// 16 random bytes (a 128-bit serial, the same size convention most
+/// real CAs use) read straight off `/dev/urandom` -- the same
+/// direct-read pattern `control_plane::grants::random_hex` already
+/// established (CLAUDE.md's slim-core rule: no `rand` dependency only
+/// for this), kept as its own small copy here rather than reaching into
+/// `control_plane` (a Postgres-bookkeeping module with no business
+/// knowing about certificate signing) for it.
+fn random_serial_bytes() -> Result<Vec<u8>, Error> {
+    use std::io::Read;
+    let mut bytes = vec![0u8; 16];
+    std::fs::File::open("/dev/urandom")
+        .and_then(|mut f| f.read_exact(&mut bytes))
+        .map_err(Error::Io)?;
+    Ok(bytes)
 }
 
 #[cfg(test)]
@@ -428,6 +540,76 @@ mod tests {
                 UnixTime::now(),
             )
             .expect("the hub's own leaf must verify against the hub's own root, for localhost");
+    }
+
+    /// M5-9's own core acceptance criterion: signing a real device CSR
+    /// (from `wkp_crypto::signing_identity`, the exact same code path
+    /// `wkp hub register` calls) produces a certificate, and the raw
+    /// public key `sign_device_csr` hands back matches the identity
+    /// that produced the CSR -- the correctness property everything
+    /// downstream (`devices.public_key`, `wkp-shell`'s SSH-path lookup)
+    /// depends on.
+    #[test]
+    fn sign_device_csr_returns_a_certificate_for_the_csrs_own_public_key() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let ca = HubCa::ensure(dir.path()).expect("ensure");
+
+        let identity =
+            wkp_crypto::signing_identity::SigningIdentity::generate().expect("generate identity");
+        let csr_pem = identity.to_csr_pem().expect("to_csr_pem");
+
+        let signed = ca
+            .sign_device_csr(&csr_pem, "wkp device test")
+            .expect("sign_device_csr");
+
+        assert!(signed.certificate_pem.contains("BEGIN CERTIFICATE"));
+        assert_eq!(signed.serial_hex.len(), 32, "16 bytes as hex");
+        assert!(signed.not_before < signed.not_after);
+
+        let derived_public_key = wkp_crypto::signing_identity::openssh_public_key_from_raw_ed25519(
+            &signed.public_key_raw,
+        )
+        .expect("openssh_public_key_from_raw_ed25519");
+        assert_eq!(
+            derived_public_key,
+            identity.public_key_openssh().expect("public_key_openssh"),
+            "the certificate's embedded public key must be the exact key the CSR was for"
+        );
+    }
+
+    /// Two devices' CSRs must never be issued the same serial -- a
+    /// collision here would break any future lookup-by-serial
+    /// (#124/#128's own job).
+    #[test]
+    fn sign_device_csr_issues_distinct_serials_for_distinct_devices() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let ca = HubCa::ensure(dir.path()).expect("ensure");
+
+        let first_csr = wkp_crypto::signing_identity::SigningIdentity::generate()
+            .expect("generate")
+            .to_csr_pem()
+            .expect("to_csr_pem");
+        let second_csr = wkp_crypto::signing_identity::SigningIdentity::generate()
+            .expect("generate")
+            .to_csr_pem()
+            .expect("to_csr_pem");
+
+        let first = ca
+            .sign_device_csr(&first_csr, "wkp device test")
+            .expect("sign first");
+        let second = ca
+            .sign_device_csr(&second_csr, "wkp device test")
+            .expect("sign second");
+        assert_ne!(first.serial_hex, second.serial_hex);
+    }
+
+    /// A malformed CSR is rejected, not signed -- untrusted input from
+    /// an unauthenticated device.
+    #[test]
+    fn sign_device_csr_rejects_a_malformed_csr() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let ca = HubCa::ensure(dir.path()).expect("ensure");
+        assert!(ca.sign_device_csr("not a csr", "wkp device test").is_err());
     }
 
     /// The other half of the trust story: a leaf from an unrelated CA

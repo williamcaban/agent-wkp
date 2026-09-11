@@ -59,6 +59,21 @@ pub struct Device {
     /// design 8.1), if it has one -- never the plaintext, which exists
     /// only for the instant [`issue_bearer_token`] returns it.
     pub bearer_token_hash: Option<String>,
+    /// The device's hub-issued client certificate (M5-9, ADR-0011),
+    /// PEM-encoded -- public information, set together with
+    /// `cert_serial`/`cert_issued_at`/`cert_expires_at` by
+    /// [`issue_device_certificate`]. `None` for a device that has never
+    /// completed CSR-based enrollment (e.g. one created directly via
+    /// the admin CLI's raw-public-key bypass).
+    pub certificate_pem: Option<String>,
+    /// Hex-encoded serial number of `certificate_pem`. UNIQUE at the
+    /// schema level; the lookup #124/#128 will need (matching a
+    /// presented certificate's serial back to its device row for
+    /// revocation checks) is not implemented yet -- this column exists
+    /// so that later task has something to index against.
+    pub cert_serial: Option<String>,
+    pub cert_issued_at: Option<OffsetDateTime>,
+    pub cert_expires_at: Option<OffsetDateTime>,
 }
 
 #[derive(Debug)]
@@ -244,6 +259,12 @@ pub fn find_idle_running_tenants(
     Ok(rows.iter().map(tenant_from_row).collect())
 }
 
+/// Every column [`device_from_row`] reads -- named once for the same
+/// anti-drift reason [`TENANT_COLUMNS`] is, now that M5-9 added four
+/// certificate columns alongside `bearer_token_hash`.
+const DEVICE_COLUMNS: &str = "id, tenant_id, public_key, created_at, revoked_at, \
+     bearer_token_hash, certificate_pem, cert_serial, cert_issued_at, cert_expires_at";
+
 /// Registers a device's public key under `tenant_id` -- the write side
 /// of what M5-2's RFC 8628 flow calls once a grant is approved, and
 /// what M5-3's `wkp-shell` reads back to resolve a presented key.
@@ -253,8 +274,10 @@ pub fn register_device(
     public_key: &str,
 ) -> Result<Device, Error> {
     let row = client.query_one(
-        "INSERT INTO devices (tenant_id, public_key) VALUES ($1, $2) \
-         RETURNING id, tenant_id, public_key, created_at, revoked_at, bearer_token_hash",
+        &format!(
+            "INSERT INTO devices (tenant_id, public_key) VALUES ($1, $2) \
+             RETURNING {DEVICE_COLUMNS}"
+        ),
         &[&tenant_id, &public_key],
     )?;
     Ok(device_from_row(&row))
@@ -269,9 +292,20 @@ pub fn find_device_by_public_key(
     public_key: &str,
 ) -> Result<Option<Device>, Error> {
     let row = client.query_opt(
-        "SELECT id, tenant_id, public_key, created_at, revoked_at, bearer_token_hash \
-         FROM devices WHERE public_key = $1",
+        &format!("SELECT {DEVICE_COLUMNS} FROM devices WHERE public_key = $1"),
         &[&public_key],
+    )?;
+    Ok(row.as_ref().map(device_from_row))
+}
+
+/// Looks up a device by its row id -- what [`grants::approve_grant`]
+/// uses to re-fetch an already-approved grant's device (M5-9), the
+/// reverse direction of the lookups above, which both start from a key
+/// or token a caller presents rather than an id it already knows.
+pub fn find_device_by_id(client: &mut Client, device_id: i64) -> Result<Option<Device>, Error> {
+    let row = client.query_opt(
+        &format!("SELECT {DEVICE_COLUMNS} FROM devices WHERE id = $1"),
+        &[&device_id],
     )?;
     Ok(row.as_ref().map(device_from_row))
 }
@@ -318,11 +352,44 @@ pub fn find_device_by_bearer_token(
 ) -> Result<Option<Device>, Error> {
     let hash = hash_bearer_token(token);
     let row = client.query_opt(
-        "SELECT id, tenant_id, public_key, created_at, revoked_at, bearer_token_hash \
-         FROM devices WHERE bearer_token_hash = $1",
+        &format!("SELECT {DEVICE_COLUMNS} FROM devices WHERE bearer_token_hash = $1"),
         &[&hash],
     )?;
     Ok(row.as_ref().map(device_from_row))
+}
+
+/// Stores a hub-issued client certificate on an existing device (M5-9,
+/// ADR-0011) -- the write side of what `handle_verify_submit` calls
+/// right after [`grants::approve_grant`] registers the device, once
+/// [`crate::hub_ca::HubCa::sign_device_csr`] has actually signed it.
+/// Overwrites any previous certificate the same way [`issue_bearer_token`]
+/// rotates a bearer token; callers that want idempotency (not minting a
+/// second certificate for a retried `/verify` submission) check
+/// `Device::certificate_pem` themselves before calling this, the same
+/// way [`grants::approve_grant`]'s own idempotency check works.
+pub fn issue_device_certificate(
+    client: &mut Client,
+    device_id: i64,
+    certificate_pem: &str,
+    cert_serial: &str,
+    cert_issued_at: OffsetDateTime,
+    cert_expires_at: OffsetDateTime,
+) -> Result<(), Error> {
+    let updated = client.execute(
+        "UPDATE devices SET certificate_pem = $1, cert_serial = $2, cert_issued_at = $3, \
+         cert_expires_at = $4 WHERE id = $5",
+        &[
+            &certificate_pem,
+            &cert_serial,
+            &cert_issued_at,
+            &cert_expires_at,
+            &device_id,
+        ],
+    )?;
+    if updated == 0 {
+        return Err(Error::NotFound(format!("device {device_id}")));
+    }
+    Ok(())
 }
 
 /// Revokes a device (sets `revoked_at` to now, if not already set).
@@ -356,6 +423,10 @@ fn device_from_row(row: &Row) -> Device {
         created_at: row.get("created_at"),
         revoked_at: row.get("revoked_at"),
         bearer_token_hash: row.get("bearer_token_hash"),
+        certificate_pem: row.get("certificate_pem"),
+        cert_serial: row.get("cert_serial"),
+        cert_issued_at: row.get("cert_issued_at"),
+        cert_expires_at: row.get("cert_expires_at"),
     }
 }
 
@@ -429,6 +500,71 @@ mod tests {
         assert!(find_tenant_by_id(&mut client, -1)
             .expect("find_tenant_by_id")
             .is_none());
+    }
+
+    #[test]
+    fn find_device_by_id_round_trips_and_returns_none_for_unknown() {
+        let mut client = connect().expect("connect");
+        let tenant = create_tenant(&mut client, &unique_slug("find-device-by-id")).expect("tenant");
+        let device = register_device(&mut client, tenant.id, &unique_slug("device-key"))
+            .expect("register_device");
+
+        let found = find_device_by_id(&mut client, device.id)
+            .expect("find_device_by_id")
+            .expect("device must be found");
+        assert_eq!(found, device);
+
+        assert!(find_device_by_id(&mut client, -1)
+            .expect("find_device_by_id")
+            .is_none());
+    }
+
+    /// M5-9's own core acceptance criterion for the schema: a freshly
+    /// registered device has no certificate yet, and
+    /// `issue_device_certificate` sets all four columns together.
+    #[test]
+    fn issue_device_certificate_round_trips_and_fails_for_an_unknown_device() {
+        let mut client = connect().expect("connect");
+        let tenant = create_tenant(&mut client, &unique_slug("issue-cert")).expect("tenant");
+        let device = register_device(&mut client, tenant.id, &unique_slug("device-key"))
+            .expect("register_device");
+        assert!(device.certificate_pem.is_none());
+        assert!(device.cert_serial.is_none());
+
+        let issued_at = OffsetDateTime::now_utc();
+        let expires_at = issued_at + time::Duration::days(397);
+        issue_device_certificate(
+            &mut client,
+            device.id,
+            "-----BEGIN CERTIFICATE-----\nfake\n-----END CERTIFICATE-----\n",
+            "deadbeef",
+            issued_at,
+            expires_at,
+        )
+        .expect("issue_device_certificate");
+
+        let found = find_device_by_id(&mut client, device.id)
+            .expect("find_device_by_id")
+            .expect("device must be found");
+        assert_eq!(
+            found.certificate_pem.as_deref(),
+            Some("-----BEGIN CERTIFICATE-----\nfake\n-----END CERTIFICATE-----\n")
+        );
+        assert_eq!(found.cert_serial.as_deref(), Some("deadbeef"));
+        assert!(found.cert_issued_at.is_some());
+        assert!(found.cert_expires_at.is_some());
+
+        assert!(matches!(
+            issue_device_certificate(
+                &mut client,
+                -1,
+                "-----BEGIN CERTIFICATE-----\nfake\n-----END CERTIFICATE-----\n",
+                "00000000",
+                issued_at,
+                expires_at,
+            ),
+            Err(Error::NotFound(_))
+        ));
     }
 
     #[test]

@@ -40,6 +40,7 @@
 //! HTML form without JavaScript would.
 
 use crate::control_plane::{self, grants};
+use crate::hub_ca::HubCa;
 use serde::{Deserialize, Serialize};
 use tiny_http::{Method, Response, StatusCode};
 
@@ -502,7 +503,13 @@ struct ErrorBody {
 #[derive(Deserialize)]
 struct DeviceCodeRequest {
     tenant_slug: String,
-    public_key: String,
+    /// The device's PKCS#10 certificate signing request, PEM-encoded
+    /// (M5-9, ADR-0011) -- not a bare public key. Validated below
+    /// before ever reaching `grants::create_device_grant`, so a
+    /// malformed request fails fast here rather than surfacing only at
+    /// `/verify` approval time, potentially confusing whoever's about
+    /// to click approve.
+    csr_pem: String,
 }
 
 #[derive(Serialize)]
@@ -515,9 +522,10 @@ struct DeviceCodeResponse {
 }
 
 /// `POST /device/code` (RFC 8628 §3.1/§3.2): the polling client's own
-/// public key and its chosen tenant are both already decided by the
-/// client (see the module doc comment and `grants`'s own doc comment
-/// for why) -- this just persists the grant and hands back the codes.
+/// CSR and its chosen tenant are both already decided by the client
+/// (see the module doc comment and `grants`'s own doc comment for why)
+/// -- this validates the CSR's shape, persists the grant, and hands
+/// back the codes.
 pub(crate) fn handle_device_code(request: &Incoming) -> Rendered {
     let body = request.body_string();
     let parsed: DeviceCodeRequest = match serde_json::from_str(&body) {
@@ -531,6 +539,17 @@ pub(crate) fn handle_device_code(request: &Incoming) -> Rendered {
             )
         }
     };
+
+    let csr_is_valid_ed25519 = rcgen::CertificateSigningRequestParams::from_pem(&parsed.csr_pem)
+        .is_ok_and(|csr| csr.public_key.algorithm() == &rcgen::PKCS_ED25519);
+    if !csr_is_valid_ed25519 {
+        return Rendered::json(
+            400,
+            &ErrorBody {
+                error: "invalid_csr".to_string(),
+            },
+        );
+    }
 
     let mut client = match control_plane::connect() {
         Ok(c) => c,
@@ -563,7 +582,7 @@ pub(crate) fn handle_device_code(request: &Incoming) -> Rendered {
         }
     };
 
-    match grants::create_device_grant(&mut client, tenant.id, &parsed.public_key) {
+    match grants::create_device_grant(&mut client, tenant.id, &parsed.csr_pem) {
         Ok(grant) => Rendered::json(
             200,
             &DeviceCodeResponse {
@@ -593,13 +612,25 @@ struct TokenSuccessResponse {
     status: String,
     tenant_slug: String,
     device_id: i64,
+    /// The hub-signed client certificate `handle_verify_submit` minted
+    /// at approval time (M5-9, ADR-0011), PEM-encoded.
+    certificate_pem: String,
+    /// The hub's own CA root, PEM-encoded -- handed back here so the
+    /// device has a way to pin it besides the operator-side `wkp-hub
+    /// ca-cert` bootstrapping path (`main.rs`'s own doc comment on that
+    /// subcommand). Actually *verifying* against it is #124's job
+    /// (client-certificate verification at request time is explicitly
+    /// out of scope for this task); this only hands the bytes over.
+    ca_cert_pem: String,
 }
 
 /// `POST /device/token` (RFC 8628 §3.4/§3.5): `authorization_pending`
 /// (RFC 8628's own error code) until a human has approved via
 /// `/verify`; `expired_token` (also RFC 8628's own) once the grant's
-/// TTL has passed with no approval; a real result once approved.
-pub(crate) fn handle_device_token(request: &Incoming) -> Rendered {
+/// TTL has passed with no approval; a real result, including the
+/// certificate `handle_verify_submit` signed at approval time, once
+/// approved.
+pub(crate) fn handle_device_token(request: &Incoming, ca: &HubCa) -> Rendered {
     let body = request.body_string();
     let parsed: TokenRequest = match serde_json::from_str(&body) {
         Ok(p) => p,
@@ -679,6 +710,39 @@ pub(crate) fn handle_device_token(request: &Incoming) -> Rendered {
             )
         }
     };
+    let device = match control_plane::find_device_by_id(&mut client, device_id) {
+        Ok(Some(d)) => d,
+        Ok(None) => {
+            return Rendered::json(
+                500,
+                &ErrorBody {
+                    error: "grant references a device that no longer exists".to_string(),
+                },
+            )
+        }
+        Err(e) => {
+            return Rendered::json(
+                500,
+                &ErrorBody {
+                    error: e.to_string(),
+                },
+            )
+        }
+    };
+    let Some(certificate_pem) = device.certificate_pem else {
+        // Approved by `handle_verify_submit`, but that handler hadn't
+        // yet reached the certificate-issuance step when this poll
+        // landed (or it failed there) -- treat it the same as
+        // `authorization_pending` rather than a hard error: a well-
+        // behaved client's own retry (RFC 8628's own `interval`) is
+        // exactly the right recovery here.
+        return Rendered::json(
+            400,
+            &ErrorBody {
+                error: "authorization_pending".to_string(),
+            },
+        );
+    };
 
     Rendered::json(
         200,
@@ -686,6 +750,8 @@ pub(crate) fn handle_device_token(request: &Incoming) -> Rendered {
             status: "approved".to_string(),
             tenant_slug,
             device_id,
+            certificate_pem,
+            ca_cert_pem: ca.root_cert_pem().to_string(),
         },
     )
 }
@@ -716,13 +782,21 @@ pub(crate) fn handle_verify_page(query: &str) -> Rendered {
     )
 }
 
+const APPROVED_HTML: &str = "<!doctype html><html><body><h1>Device approved</h1>\
+     <p>You can close this page and return to your device.</p></body></html>";
+
 /// `POST /verify`: a plain HTML form submission
 /// (`application/x-www-form-urlencoded`), the same shape a human's
 /// browser sends with no JavaScript involved -- the actual approval
-/// step ([`grants::approve_grant`]) is exactly the same call whether
-/// this body came from a real browser or (this task's own acceptance
+/// step (signing the device's CSR and registering it,
+/// [`grants::approve_grant`]) is exactly the same call whether this
+/// body came from a real browser or (this task's own acceptance
 /// criterion) a scripted stand-in for one.
-pub(crate) fn handle_verify_submit(request: &Incoming) -> Rendered {
+///
+/// M5-9 (ADR-0011): this is where the hub's CA actually signs a
+/// device's certificate, not `/device/token` -- the polling endpoint
+/// only ever relays what got signed here.
+pub(crate) fn handle_verify_submit(request: &Incoming, ca: &HubCa) -> Rendered {
     let body = request.body_string();
     let Some(user_code) = body
         .split('&')
@@ -745,15 +819,56 @@ pub(crate) fn handle_verify_submit(request: &Incoming) -> Rendered {
         return Rendered::html(400, "<p>this code has expired</p>".to_string());
     }
 
-    match grants::approve_grant(&mut client, &grant) {
-        Ok(_device) => Rendered::html(
-            200,
-            "<!doctype html><html><body><h1>Device approved</h1>\
-             <p>You can close this page and return to your device.</p></body></html>"
-                .to_string(),
-        ),
-        Err(e) => Rendered::html(500, format!("<p>{}</p>", html_escape(&e.to_string()))),
+    // Idempotent, like `approve_grant` itself: a retried `/verify`
+    // submission (a double-click, a resubmitted form) for a grant
+    // that's already been fully approved -- device registered *and*
+    // certificate issued -- must not mint a second certificate.
+    if let Some(device_id) = grant.approved_device_id {
+        match control_plane::find_device_by_id(&mut client, device_id) {
+            Ok(Some(device)) if device.certificate_pem.is_some() => {
+                return Rendered::html(200, APPROVED_HTML.to_string());
+            }
+            Ok(_) => {} // approved, but no certificate on file yet -- fall through and finish the job.
+            Err(e) => {
+                return Rendered::html(500, format!("<p>{}</p>", html_escape(&e.to_string())))
+            }
+        }
     }
+
+    let signed = match ca.sign_device_csr(&grant.csr_pem, "wkp device") {
+        Ok(s) => s,
+        Err(e) => {
+            return Rendered::html(
+                400,
+                format!(
+                    "<p>could not sign this device's request: {}</p>",
+                    html_escape(&e.to_string())
+                ),
+            )
+        }
+    };
+    let public_key = match wkp_crypto::signing_identity::openssh_public_key_from_raw_ed25519(
+        &signed.public_key_raw,
+    ) {
+        Ok(k) => k,
+        Err(e) => return Rendered::html(500, format!("<p>{}</p>", html_escape(&e.to_string()))),
+    };
+    let device = match grants::approve_grant(&mut client, &grant, &public_key) {
+        Ok(d) => d,
+        Err(e) => return Rendered::html(500, format!("<p>{}</p>", html_escape(&e.to_string()))),
+    };
+    if let Err(e) = control_plane::issue_device_certificate(
+        &mut client,
+        device.id,
+        &signed.certificate_pem,
+        &signed.serial_hex,
+        signed.not_before,
+        signed.not_after,
+    ) {
+        return Rendered::html(500, format!("<p>{}</p>", html_escape(&e.to_string())));
+    }
+
+    Rendered::html(200, APPROVED_HTML.to_string())
 }
 
 /// A minimal `application/x-www-form-urlencoded` value decoder: `+` is

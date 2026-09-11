@@ -49,6 +49,12 @@ const MAX_BODY_BYTES: usize = 1024 * 1024 * 1024;
 struct FrontDoorState {
     repos_root: PathBuf,
     image: String,
+    /// M5-9 (ADR-0011): `device_token`/`verify_submit` need the CA to
+    /// sign a device's CSR (`verify_submit`) and to hand back the root
+    /// for pinning (`device_token`). An owned copy, not a reference --
+    /// this state outlives `serve_on`'s own stack frame for as long as
+    /// the server runs. `HubCa` derives `Clone` for exactly this.
+    ca: HubCa,
 }
 
 /// Run the front door on `port`, terminating TLS with a certificate
@@ -80,7 +86,7 @@ pub fn serve_on(
     tls.alpn_protocols = vec![b"http/1.1".to_vec()];
     let tls = RustlsConfig::from_config(Arc::new(tls));
 
-    let app = router(repos_root, image);
+    let app = router(repos_root, image, ca.clone());
 
     // `enable_all` rather than a hand-picked reactor set: `axum-server`
     // needs both the I/O driver (for the listener) and the timer.
@@ -101,8 +107,12 @@ pub fn serve_on(
 
 /// The front door's routes. Public to this crate so a test can drive
 /// the same router the real `serve` does, rather than a stand-in.
-fn router(repos_root: PathBuf, image: String) -> Router {
-    let state = Arc::new(FrontDoorState { repos_root, image });
+fn router(repos_root: PathBuf, image: String, ca: HubCa) -> Router {
+    let state = Arc::new(FrontDoorState {
+        repos_root,
+        image,
+        ca,
+    });
     Router::new()
         .route("/device/code", post(device_code))
         .route("/device/token", post(device_token))
@@ -194,9 +204,11 @@ async fn device_code(request: Request) -> Response {
     }
 }
 
-async fn device_token(request: Request) -> Response {
+async fn device_token(State(state): State<Arc<FrontDoorState>>, request: Request) -> Response {
     match split(request).await {
-        Ok((_, _, _, incoming)) => blocking(move || http::handle_device_token(&incoming)).await,
+        Ok((_, _, _, incoming)) => {
+            blocking(move || http::handle_device_token(&incoming, &state.ca)).await
+        }
         Err(response) => *response,
     }
 }
@@ -210,9 +222,11 @@ async fn verify_page(request: Request) -> Response {
     }
 }
 
-async fn verify_submit(request: Request) -> Response {
+async fn verify_submit(State(state): State<Arc<FrontDoorState>>, request: Request) -> Response {
     match split(request).await {
-        Ok((_, _, _, incoming)) => blocking(move || http::handle_verify_submit(&incoming)).await,
+        Ok((_, _, _, incoming)) => {
+            blocking(move || http::handle_verify_submit(&incoming, &state.ca)).await
+        }
         Err(response) => *response,
     }
 }
@@ -252,6 +266,20 @@ mod tests {
             .map(|d| d.as_nanos())
             .unwrap_or(0);
         format!("{prefix}-{nanos}")
+    }
+
+    /// A real CSR from a freshly generated device identity -- the exact
+    /// same `SigningIdentity::to_csr_pem` a real `wkp hub register`
+    /// client calls (M5-9, ADR-0011), not a placeholder string. Tests
+    /// that need the OpenSSH-form public key this same device would
+    /// register under (to check `find_device_by_public_key`
+    /// afterwards) get it back alongside the CSR.
+    fn generate_csr_and_public_key() -> (String, String) {
+        let identity = wkp_crypto::signing_identity::SigningIdentity::generate()
+            .expect("generate a signing identity");
+        let csr_pem = identity.to_csr_pem().expect("to_csr_pem");
+        let public_key = identity.public_key_openssh().expect("public_key_openssh");
+        (csr_pem, public_key)
     }
 
     /// A running front door: the real `axum-server`-on-`rustls`
@@ -442,13 +470,12 @@ mod tests {
         let front_door = start_front_door();
         let mut client = control_plane::connect().expect("connect (seeding the tenant directly)");
         let tenant = create_tenant(&mut client, &unique_slug("front-door-tls")).expect("tenant");
-        let public_key = unique_slug("ssh-ed25519 AAAA...front-door-tls");
+        let (csr_pem, _public_key) = generate_csr_and_public_key();
 
         let (status, body) = post_json(
             &front_door,
             "/device/code",
-            &serde_json::json!({ "tenant_slug": tenant.slug, "public_key": public_key })
-                .to_string(),
+            &serde_json::json!({ "tenant_slug": tenant.slug, "csr_pem": csr_pem }).to_string(),
         );
         assert_eq!(status, 200, "body: {body}");
         let parsed: serde_json::Value = serde_json::from_str(&body).expect("parse the JSON body");
@@ -494,23 +521,26 @@ mod tests {
         );
     }
 
-    /// M5-2's own acceptance criterion, now over the TLS front door: a
-    /// scripted stand-in for the human approval step drives a full
-    /// register round trip -- device-code request, a still-pending
-    /// poll, the scripted "approval", then a successful poll -- against
-    /// a real running server and a real Postgres database.
+    /// M5-2's own acceptance criterion, now over the TLS front door and
+    /// extended for M5-9 (ADR-0011): a scripted stand-in for the human
+    /// approval step drives a full register round trip -- device-code
+    /// request (now a CSR, not a bare public key), a still-pending
+    /// poll, the scripted "approval" (which now also signs the CSR with
+    /// the hub's CA), then a successful poll carrying the issued
+    /// certificate -- against a real running server and a real
+    /// Postgres database, ending with the device actually holding a
+    /// hub-signed certificate (#123's own acceptance criterion).
     #[test]
     fn full_device_registration_round_trip_over_real_https() {
         let front_door = start_front_door();
         let mut client = control_plane::connect().expect("connect (seeding the tenant directly)");
         let tenant = create_tenant(&mut client, &unique_slug("https-round-trip")).expect("tenant");
-        let public_key = unique_slug("ssh-ed25519 AAAA...https-round-trip");
+        let (csr_pem, public_key) = generate_csr_and_public_key();
 
         let (status, body) = post_json(
             &front_door,
             "/device/code",
-            &serde_json::json!({ "tenant_slug": tenant.slug, "public_key": public_key })
-                .to_string(),
+            &serde_json::json!({ "tenant_slug": tenant.slug, "csr_pem": csr_pem }).to_string(),
         );
         assert_eq!(status, 200);
         let code_response: serde_json::Value =
@@ -553,31 +583,66 @@ mod tests {
             serde_json::from_str(&body).expect("parse token response");
         assert_eq!(approved["status"], "approved");
         assert_eq!(approved["tenant_slug"], tenant.slug);
+        let certificate_pem = approved["certificate_pem"]
+            .as_str()
+            .expect("certificate_pem must be present");
+        assert!(certificate_pem.contains("BEGIN CERTIFICATE"));
+        assert_eq!(
+            approved["ca_cert_pem"].as_str().expect("ca_cert_pem"),
+            front_door.root_pem,
+            "the device must be handed the same root the front door itself presents"
+        );
 
         // The real, load-bearing assertion: the device actually landed
         // in the control plane, under the right tenant, from the
-        // registered public key -- not just that the HTTP responses
-        // looked right.
+        // registered public key, holding the exact certificate the
+        // `/device/token` response just handed back -- not just that
+        // the HTTP responses looked right.
         let registered = control_plane::find_device_by_public_key(&mut client, &public_key)
             .expect("find_device_by_public_key")
             .expect("device must actually be registered");
         assert_eq!(registered.tenant_id, tenant.id);
         assert!(registered.revoked_at.is_none());
+        assert_eq!(registered.certificate_pem.as_deref(), Some(certificate_pem));
+        assert!(registered.cert_serial.is_some());
+        assert!(registered.cert_issued_at.is_some());
+        assert!(registered.cert_expires_at.is_some());
     }
 
     #[test]
     fn device_code_request_for_an_unknown_tenant_is_refused() {
         let front_door = start_front_door();
+        let (csr_pem, _public_key) = generate_csr_and_public_key();
         let (status, _) = post_json(
             &front_door,
             "/device/code",
             &serde_json::json!({
                 "tenant_slug": unique_slug("never-created-tenant"),
-                "public_key": unique_slug("ssh-ed25519 AAAA...unknown-tenant"),
+                "csr_pem": csr_pem,
             })
             .to_string(),
         );
         assert_eq!(status, 404, "an unknown tenant must not succeed");
+    }
+
+    /// M5-9's own boundary-validation case: a garbage `csr_pem` is
+    /// rejected at `/device/code` time, before a human ever gets a
+    /// user-code to approve.
+    #[test]
+    fn device_code_request_with_a_malformed_csr_is_refused() {
+        let front_door = start_front_door();
+        let (status, body) = post_json(
+            &front_door,
+            "/device/code",
+            &serde_json::json!({
+                "tenant_slug": unique_slug("malformed-csr"),
+                "csr_pem": "not a csr",
+            })
+            .to_string(),
+        );
+        assert_eq!(status, 400, "body: {body}");
+        let parsed: serde_json::Value = serde_json::from_str(&body).expect("parse the JSON body");
+        assert_eq!(parsed["error"], "invalid_csr");
     }
 
     /// M5-6's own fixture, unchanged apart from the transport: a real

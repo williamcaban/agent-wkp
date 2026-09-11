@@ -68,6 +68,11 @@ pub enum Error {
     /// different job (SSH transport authentication, M5-2/8.1), from
     /// this same keystore-or-file storage pattern.
     SshKey(ssh_key::Error),
+    /// Building a PKCS#10 certificate signing request from a
+    /// [`signing_identity::SigningIdentity`] failed -- either
+    /// re-encoding the ed25519 key into the PKCS#8 form `rcgen` needs,
+    /// or `rcgen`'s own CSR construction (M5-9, ADR-0011).
+    Certificate(String),
 }
 
 impl fmt::Display for Error {
@@ -81,6 +86,7 @@ impl fmt::Display for Error {
             Error::Io(e) => write!(f, "I/O error during age streaming: {e}"),
             Error::Keystore(e) => write!(f, "OS keystore error: {e}"),
             Error::SshKey(e) => write!(f, "SSH key error: {e}"),
+            Error::Certificate(m) => write!(f, "certificate error: {m}"),
         }
     }
 }
