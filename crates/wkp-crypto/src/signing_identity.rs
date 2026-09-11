@@ -60,6 +60,53 @@ impl SigningIdentity {
             .map(SigningIdentity)
             .map_err(Error::SshKey)
     }
+
+    /// Builds a PKCS#10 certificate signing request (CSR), PEM-encoded,
+    /// for this identity's own ed25519 keypair -- what `wkp hub
+    /// register` (M5-9, ADR-0011) submits to the hub's CA instead of a
+    /// bare public key. Not a second key: this re-encodes the exact
+    /// same private key bytes [`public_key_openssh`](Self::public_key_openssh)
+    /// already exposes, just into the PKCS#8 form `rcgen` needs to
+    /// build and sign the request.
+    pub fn to_csr_pem(&self) -> Result<String, Error> {
+        let ed25519 = self.0.key_data().ed25519().ok_or_else(|| {
+            Error::Certificate("signing identity is not an ed25519 key".to_string())
+        })?;
+        let signing_key = ed25519_dalek::SigningKey::from_bytes(&ed25519.private.to_bytes());
+        let pkcs8_der = {
+            use ed25519_dalek::pkcs8::EncodePrivateKey;
+            signing_key
+                .to_pkcs8_der()
+                .map_err(|e| Error::Certificate(format!("PKCS#8 encoding failed: {e}")))?
+        };
+        let key_pair = rcgen::KeyPair::from_pkcs8_der_and_sign_algo(
+            &rustls_pki_types::PrivatePkcs8KeyDer::from(pkcs8_der.as_bytes().to_vec()),
+            &rcgen::PKCS_ED25519,
+        )
+        .map_err(|e| Error::Certificate(e.to_string()))?;
+
+        rcgen::CertificateParams::default()
+            .serialize_request(&key_pair)
+            .map_err(|e| Error::Certificate(e.to_string()))?
+            .pem()
+            .map_err(|e| Error::Certificate(e.to_string()))
+    }
+}
+
+/// Builds the standard OpenSSH public-key line (`ssh-ed25519 AAAA...`)
+/// from `raw`, the 32 raw bytes of an ed25519 public key -- the
+/// server-side counterpart to
+/// [`public_key_openssh`](SigningIdentity::public_key_openssh), used by
+/// the hub (M5-9, ADR-0011) to derive the identical representation from
+/// a device's CSR, so `devices.public_key` (and `wkp-shell`'s lookup,
+/// M5-3) sees the same value the device's own `public_key_openssh()`
+/// would have produced -- without `wkp-hub` needing its own `ssh-key`
+/// dependency for anything beyond this one conversion.
+pub fn openssh_public_key_from_raw_ed25519(raw: &[u8; 32]) -> Result<String, Error> {
+    let key_data = ssh_key::public::KeyData::Ed25519(ssh_key::public::Ed25519PublicKey(*raw));
+    ssh_key::public::PublicKey::new(key_data, "")
+        .to_openssh()
+        .map_err(Error::SshKey)
 }
 
 /// The keystore service name every wkp SSH signing identity is filed
@@ -217,6 +264,37 @@ mod tests {
         let public_after = restored.public_key_openssh().expect("public after");
 
         assert_eq!(public_before, public_after);
+    }
+
+    #[test]
+    fn to_csr_pem_produces_a_pem_certificate_request() {
+        let identity = SigningIdentity::generate().expect("generate");
+        let csr_pem = identity.to_csr_pem().expect("to_csr_pem");
+        assert!(csr_pem.contains("BEGIN CERTIFICATE REQUEST"));
+        assert!(csr_pem.contains("END CERTIFICATE REQUEST"));
+    }
+
+    /// The hub (M5-9) derives `devices.public_key` from a CSR's raw
+    /// embedded key via this function -- it must reproduce exactly what
+    /// the device's own `public_key_openssh()` would have said, or
+    /// `wkp-shell`'s SSH-path lookup (M5-3) would silently diverge from
+    /// what the device actually registered.
+    #[test]
+    fn openssh_public_key_from_raw_ed25519_matches_the_identity_it_was_derived_from() {
+        let identity = SigningIdentity::generate().expect("generate");
+        let raw = identity
+            .0
+            .public_key()
+            .key_data()
+            .ed25519()
+            .expect("an ed25519 public key")
+            .0;
+        let derived =
+            openssh_public_key_from_raw_ed25519(&raw).expect("openssh_public_key_from_raw_ed25519");
+        assert_eq!(
+            derived,
+            identity.public_key_openssh().expect("public_key_openssh")
+        );
     }
 
     #[test]

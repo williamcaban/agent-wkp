@@ -28,6 +28,30 @@ age = "0.12.1"
 keyring-core = "1.0.0"
 rand_core = { version = "0.6", features = ["getrandom"] }
 ssh-key = { version = "0.6.7", features = ["ed25519", "rand_core"] }
+# M5-9 (ADR-0011): building a PKCS#10 certificate signing request (CSR)
+# from a `SigningIdentity`'s ed25519 keypair, for `wkp hub register` to
+# submit to the hub's CA (M5-8) instead of a bare public key.
+# `ed25519-dalek` is already in this workspace's dependency tree
+# transitively (`ssh-key`'s own "ed25519" feature pulls it in for the
+# same key type); this just makes it a direct dependency and turns on
+# its `pkcs8` feature, needed to re-encode the same private key bytes
+# into the PKCS#8 form `rcgen::KeyPair::from_pkcs8_der_and_sign_algo`
+# requires -- no second keypair, no new key material, just a different
+# encoding of the identical key `public_key_openssh` already exposes.
+ed25519-dalek = { version = "2.2.0", features = ["pkcs8"] }
+# `default-features = false` + `ring`: pin the crypto provider to
+# `ring`, matching `wkp-hub`'s own `rcgen`/`rustls` entries (see
+# `crates/wkp-hub/Cargo.toml`'s comment on why -- avoiding a future
+# default flip to `aws-lc-rs`, a C library with `unsafe` FFI). `pem`
+# for `CertificateSigningRequest::pem()`; no `x509-parser` feature
+# here -- parsing an incoming CSR is the hub's own job (`wkp-hub`),
+# this crate only ever builds one.
+rcgen = { version = "0.14.10", default-features = false, features = ["ring", "pem"] }
+# The DER wrapper type `rcgen::KeyPair::from_pkcs8_der_and_sign_algo`
+# takes -- `rcgen`'s own public API names it via this crate under the
+# hood, so it has to be named directly here too rather than reaching
+# into `rcgen`'s internals for it.
+rustls-pki-types = "1"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 apple-native-keyring-store = { version = "1", default-features = false, features = [

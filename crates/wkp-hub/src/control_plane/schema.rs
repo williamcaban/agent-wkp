@@ -67,7 +67,21 @@ CREATE TABLE IF NOT EXISTS devices (
     -- password). Nullable: an SSH-only device never gets one. UNIQUE
     -- so a lookup by presented token is a single indexed equality
     -- check, matching `public_key`'s own lookup shape exactly.
-    bearer_token_hash TEXT UNIQUE
+    bearer_token_hash TEXT UNIQUE,
+    -- M5-9 (ADR-0011): certificate-based enrollment. A device that
+    -- registered via the CSR flow (`grants::approve_grant` +
+    -- `issue_device_certificate`) has all four populated; a device
+    -- created directly via the admin CLI's raw-public-key bypass
+    -- (`wkp-hub device register`, unchanged by this task) has none of
+    -- them -- the same nullable-until-issued shape `bearer_token_hash`
+    -- already established for M5-6's own optional credential.
+    -- `cert_serial` is UNIQUE for the same reason `bearer_token_hash`
+    -- is: a future lookup by presented serial (#124/#128's own job) is
+    -- then a single indexed equality check, not a table scan.
+    certificate_pem TEXT,
+    cert_serial TEXT UNIQUE,
+    cert_issued_at TIMESTAMPTZ,
+    cert_expires_at TIMESTAMPTZ
 );
 
 CREATE INDEX IF NOT EXISTS devices_tenant_id_idx ON devices (tenant_id);
@@ -78,12 +92,17 @@ CREATE INDEX IF NOT EXISTS devices_tenant_id_idx ON devices (tenant_id);
 -- `device_code` is what the polling CLI holds and never displays.
 -- `approved_device_id` is set once a human approves the grant and a
 -- device row (this module's `register_device`) exists for it.
+-- `csr_pem` (M5-9, ADR-0011): the device's PKCS#10 certificate signing
+-- request, not a bare public key -- the approval endpoint signs it with
+-- the hub's CA (M5-8) once a human approves. Public information (a CSR
+-- is a self-signed statement of "this is my public key," never the
+-- matching private key), same as `devices.public_key` was.
 CREATE TABLE IF NOT EXISTS device_grants (
     id BIGSERIAL PRIMARY KEY,
     tenant_id BIGINT NOT NULL REFERENCES tenants (id),
     device_code TEXT NOT NULL UNIQUE,
     user_code TEXT NOT NULL UNIQUE,
-    public_key TEXT NOT NULL,
+    csr_pem TEXT NOT NULL,
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     expires_at TIMESTAMPTZ NOT NULL,
     approved_device_id BIGINT REFERENCES devices (id)
