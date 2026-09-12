@@ -9,6 +9,17 @@
 
 ## Changelog
 
+- 2026-09-11: pluggable pod orchestrator: `crates/wkp-hub/src/tenant_pod.rs`
+  gains a `PodOrchestrator` trait (`PodmanOrchestrator` the only
+  implementation today; `WKP_HUB_POD_ORCHESTRATOR=kubernetes` a reserved
+  name that fails fast rather than half-working) so pod *lifecycle*
+  (start/stop), not just git traffic proxying, has the same
+  runtime-independent seam ADR-0009 required. Also fixed the front-door
+  container's own inability to reach a podman engine at all
+  (`podman-remote` + a bind-mounted socket). **Implemented, merged
+  2026-09-11 (PR #135).** See
+  `docs/adr/0012-pod-orchestrator-abstraction.md`. A real Kubernetes
+  backend is tracked separately (issue #141), not built by this ADR.
 - 2026-09-11: 8.1's SSH half (`sshd` + `AuthorizedKeysCommand` +
   `wkp-shell`) is dropped: ADR-0009/0010's pod-per-tenant model has no
   way to run `git-receive-pack`/`git-upload-pack` locally once repos
@@ -21,9 +32,9 @@
   2026-09-11 (#125)**, sequenced after M5-13's mTLS integration test
   proved green in CI, per ADR-0011's own requirement to never leave a
   window with neither transport functional. See
-  `docs/adr/0011-drop-ssh-mtls-transport.md`; not yet implemented.
-  M5-3/M5-5's already-merged SSH-path code is scheduled for removal
-  once the mTLS replacement is built and proven working, not before.
+  `docs/adr/0011-drop-ssh-mtls-transport.md`. M5-3/M5-5's SSH-path code
+  (`wkp_shell.rs`, `sshd_config`, `wkp-hub-akc.sh`,
+  `test-ssh-integration.sh`) is gone from the tree, not just scheduled.
 - 2026-09-10: ADR-0009's per-tenant pod model gets its lifecycle,
   addressing, and repo-persistence design: pods are started on-demand
   per tenant (with a per-tenant `always_warm` override) and torn down
@@ -33,18 +44,20 @@
   shared user-defined network, not a per-tenant host-port mapping; bare
   repos persist on a bind-mounted shared path outside each pod's own
   ephemeral filesystem. See
-  `docs/adr/0010-per-tenant-pod-lifecycle-and-addressing.md`; not yet
-  implemented (M5-7, issue #110).
+  `docs/adr/0010-per-tenant-pod-lifecycle-and-addressing.md`.
+  **Implemented, merged 2026-09-11 (M5-7, issue #110, PR #142)** --
+  the pod-per-tenant model itself, plus a real cross-tenant filesystem
+  isolation test.
 - 2026-09-09: 8.2's "a bare repo under its own Unix user (or a per-tenant
   user namespace in the container runtime)" is resolved in favor of the
-  second option: a container-runtime pod per tenant, with the front-door
-  `sshd`/`wkp-shell` process reaching a tenant's pod over the network
-  (its own `git http-backend`, 8.1's already-chosen HTTPS backend) rather
-  than a Unix UID switch or a runtime-specific mechanism like `podman
-  exec` (which has no Kubernetes equivalent). See
-  `docs/adr/0009-per-tenant-pod-isolation.md`; not yet implemented, and
-  M5-5 is rescoped to the front-door container only in the meantime
-  (`docs/plan/milestones.md`).
+  second option: a container-runtime pod per tenant, with the front door
+  reaching a tenant's pod over the network (its own `git http-backend`,
+  8.1's already-chosen HTTPS backend) rather than a Unix UID switch or a
+  runtime-specific mechanism like `podman exec` (which has no Kubernetes
+  equivalent). See `docs/adr/0009-per-tenant-pod-isolation.md`.
+  **Implemented alongside the 2026-09-10 entry above** (M5-7, #110,
+  #142) -- M5-5 was rescoped to the front-door container only in the
+  interim (`docs/plan/milestones.md`), and that interim has since ended.
 - 2026-09-07: Resolved the `[unverified]` tag on the fsmonitor sentence in
   5.1 (Linux builtin fsmonitor support is newer than macOS/Windows, and
   specifically landed in git 2.55, not alongside the 2.37 daemon). Minimum
@@ -433,6 +446,8 @@ Prompt injection through agent-consumed content is **established** as a practica
 - *Custom protocol server in Rust (russh + gitoxide).* Full control and no process spawn per connection, at the cost of owning an SSH implementation's security. Not justified at micro-SaaS scale.
 
 ### 8.2 D8: Per-tenant isolation with per-tenant SQLite; Postgres only for the control plane
+
+**Superseded (2026-09-09/10/11) for the isolation mechanism only.** ADR-0009 resolved the "bare repo under its own Unix user (or a per-tenant user namespace)" option below in favor of a container-runtime pod per tenant instead -- a Unix-UID switch was never actually implemented, and would not have satisfied the milestone's own "per-tenant hard isolation" exit criterion on its own (no OS-level barrier beyond an application-level path check). ADR-0010 designed that pod's lifecycle (on-demand start, idle-teardown reaper) and addressing (container-runtime DNS name on a shared network); ADR-0012 gave pod *lifecycle*, not just git-traffic proxying, a runtime-independent seam (`PodOrchestrator`, podman today, Kubernetes reserved). "Quotas enforced by filesystem quota" below is also not what shipped -- per-tenant/pod resource and cgroup quotas remain an open item, per ADR-0010's own "not decided here" notes and issue #110/M5-7's own scope. The rest of this section (Postgres for the control plane, billing deferred to a later MoR integration) is unaffected. See `docs/adr/0009-per-tenant-pod-isolation.md`, `docs/adr/0010-per-tenant-pod-lifecycle-and-addressing.md`, `docs/adr/0012-pod-orchestrator-abstraction.md`.
 
 **Decision.** Each tenant gets a bare repo under its own Unix user (or a per-tenant user namespace in the container runtime), a `post-receive` hook that runs `wkp index` into a per-tenant `index.db` for the `shared` (plaintext) subset, and quotas enforced by filesystem quota. The control plane (accounts, devices, keys, subscriptions, audit events) is a small Postgres schema behind the same Rust binary running in `hub` mode. Billing is delegated to a Merchant of Record (Paddle or Lemon Squeezy) via webhooks; the core never sees card data.
 
