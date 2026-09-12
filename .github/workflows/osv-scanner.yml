@@ -13,6 +13,17 @@ name: OSV-Scanner
 #   - scan-scheduled: full scan on push and on a weekly schedule, so a
 #     vulnerability disclosed *after* a dependency already merged is still
 #     caught (results land in the repo's Security > Code Scanning tab).
+#
+# The pinned commit below (880d9b5...) was tagged v2.5.1 upstream when
+# this was written; an accuracy audit later found upstream has since
+# moved the v2.5.1 tag to point at a different commit
+# (6e4298ebc4db23e847df9b2e2de2939d6f066c67). This pin is unaffected --
+# SHA-pinning exists precisely so a moved tag can't silently change what
+# CI runs -- but the trailing "# v2.5.1" comment on each `uses:` line
+# below is no longer verifiable against that tag today. Left un-repinned
+# deliberately: bumping to whatever the tag now points at is a real
+# dependency change that deserves its own review, not something to do
+# silently while fixing a comment.
 
 on:
   push:
@@ -38,7 +49,7 @@ jobs:
       # Required to upload SARIF results to the Security tab.
       security-events: write
       contents: read
-    uses: "google/osv-scanner-action/.github/workflows/osv-scanner-reusable.yml@880d9b542cc66d36d91d51b3fbcc038f5f28cfc5" # v2.5.1
+    uses: "google/osv-scanner-action/.github/workflows/osv-scanner-reusable.yml@880d9b542cc66d36d91d51b3fbcc038f5f28cfc5" # v2.5.1 at pin time, see note above
     with:
       scan-args: |-
         -r
@@ -50,7 +61,7 @@ jobs:
       actions: read
       security-events: write
       contents: read
-    uses: "google/osv-scanner-action/.github/workflows/osv-scanner-reusable-pr.yml@880d9b542cc66d36d91d51b3fbcc038f5f28cfc5" # v2.5.1
+    uses: "google/osv-scanner-action/.github/workflows/osv-scanner-reusable-pr.yml@880d9b542cc66d36d91d51b3fbcc038f5f28cfc5" # v2.5.1 at pin time, see note above
     with:
       scan-args: |-
         -r
