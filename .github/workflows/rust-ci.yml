@@ -117,6 +117,16 @@ jobs:
       - name: compare against benches/baseline.json
         run: ./benches/compare.sh
 
+      # M0-5: the process-level cold-start measurement (design 4.3) needs
+      # the real release binary, not a criterion in-process call; not
+      # gated (see benches/README.md) -- logged for now, whoever sets up
+      # M6's binary-size/cold-start gating reads real numbers from here.
+      - name: cargo build --release -p wkp-cli
+        run: cargo build --release --locked -p wkp-cli
+
+      - name: benches/cold_start.sh
+        run: ./benches/cold_start.sh target/release/wkp 200
+
   cross-linux-musl:
     name: cross-compile (x86_64-unknown-linux-musl)
     runs-on: ubuntu-latest
