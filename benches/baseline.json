@@ -10,5 +10,16 @@
   },
   "cold_search_50k_corpus": {
     "mean_ns": 280114.81567882246
+  },
+  "materialize_tier0_50k_corpus": {
+    "mean_ns": 19298201.913333327
+  },
+  "_comment_binary_size_and_cold_start": "Not read/gated by compare.sh (no criterion estimates.json) -- recorded here per issue #5's acceptance criteria so M6 has real numbers to build a size/cold-start gate against. Captured from PR #150's own CI run (ubuntu-latest), 2026-09-12.",
+  "binary_size_bytes": {
+    "x86_64-unknown-linux-musl": 8565344
+  },
+  "cold_start_wkp_version_us": {
+    "p50": 1170,
+    "p95": 1257
   }
 }

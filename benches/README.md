@@ -135,6 +135,15 @@ A bench with no entry in `baseline.json` is reported `NEW` and does not
 fail the run — `--update` establishes a baseline for it once you're
 satisfied with the numbers.
 
+**`--update` rewrites the whole file from `BENCHES`, wiping anything else
+in it.** `baseline.json` also carries `binary_size_bytes` and
+`cold_start_wkp_version_us` (issue #5's acceptance criteria: binary size
+recorded so M6 can gate on it) — neither is a criterion bench, so
+`--update` doesn't know about them and will silently drop them on its next
+run. Whoever builds M6's actual size/cold-start gate should either extend
+`--update` to preserve non-`BENCHES` keys or re-add them by hand afterward
+— noted here rather than fixed now, since nothing gates on them yet.
+
 ## Fixture corpus
 
 `crates/wkp-core/benches/support.rs` is deliberately dependency-free: a
