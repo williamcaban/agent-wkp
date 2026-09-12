@@ -251,7 +251,7 @@ jobs:
           # libiconv, both ship with the OS) or something under the system
           # Frameworks path. Anything else is a non-system dynamic
           # dependency breaking the "no runtime" claim.
-          BAD=$(otool -L "$BIN" | tail -n +2 | awk '{print $1}' | grep -vE '^(/usr/lib/[^/]+\.dylib|/System/Library/Frameworks/)')
+          BAD=$(otool -L "$BIN" | tail -n +2 | awk '{print $1}' | grep -vE '^(/usr/lib/[^/]+\.dylib|/System/Library/Frameworks/)' || true)
           if [ -n "$BAD" ]; then
             echo "::error::unexpected dynamic dependencies:"
             echo "$BAD"
