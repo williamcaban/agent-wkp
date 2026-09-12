@@ -229,11 +229,60 @@ fn synthetic_item(i: usize, distinctive_content: bool) -> wkp_core::index::Item 
     }
 }
 
+/// M1-6 (`wkp materialize --tier 0|1`, M0-5's originally-named
+/// `materialize_tier0` target). Builds a 50k-item index where 1 in 100
+/// items (500 total) are `type: project-state` and human-signed -- tier 0
+/// unconditionally per [`compute_tier`](crate::index::tier) -- and the
+/// rest are untyped, landing at tier 2. That ratio approximates a real
+/// store's shape: most content is reference/knowledge material a harness
+/// pulls in on demand, only a small, deliberately-curated slice is tier 0
+/// content injected into every session. Materializing the full 50k corpus
+/// as if it were all tier 0 would measure a scenario this design never
+/// intends to hit in practice.
+fn materialize_tier0_50k_corpus(c: &mut Criterion) {
+    let dir = bench_dir("materialize-tier0-50k");
+    let dest = dir.join("index.db");
+    let items: Vec<wkp_core::index::Item> = (0..50_000)
+        .map(|i| materialize_bench_item(i, i % 100 == 0))
+        .collect();
+    wkp_core::index::build_index(&dest, &items).expect("build 50k index");
+
+    let mut group = c.benchmark_group("materialize_tier0_50k_corpus");
+    group.sample_size(50);
+    group.bench_function("materialize", |b| {
+        b.iter(|| {
+            let conn = wkp_core::index::open_index(black_box(&dest)).unwrap();
+            let out = wkp_core::index::materialize(&conn, black_box(0)).unwrap();
+            black_box(out);
+        })
+    });
+    group.finish();
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+fn materialize_bench_item(i: usize, tier0: bool) -> wkp_core::index::Item {
+    let mut rng = support::Xorshift64::new(i as u64 + 1);
+    let mut frontmatter = wkp_core::frontmatter::Frontmatter::default();
+    if tier0 {
+        frontmatter.item_type = Some(wkp_core::frontmatter::ItemType::ProjectState);
+        frontmatter.title = Some(format!("project state {i}"));
+    }
+    wkp_core::index::Item {
+        path: format!("item-{i:06}.md"),
+        frontmatter,
+        body: support::synthetic_body(&mut rng, 30),
+        embedding: None,
+        human_signed: true,
+    }
+}
+
 criterion_group!(
     benches,
     fixture_corpus_generate_5k,
     fixture_corpus_generate_50k,
     incremental_update_50k_corpus,
-    cold_search_50k_corpus
+    cold_search_50k_corpus,
+    materialize_tier0_50k_corpus
 );
 criterion_main!(benches);
