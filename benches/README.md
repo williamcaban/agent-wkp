@@ -53,6 +53,57 @@ measured separately with `/usr/bin/time -v` and a timing loop, not gated in
 CI: ~7.75ms wall-clock per invocation and ~5.7MB peak RSS on a 2k-item
 store, both within design 4.3's budget (RSS target: < 30MB).
 
+**M1-6 (`wkp materialize`) added `materialize_tier0_50k_corpus`** (issue #5's
+originally-named `materialize_tier0` target): a 50k-item corpus where 1 in
+100 items are `type: project-state` (tier 0 unconditionally) and the rest
+are untyped (tier 2), then times `wkp_core::index::materialize` assembling
+tier 0's `tier0.md` content. The 1% ratio approximates a real store's
+shape -- most content is reference/knowledge material pulled in on demand,
+only a small, curated slice is tier 0 content injected every session.
+Measured ~21ms locally; not yet CI-captured (see "CI" below).
+
+## `tools/gen-corpus` (issue #5's original ask)
+
+Issue #5 asked for a separate `tools/gen-corpus` binary generating fixture
+corpora into `tests/fixtures/`. This harness instead puts corpus generation
+directly in `crates/wkp-core/benches/support.rs`, a dev-dependency-only
+module every bench above already shares (see "Fixture corpus" below) --
+deliberately, not as an oversight: every one of these benches needs a
+fixture corpus at exactly this scale, so `support::generate_corpus` already
+*is* the shared dependency a separate tool would only duplicate, and
+CLAUDE.md's own stance against unnecessary abstraction argues against
+maintaining two corpus generators. If a *non-benchmark* consumer needs
+fixture generation later (e.g. a CLI smoke-test harness), that's the
+occasion to extract `support::generate_corpus` into a real `tools/`
+binary -- not before.
+
+## `benches/cold_start.sh` (process-level cold-start bench)
+
+Design 4.3's "cold `wkp search` process" framing also names a proxy metric
+for start-up cost generally: wall-clock of spawning `target/release/wkp
+--version`, p50/p95 over many runs. This can't be a Criterion bench --
+Criterion measures in-process function calls, not `fork`/`exec` and
+dynamic-linker overhead -- so it's a small standalone script instead:
+
+```bash
+cargo build --release -p wkp-cli
+./benches/cold_start.sh                        # target/release/wkp, 200 runs
+./benches/cold_start.sh target/release/wkp 50  # override binary/run count
+```
+
+Not wired into `compare.sh`'s regression gate (no criterion `estimates.json`
+to read) and not currently run in CI -- it exists to make this measurement
+reproducible, since no prior CI-captured number for `wkp --version`
+specifically exists on record (the ~7.75ms and ~2-3ms wall-clock figures
+elsewhere in this doc and in `core_benches.rs` are both for `wkp search`,
+on 2k- and 50k-item stores respectively -- a different command, not this
+script's target). A local run in this sandbox measured p50 1.37ms / p95
+1.46ms over 50 runs -- illustrative only, not a CI-captured baseline.
+Whoever gates this in CI later should expect the same shared-runner
+variance documented below for the criterion benches, probably worse
+(process-spawn overhead is more scheduler-sensitive than in-process work)
+-- start with a generous threshold, not the 25% intuition.
+
 ## Running
 
 ```bash
