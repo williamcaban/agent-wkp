@@ -6,8 +6,7 @@ on:
   pull_request:
     branches: [main, v2-rust]
 
-permissions:
-  contents: read
+permissions: {} # every job below declares its own least-privilege grant
 
 concurrency:
   group: rust-ci-${{ github.workflow }}-${{ github.ref }}
@@ -60,8 +59,20 @@ jobs:
       - name: cargo clippy -D warnings
         run: cargo clippy --workspace --all-targets -- -D warnings
 
-      - name: cargo test
-        run: cargo test --workspace
+      # Advisory only, deliberately a separate invocation from the -D
+      # warnings gate above: combining `-D warnings -W clippy::pedantic`
+      # in one clippy call turned out to deny the pedantic lints too (not
+      # just warn on them -- confirmed by hand, ~80 pre-existing
+      # violations across wkp-crypto/wkp-git/wkp-hub/wkp-cli would have
+      # failed CI outright). Fixing all of those is a real, separate
+      # cleanup pass, not something this step should force silently.
+      # Without -D warnings in this invocation, pedantic lints only ever
+      # warn (exit 0), which is what "visible but not blocking" means here.
+      - name: cargo clippy -W clippy::pedantic (advisory, non-blocking)
+        run: cargo clippy --workspace --all-targets -- -W clippy::pedantic
+
+      - name: cargo test --locked
+        run: cargo test --workspace --locked
 
   audit-deny-vet:
     name: audit, deny, vet
@@ -290,7 +301,7 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
       - name: semgrep --config p/rust
-        run: semgrep scan --config p/rust --error --metrics=off
+        run: semgrep scan --config p/rust --config p/secrets --error --metrics=off
 
   hub-mtls-integration:
     name: hub HTTPS+mTLS integration test (M5-13)

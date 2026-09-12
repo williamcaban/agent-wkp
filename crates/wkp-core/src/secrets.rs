@@ -216,7 +216,7 @@ mod tests {
 
     #[test]
     fn detects_an_aws_access_key_id() {
-        let findings = scan("AWS_ACCESS_KEY_ID=AKIAABCDEFGHIJKLMNOP\n");
+        let findings = scan("AWS_ACCESS_KEY_ID=AKIAABCDEFGHIJKLMNOP\n"); // nosemgrep: generic.secrets.security.detected-aws-access-key-id-value.detected-aws-access-key-id-value -- fixture for this module's own scanner, not a real key
         assert!(rule_names(&findings).contains(&"aws-access-key-id"));
     }
 
@@ -275,7 +275,7 @@ mod tests {
 
     #[test]
     fn redacted_excerpt_never_contains_the_matched_secret() {
-        let secret = "AKIAABCDEFGHIJKLMNOP";
+        let secret = "AKIAABCDEFGHIJKLMNOP"; // nosemgrep: generic.secrets.security.detected-aws-access-key-id-value.detected-aws-access-key-id-value -- fixture for this module's own scanner, not a real key
         let content = format!("AWS_ACCESS_KEY_ID={secret}\n");
         let findings = scan(&content);
         assert!(!findings.is_empty());
@@ -290,8 +290,8 @@ mod tests {
 
     #[test]
     fn redacted_excerpt_is_safe_on_non_ascii_content_near_the_match() {
-        let content = "emoji context 🎉🎉🎉 AWS_ACCESS_KEY_ID=AKIAABCDEFGHIJKLMNOP 🎉🎉🎉 more\n";
-        // Must not panic slicing on a non-char-boundary byte offset.
+        let content = "emoji context 🎉🎉🎉 AWS_ACCESS_KEY_ID=AKIAABCDEFGHIJKLMNOP 🎉🎉🎉 more\n"; // nosemgrep: generic.secrets.security.detected-aws-access-key-id-value.detected-aws-access-key-id-value -- fixture for this module's own scanner, not a real key
+                                                                                                   // Must not panic slicing on a non-char-boundary byte offset.
         let findings = scan(content);
         assert!(!findings.is_empty());
     }
