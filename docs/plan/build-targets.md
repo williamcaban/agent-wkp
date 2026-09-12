@@ -55,10 +55,12 @@ lookup, which `wkp --version` and normal store operations don't.
 
 Builds `wkp-cli` with `--release --locked`, then checks:
 
-- `otool -L <binary>` lists nothing besides `/usr/lib/libSystem.B.dylib`
-  and paths under `/System/Library/Frameworks/` -- any other entry is a
-  non-system dynamic dependency that would break "links only system
-  frameworks" on a machine without that library installed.
+- `otool -L <binary>` lists nothing besides base-system dylibs
+  (`/usr/lib/*.dylib` -- e.g. `libSystem.B.dylib`, and `libiconv.2.dylib`,
+  which this binary also links, pulled in transitively) and paths under
+  `/System/Library/Frameworks/` -- any other entry is a non-system dynamic
+  dependency that would break "links only system frameworks" on a machine
+  without that library installed.
 - Binary size stays under the 10 MB gate (design 9.6).
 
 ```bash

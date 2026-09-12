@@ -247,10 +247,11 @@ jobs:
           BIN=target/aarch64-apple-darwin/release/wkp
           otool -L "$BIN"
           # Every line after the first (the binary's own install name) must
-          # be libSystem or something under the system Frameworks path --
-          # anything else is a non-system dynamic dependency breaking the
-          # "no runtime" claim.
-          BAD=$(otool -L "$BIN" | tail -n +2 | awk '{print $1}' | grep -vE '^(/usr/lib/libSystem\.B\.dylib|/System/Library/Frameworks/)')
+          # be a base-system dylib (/usr/lib/*.dylib -- e.g. libSystem,
+          # libiconv, both ship with the OS) or something under the system
+          # Frameworks path. Anything else is a non-system dynamic
+          # dependency breaking the "no runtime" claim.
+          BAD=$(otool -L "$BIN" | tail -n +2 | awk '{print $1}' | grep -vE '^(/usr/lib/[^/]+\.dylib|/System/Library/Frameworks/)')
           if [ -n "$BAD" ]; then
             echo "::error::unexpected dynamic dependencies:"
             echo "$BAD"
