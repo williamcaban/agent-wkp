@@ -44,9 +44,11 @@ pub struct Tenant {
 
 /// One registered device key (design 6.4, 8.1): the public half of a
 /// device's signing identity, scoped to one tenant. `revoked_at` being
-/// `Some` is what [`crate::control_plane`]'s callers (`wkp-shell`,
-/// M5-3) check to refuse a connection -- there is no separate "delete
-/// the row" revocation path, so a revoked device's own history (which
+/// `Some` is what `hub_ca.rs`'s `RevocationAwareClientCertVerifier` and
+/// `http.rs`'s `handle_git_http` check to refuse a connection today
+/// (originally `wkp-shell`'s job, M5-3, before ADR-0011/#125 removed
+/// the SSH transport it served) -- there is no separate "delete the
+/// row" revocation path, so a revoked device's own history (which
 /// tenant it belonged to, when it was revoked) is never lost.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Device {
@@ -168,8 +170,9 @@ pub fn find_tenant_by_slug(client: &mut Client, slug: &str) -> Result<Option<Ten
 
 /// Looks up a tenant by its `id` -- the reverse direction of
 /// [`find_tenant_by_slug`], needed by anything that starts from a
-/// [`Device`] row (which only carries `tenant_id`), e.g. `wkp-shell`'s
-/// key-to-tenant resolution (M5-3).
+/// [`Device`] row (which only carries `tenant_id`), e.g. `http.rs`'s
+/// RFC 8628 device-grant flow today (originally `wkp-shell`'s
+/// key-to-tenant resolution, M5-3, before ADR-0011/#125 removed it).
 pub fn find_tenant_by_id(client: &mut Client, tenant_id: i64) -> Result<Option<Tenant>, Error> {
     let row = client.query_opt(
         &format!("SELECT {TENANT_COLUMNS} FROM tenants WHERE id = $1"),
@@ -265,8 +268,10 @@ const DEVICE_COLUMNS: &str = "id, tenant_id, public_key, created_at, revoked_at,
      certificate_pem, cert_serial, cert_issued_at, cert_expires_at";
 
 /// Registers a device's public key under `tenant_id` -- the write side
-/// of what M5-2's RFC 8628 flow calls once a grant is approved, and
-/// what M5-3's `wkp-shell` reads back to resolve a presented key.
+/// of what M5-2's RFC 8628 flow calls once a grant is approved, read
+/// back today by `main.rs`'s admin CLI and `hub_ca.rs`'s certificate
+/// checks (originally also `wkp-shell`'s job, M5-3, before ADR-0011/
+/// #125 removed it).
 pub fn register_device(
     client: &mut Client,
     tenant_id: i64,
@@ -283,9 +288,11 @@ pub fn register_device(
 }
 
 /// Looks up a device by its exact public key. `Ok(None)` for an
-/// unknown key -- not an error, since `wkp-shell` (M5-3) needs to
-/// treat "no such device" as an ordinary, expected outcome (refuse
-/// the connection), not a control-plane failure.
+/// unknown key -- not an error, since callers like `main.rs`'s admin
+/// CLI need to treat "no such device" as an ordinary, expected outcome
+/// (refuse the connection), not a control-plane failure. `wkp-shell`
+/// (M5-3) originally had the same requirement, before ADR-0011/#125
+/// removed it.
 pub fn find_device_by_public_key(
     client: &mut Client,
     public_key: &str,

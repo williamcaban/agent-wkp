@@ -181,9 +181,11 @@ impl Rendered {
         )
     }
 
-    /// A bare status code with no body -- `401`/`403` for the bearer-
-    /// token checks M5-6's own routes make before ever calling `git
-    /// http-backend` at all.
+    /// A bare status code with no body -- `401`/`403` for the mTLS
+    /// client-certificate checks `handle_git_http` makes (missing cert,
+    /// unknown cert_serial, revoked device, tenant mismatch) before ever
+    /// calling `git http-backend` at all. Bearer tokens (M5-6) were
+    /// replaced by client-cert auth in M5-10/ADR-0011.
     pub(crate) fn status_only(status: u16) -> Self {
         Rendered {
             status,
@@ -218,10 +220,11 @@ fn respond(request: tiny_http::Request, rendered: Rendered) {
 }
 
 /// M5-7 (ADR-0010): the mode a tenant's own pod runs -- serves exactly
-/// one fixed tenant's repo via `git http-backend`, with no bearer-token
-/// check at all (the front door already made that decision before ever
-/// proxying a request here) and no RFC 8628/`/verify` routes (a pod
-/// has no reason to run them; those stay the front door's own job).
+/// one fixed tenant's repo via `git http-backend`, with no mTLS
+/// client-certificate check at all (the front door already made that
+/// decision before ever proxying a request here) and no RFC 8628/
+/// `/verify` routes (a pod has no reason to run them; those stay the
+/// front door's own job).
 /// Refuses (404) any request naming a *different* tenant than the one
 /// this process was started for -- defense in depth even though the
 /// front door should never send one here, the same posture
@@ -272,8 +275,9 @@ pub fn serve_single_tenant(
 /// Recognizes `/<tenant-slug>.git/<suffix>` (`info/refs`,
 /// `git-upload-pack`, `git-receive-pack`) -- the URL shape a real git
 /// client constructs against a `https://.../<tenant-slug>.git` remote,
-/// matching `wkp-shell`'s own `<slug>.git` bare-repo naming convention
-/// (M5-3/M5-4) so both transports name the same repo the same way.
+/// matching the `<slug>.git` bare-repo naming convention M5-4 (`tenant_repo.rs`)
+/// established and `wkp_shell.rs`'s SSH path originally shared before
+/// ADR-0011 removed it.
 pub(crate) fn git_http_path(path: &str) -> Option<(String, String)> {
     let rest = path.strip_prefix('/')?;
     let (repo, suffix) = rest.split_once('/')?;
@@ -284,18 +288,17 @@ pub(crate) fn git_http_path(path: &str) -> Option<(String, String)> {
     Some((tenant_slug.to_string(), suffix.to_string()))
 }
 
-/// M5-6 (design 8.1): validates a device-scoped bearer token against
-/// the control plane, checks it names *this* URL's own tenant (a
-/// token valid for one tenant must never reach another tenant's repo,
-/// even though both live under the same `repos_root` -- the same
-/// never-trust-the-client's-own-path posture `wkp-shell`'s SSH path
-/// already takes, M5-3), and only then hands the request off to `git
-/// http-backend` (`wkp_git::http_backend`, this crate's own plumbing
-/// for it).
 /// The three pieces [`git_http_path`] parses out of a request's URL,
 /// bundled into one argument so [`handle_git_http`] stays under
 /// clippy's `too_many_arguments` -- always produced and consumed
-/// together, never independently.
+/// together, never independently. `handle_git_http` itself (M5-10/
+/// ADR-0011) validates the caller's mTLS client certificate against the
+/// control plane, checks it names *this* route's own tenant (a
+/// certificate valid for one tenant must never reach another tenant's
+/// repo, even though both live under the same `repos_root`), and only
+/// then hands the request off to `git http-backend`
+/// (`wkp_git::http_backend`, this crate's own plumbing for it). M5-6's
+/// original bearer-token check this replaced is gone.
 #[derive(Clone, Copy)]
 pub(crate) struct GitHttpRoute<'a> {
     pub(crate) tenant_slug: &'a str,
@@ -1026,8 +1029,8 @@ mod tests {
     }
 
     /// M5-7 (ADR-0010): the mode a tenant's own pod runs -- serves its
-    /// one fixed repo with no bearer-token check at all (the front door
-    /// already made that decision before ever proxying here).
+    /// one fixed repo with no mTLS client-certificate check at all (the
+    /// front door already made that decision before ever proxying here).
     #[test]
     fn serve_single_tenant_serves_its_one_configured_tenant_with_no_auth_needed() {
         let repos_root = tempfile::Builder::new()

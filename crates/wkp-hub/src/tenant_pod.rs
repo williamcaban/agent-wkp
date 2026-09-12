@@ -216,11 +216,12 @@ fn start_pod(image: &str, repos_root: &Path, tenant_slug: &str) -> Result<(), St
     let mount = repo_mount_arg(repos_root, tenant_slug);
     let port = SERVE_PORT.to_string();
     // `--entrypoint`: the image's own default entrypoint
-    // (`deploy/hub/entrypoint.sh`) unconditionally starts `sshd` for
-    // the *front-door* container -- found by hand while testing this
+    // (`deploy/hub/entrypoint.sh`) unconditionally execs `wkp-hub serve`
+    // (the *front-door* server mode) -- found by hand while testing this
     // against the real image, it silently ignores whatever command a
     // `podman run` passes after the image name instead of running it.
-    // A tenant's own pod needs `wkp-hub` invoked directly instead.
+    // A tenant's own pod needs `wkp-hub` invoked directly instead, in
+    // its single-tenant serving mode, not the front door's.
     run_podman(&[
         "run",
         "-d",
