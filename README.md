@@ -5,10 +5,16 @@ Rust binary that gives any agentic harness durable, cross-machine,
 cross-harness memory: a git repository of markdown files, a derived SQLite
 FTS5 index, and optional sync to a hosted hub.
 
-This branch (`v2-rust`) is that rewrite in progress. The Cargo workspace,
-CI baseline, and the git minimum-version gate are in place (M0); read-path
-parity with the old tool (`wkp init`, `index`, `search`, `context`,
-`materialize`, `hooks`) lands in M1. See:
+This branch (`v2-rust`) is that rewrite. M0 through M5 are substantively
+done: read-path parity (`wkp init`, `index`, `search`, `context`,
+`materialize`, `hooks`), the write/audit path (`wkp remember`/`promote`,
+signed commits), local multi-machine sync, age encryption for private
+items, and a hosted hub (per-tenant pods, HTTPS with mutual TLS, device
+registration and revocation) all exist and are exercised in CI. M6
+(hardening and release: sandboxing, signed reproducible releases, a
+Homebrew tap, an OCI image) has not started. See `docs/plan/milestones.md`
+for exactly what each milestone's own exit criterion holds and what's
+still open.
 
 - [`CLAUDE.md`](CLAUDE.md) — the working agreement for anyone (human or
   agent) contributing code on this branch.
@@ -16,8 +22,7 @@ parity with the old tool (`wkp init`, `index`, `search`, `context`,
   the authoritative design.
 - [`docs/plan/milestones.md`](docs/plan/milestones.md) — milestones and
   per-milestone task lists.
-- [`AGENTS.md`](AGENTS.md) — how an agent uses the `wkp` CLI once it exists
-  (currently describes the Python tool; rewritten for the Rust CLI in M1).
+- [`AGENTS.md`](AGENTS.md) — how an agent uses the `wkp` CLI.
 
 ## The previous Python implementation
 

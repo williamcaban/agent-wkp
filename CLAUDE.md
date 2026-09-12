@@ -65,10 +65,9 @@ crates/wkp-core    store model, frontmatter, tiers, index, FTS5 search, merge dr
 crates/wkp-crypto  age filter, keys, signing, allowed_signers        (human co-sign)
 crates/wkp-git     plumbing wrapper, bundles, sync                    (human co-sign)
 crates/wkp-cli     the wkp binary; wkpd is a subcommand
-crates/wkp-hub     hub mode: wkp-shell, tenant mapping, indexer, control plane (human co-sign)
+crates/wkp-hub     hub mode: mTLS front door, tenant pods, indexer, control plane (human co-sign)
 crates/wkp-sys     only crate allowed unsafe (bundled SQLite)
-adapters/          hook templates per harness, printed by `wkp hooks`
-deploy/            Containerfiles, sshd_config, systemd and launchd units
+deploy/            Containerfiles (CLI scratch image, wkp-hub's front door), systemd and launchd units
 fuzz/              cargo-fuzz targets for every parser of untrusted input
 tests/injection-corpus/
 docs/design, docs/plan, docs/adr
