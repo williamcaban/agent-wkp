@@ -353,7 +353,7 @@ mod tests {
         let key = generate_test_key_and_register(dir, "agent:claude-code@host");
 
         let opts = remember_opts(dir, &key, "knowledge", "Has A Secret");
-        let result = run_remember_with_body(&opts, "AWS_ACCESS_KEY_ID=AKIAABCDEFGHIJKLMNOP\n");
+        let result = run_remember_with_body(&opts, "AWS_ACCESS_KEY_ID=AKIAABCDEFGHIJKLMNOP\n"); // nosemgrep: generic.secrets.security.detected-aws-access-key-id-value.detected-aws-access-key-id-value -- fixture proving wkp remember's own secret scan refuses this, not a real key
 
         assert!(result.is_err(), "expected a secret-scan refusal");
         let inbox = dir.join("inbox");
