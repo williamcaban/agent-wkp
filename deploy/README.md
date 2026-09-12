@@ -24,32 +24,43 @@ Both units run as the invoking user, never root/system-wide, and both
 need their placeholder paths (`REPLACE_ME_*`) filled in for the specific
 store being watched -- see the comments inside each file.
 
-## `hub/` (M5-5)
+## `hub/` (M5-5, ADR-0011/#125)
 
-The hub's front-door container: `sshd` + `wkp-shell` in front of a
-single shared filesystem (per-tenant hard isolation via a pod per
-tenant is ADR-0009/M5-7's job, not this image's). Fedora-based
+The hub's front-door container: HTTPS with mutual TLS only (the
+original SSH transport -- `sshd` + `wkp-shell` -- was dropped by
+ADR-0011 and its code removed, #125). Fedora-based
 (`quay.io/fedora/fedora-minimal`), built and run with `podman`.
 
 - `Containerfile` -- multi-stage build (a Rust builder stage compiling
   `wkp-hub` at the toolchain version `rust-toolchain.toml` pins, then a
-  minimal runtime stage with `sshd`, `git`, and the compiled binary).
-- `sshd_config` -- design 8.1's hardening list, checked in verbatim.
-- `entrypoint.sh` -- generates the host key on first boot, and writes
-  `DATABASE_URL` to a `0640` file `wkp-hub-akc.sh` sources: `sshd`
-  invokes `AuthorizedKeysCommand` with a sanitized environment (a
-  container-level env var does not reach it -- confirmed by hand while
-  building this image), and a Postgres connection string is
-  secret-shaped, so CLAUDE.md's "read secrets from... a 0600 file" rule
-  applies directly rather than relying on env-var passthrough that
-  doesn't happen anyway.
-- `wkp-hub-akc.sh` -- the `AuthorizedKeysCommand` wrapper described
-  above; must stay root-owned and non-group/world-writable (`sshd`'s
-  own requirement for this directive).
-- `test-ssh-integration.sh` -- the milestone's one required integration
-  test: register a device, push over SSH, revoke it, attempt another
-  push, confirm it fails. Run it locally against a built image
+  minimal runtime stage with `git`, `podman-remote` (ADR-0012 -- lets
+  this container reach a `podman` engine on the host to start/stop
+  tenant pods without running its own nested container runtime), and
+  the compiled binary). No `sshd` here anymore.
+- `entrypoint.sh` -- validates `DATABASE_URL` is set and execs
+  `wkp-hub serve` directly; `wkp-hub serve` reads `DATABASE_URL` and
+  its CA directory from its own process environment/defaults, so there
+  is nothing left for this entrypoint to do beyond that.
+- `test-mtls-integration.sh` -- the milestone's one required
+  integration test (M5-13): register a device over the real RFC 8628 +
+  CSR flow, push and fetch over HTTPS with mutual TLS, revoke it,
+  attempt another push, confirm it fails at the TLS handshake itself.
+  Run it locally against a built image
   (`podman build -f deploy/hub/Containerfile -t wkp-hub .`) with
   `DATABASE_URL` pointing at a reachable Postgres; CI wires the same
-  script up against a service container (a separate PR, per CLAUDE.md's
-  rule against mixing workflow-file changes with feature code).
+  script up against a service container (`hub HTTPS+mTLS integration
+  test (M5-13)`, `.github/workflows/rust-ci.yml`).
+- `test-pod-lifecycle.sh`, `test-cross-tenant-isolation.sh` (M5-7,
+  #110) -- per-tenant pod provisioning/lifecycle and a real
+  cross-tenant filesystem isolation check (a tenant's own pod
+  container never has any other tenant's repo bind-mounted into it at
+  all, not just an application-level path check). CI job:
+  `hub per-tenant pod isolation test (M5-7)`.
+
+## Top-level `Containerfile` (M0-6)
+
+A separate, much smaller image: `FROM scratch`, containing nothing but
+a statically linked `wkp` CLI binary (`x86_64-unknown-linux-musl`),
+proving design 9.6's "no runtime" claim end to end. Not related to
+`hub/`'s image -- this one exists purely to exercise the CLI binary's
+own static-link property. See `docs/plan/build-targets.md`.
