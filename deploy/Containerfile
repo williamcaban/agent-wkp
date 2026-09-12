@@ -1,0 +1,16 @@
+# M0-6: minimal `FROM scratch` image proving the `wkp` binary really is
+# static and needs no base image at all -- design 9.6's "no runtime" claim.
+# Not `wkp-hub`'s image (`deploy/hub/Containerfile`, Fedora-based, sshd +
+# git): this one exists purely to prove and exercise the CLI binary's own
+# static-link property, not to run a service.
+#
+# Build a release x86_64-unknown-linux-musl binary first (see
+# .github/workflows/rust-ci.yml's `cross-linux-musl` job, or locally:
+# `cargo build --release --locked -p wkp-cli --target x86_64-unknown-linux-musl`),
+# then:
+#   podman build -f deploy/Containerfile -t wkp .
+#   podman run --rm wkp --version
+FROM scratch
+COPY target/x86_64-unknown-linux-musl/release/wkp /wkp
+USER 65532
+ENTRYPOINT ["/wkp"]
