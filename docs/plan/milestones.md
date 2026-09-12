@@ -19,7 +19,7 @@ Each milestone has an exit criterion that is observable, not a checklist of file
 3. Git minimum-version spike: confirm SSH signing (`gpg.format=ssh`, `gpg.ssh.allowedSignersFile`) and builtin fsmonitor behavior on the current macOS and Fedora git builds; record the decision as ADR-0001; `wkp` refuses to run below the minimum with a clear message.
 4. Remove the Python tree from this branch after tagging `v0-python` on `main`; keep `AGENTS.md` (to be rewritten in M1) and `LICENSE`.
 5. Benchmark harness: criterion benches for cold `wkp search`, incremental index, materialize; a fixture corpus generator (5k and 50k items); `benches/baseline.json` and a regression threshold documented in `benches/README.md`.
-6. Cross-compile and static-link check: `x86_64-unknown-linux-musl`, `aarch64-apple-darwin`; size gate.
+6. Cross-compile and static-link check: `x86_64-unknown-linux-musl`, `aarch64-apple-darwin`; size gate. **Done, merged 2026-09-11** (issue #6): also added `aarch64-unknown-linux-musl` (via `cross`, no native cross-linker for that pair on `ubuntu-latest`) beyond the two targets originally named here, an `otool -L` check on the macOS binary, a `FROM scratch` `deploy/Containerfile` proving the static-link claim end to end, and `docs/plan/build-targets.md`.
 
 ## M1 tasks
 
