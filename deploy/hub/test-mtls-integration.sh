@@ -8,8 +8,9 @@
 # real, built `wkp-hub` image (deploy/hub/Containerfile), over a real
 # mTLS connection and a real tenant pod, not a simulated call. This is
 # the mTLS-era replacement for M5-5's own required
-# test-ssh-integration.sh, which #125 (ADR-0011, gated on this test
-# being green) will retire once this one is proven.
+# test-ssh-integration.sh, which #125 (ADR-0011) retired once this test
+# was proven green in CI -- that script and the SSH-path code it
+# exercised are gone from the tree now, not just scheduled for removal.
 #
 # Expects: `podman`, `git`, `curl`, `psql` on PATH; the `wkp-hub` image
 # already built and tagged (default localhost/wkp-hub, override via
@@ -21,8 +22,8 @@
 # is untouched).
 #
 # Bridge networking with a mapped port for the front door's own client-
-# facing port, same reasoning `test-ssh-integration.sh` already
-# documents for its own SSH port (a real GitHub Actions runner's own
+# facing port, the same reasoning the now-removed test-ssh-integration.sh
+# documented for its own SSH port (a real GitHub Actions runner's own
 # services can collide with `--network host`). The front door
 # container *also* joins the shared `wkp-hub-tenants` user-defined
 # network (ADR-0009/0010) -- unlike M5-5's own container, which never
