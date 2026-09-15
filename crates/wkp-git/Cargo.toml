@@ -1,0 +1,15 @@
+[package]
+name = "wkp-git"
+description = "Plumbing wrapper, bundles, sync"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+name = "wkp_git"
+
+[dev-dependencies]
+tempfile = "3.27.0"

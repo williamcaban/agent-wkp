@@ -1,0 +1,29 @@
+[package]
+name = "wkp-core-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+
+[dependencies.wkp-core]
+path = "../crates/wkp-core"
+
+[[bin]]
+name = "frontmatter"
+path = "fuzz_targets/frontmatter.rs"
+test = false
+doc = false
+bench = false
+
+# Deliberately its own workspace: cargo-fuzz targets need a toolchain and
+# instrumentation the main workspace does not (commonly nightly), and
+# CLAUDE.md's supply-chain gates (deny/vet) apply to the release binary's
+# dependency graph, not this dev-only fuzzing harness. Keeping it detached
+# means `cargo build --workspace` / `cargo deny check` at the repo root
+# never touch it.
+[workspace]

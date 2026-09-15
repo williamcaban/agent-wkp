@@ -1,0 +1,23 @@
+# cargo-audit config (read automatically, no CLI flag needed -- see
+# .github/workflows/rust-ci.yml's plain `cargo audit` step).
+#
+# RUSTSEC-2023-0071 (Marvin Attack, rsa 0.9.10, no fixed upgrade
+# available): rsa is an *optional*, feature-gated dependency of
+# ssh-key (crates/wkp-crypto/Cargo.toml, M5-2's SSH signing identity),
+# which this workspace only ever enables with `features = ["ed25519",
+# "rand_core"]` -- never ssh-key's own "rsa" or "crypto" feature.
+# Confirmed by hand, not assumed: `cargo clean -p ssh-key && cargo
+# build -p wkp-crypto -v` shows the actual rustc invocation activates
+# exactly `alloc, default, ecdsa, ed25519, rand_core, std` -- no
+# `rsa`/`p256`/`p384`/`p521` cfg flag anywhere. `rsa` still appears as
+# a *resolved* entry in Cargo.lock (a known cargo-audit limitation:
+# Cargo.lock records every optional dependency a crate's *chosen
+# version* could activate under any feature selection, not just the
+# ones actually compiled for this workspace's specific feature set --
+# `cargo deny check`'s advisory scan is feature-aware and does not
+# flag this same crate, which is the asymmetry that surfaced this).
+# The vulnerable code path genuinely never compiles into any binary
+# this workspace produces. Revisit if ssh-key's own default features
+# ever change, or if this workspace ever needs RSA host key support.
+[advisories]
+ignore = ["RUSTSEC-2023-0071"]

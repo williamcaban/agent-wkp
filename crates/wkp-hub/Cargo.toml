@@ -1,0 +1,181 @@
+[package]
+name = "wkp-hub"
+description = "wkp hub mode: mTLS front door, tenant pods, indexer, control plane"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "wkp-hub"
+path = "src/main.rs"
+
+[dependencies]
+# M5-4: the tenant indexer reuses wkp-core's own frontmatter parser and
+# index builder rather than reimplementing them (CLAUDE.md's slim-core
+# rule, design 3.3) -- the same reuse contract this crate's own module
+# doc for `tenant_repo` names explicitly.
+wkp-core = { path = "../wkp-core" }
+# M5-4: bare-repo provisioning and reading pushed blob content both go
+# through this crate's plumbing wrapper (CLAUDE.md: no `Command::new("git")`
+# outside `wkp-git`), exactly like `wkp-cli` does.
+wkp-git = { path = "../wkp-git" }
+# M5-4: `wkp_crypto::AGE_HEADER`, the same age-ciphertext detection
+# `wkp-cli`'s filter (M4-4) uses, needed here so the tenant indexer never
+# parses a `visibility: private` blob's ciphertext as if it were plaintext
+# markdown. No encrypt/decrypt call in this crate -- the hub never holds a
+# device's decryption key (design 8's whole point).
+wkp-crypto = { path = "../wkp-crypto" }
+# M5-1: the control plane's Postgres client (design 8.2). The
+# synchronous `postgres` crate, not `tokio-postgres`/`sqlx` directly --
+# every other crate in this workspace is deliberately blocking (git
+# subprocesses, rusqlite), and this keeps `wkp-hub`'s own code in that
+# same style rather than pulling an async runtime into its call sites
+# at this stage; `postgres` still uses `tokio` internally, but only as
+# a private implementation detail behind a fully blocking public API.
+# Revisit if M5-2's HTTP server needs real request concurrency this
+# can't provide. `with-time-0_3` maps `TIMESTAMPTZ` (this schema's
+# `revoked_at`, `created_at`) to a real `time::OffsetDateTime` instead
+# of hand-parsing a raw string.
+postgres = { version = "0.19.14", features = ["with-time-0_3"] }
+# M5-2: request/response bodies for the RFC 8628 device-authorization
+# endpoints (design 6.4). A well-vetted library, not a hand-rolled
+# parser: this parses untrusted network input, unlike promote.rs's
+# small, local, trusted TOML config.
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+time = "0.3"
+# M5-2: the RFC 8628 endpoints and `/verify` page (design 6.4, 8.1).
+# Synchronous, not an async web framework -- matches `postgres`'s own
+# blocking choice above; a handful of low-traffic, infrequent-by-nature
+# endpoints has no real concurrency need an async framework would
+# justify.
+tiny_http = "0.12.0"
+# M5-7 (ADR-0009/0010): the front door proxies a git-http request to
+# the resolved tenant's own pod over the shared network rather than
+# running `git http-backend` itself -- was a dev-only dependency (M5-2's
+# own test suite drives this crate's endpoints over a real socket, not
+# by calling handler functions directly); production code needs it now
+# too, for the exact same "no async runtime" reasoning `postgres`'s own
+# comment above gives. `default-features = false`: see
+# wkp-cli/Cargo.toml's identical entry for why (CDLA-Permissive-2.0
+# license on the TLS stack's `webpki-roots`, and no `https://` target
+# a tenant pod's own address ever needs -- it's plain HTTP inside the
+# shared podman network, not a public endpoint).
+ureq = { version = "3.4.1", default-features = false, features = ["json", "gzip"] }
+# M5-8 (ADR-0011): real TLS termination for the front door. Already in
+# this workspace's `Cargo.lock` at 0.23.44 (`ureq`'s own optional TLS
+# stack, which `default-features = false` above leaves unbuilt); this
+# makes it a direct dependency so `src/hub_ca.rs` can build the
+# `ServerConfig` the front door's acceptor presents.
+# `default-features = false` + `ring`: pin the crypto provider
+# to `ring`, the one already in this tree, rather than letting the
+# default pull in `aws-lc-rs`/`aws-lc-sys` -- a C library with `unsafe`
+# FFI, which is exactly the tradeoff ADR-0011 rejected OpenSSL over.
+# No `webpki-roots` feature and no public trust bundle anywhere: the
+# hub is its own private CA (issue #122's own acceptance criterion),
+# which also sidesteps the CDLA-Permissive-2.0 license note on `ureq`
+# above.
+rustls = { version = "0.23", default-features = false, features = ["std", "ring", "tls12", "logging"] }
+# M5-8 (ADR-0011): the hub's own private CA -- generating the root
+# certificate and minting the TLS server leaf it presents. Pure Rust,
+# so `#![forbid(unsafe_code)]` holds without shelling out to OpenSSL
+# (ADR-0011 option 4 vs. option 5). `default-features = false` +
+# `ring`: same crypto-provider pinning as `rustls` above (rcgen's own
+# default is `ring` today, but stating it means a future default flip
+# to `aws-lc-rs` can't silently pull a C library in). `pem` for the
+# on-disk PEM encoding the CA files use. `x509-parser` so
+# `rcgen::Issuer::from_ca_cert_pem` can rebuild the issuer from the
+# root certificate actually on disk, rather than from a reconstructed
+# copy of the parameters it was generated with -- the reconstruction
+# would silently start minting leaves with a mismatched issuer DN the
+# day someone edits that constant, and every already-issued
+# certificate would stop chaining. `rustls-pki-types` is rcgen's and
+# rustls' shared DER wrapper type, named directly here so `hub_ca` can
+# hand a `CertificateDer`/`PrivateKeyDer` from one to the other
+# without an intermediate re-parse.
+rcgen = { version = "0.14.10", default-features = false, features = ["ring", "pem", "x509-parser"] }
+rustls-pki-types = "1"
+# M5-10 (ADR-0011): `RevocationAwareClientCertVerifier` (`src/hub_ca.rs`)
+# needs to read a presented client certificate's serial number back out
+# of its DER at handshake time, to look it up in the control plane's
+# `devices.cert_serial`. Already resolved in this workspace's
+# `Cargo.lock` -- `rcgen`'s own `x509-parser` feature above pulls it in
+# transitively for CSR parsing -- so this makes it a direct dependency
+# rather than a second, hand-rolled ASN.1 parser: the exact same
+# "mature, audited library over novel security-critical code" call
+# ADR-0011 already made for TLS itself (see `axum`/`axum-server`'s own
+# comment below). `default-features = false`: this crate only ever
+# reads an already chain-validated certificate's serial number, never
+# builds or cryptographically verifies one itself (`rustls` already did
+# that by the time this runs) -- no need for the `verify`/`validate`
+# features.
+x509-parser = { version = "0.18", default-features = false }
+# M5-8 (ADR-0011): the front door's HTTP listener, and only the front
+# door's. The rest of this crate stays deliberately synchronous
+# (`postgres`, `wkp-git`'s subprocesses, `ureq`) and `serve-tenant`
+# (the mode a tenant's own pod runs, plain HTTP inside the shared
+# podman network) stays on `tiny_http` untouched -- see
+# `src/front_door.rs`'s module doc. Why an async stack here at all,
+# against this crate's own grain: the front door is now the sole
+# process terminating client-facing TLS (ADR-0009/0010), and #124 has
+# to hang a custom `rustls` client-certificate verifier off that same
+# listener. `tiny_http`'s bundled TLS is pinned to rustls 0.20, which
+# has no usable client-verifier API, so keeping it would have meant
+# hand-rolling a TLS-terminating proxy in front of it -- novel,
+# security-critical code this project should not be writing itself
+# when `axum`/`axum-server` already do exactly this job and are far
+# more heavily audited. Security and long-term maintainability
+# outrank dependency-count here specifically (CLAUDE.md's priority 2
+# over priority 3), and the blast radius is one listener.
+# `default-features = false` on both: only what the front door
+# actually uses gets built.
+axum = { version = "0.8.9", default-features = false }
+# `tls-rustls-no-provider`, not `tls-rustls`: the latter forces
+# `rustls/aws-lc-rs`, a C library with `unsafe` FFI, which is exactly
+# what the `rustls`/`rcgen` entries above pin `ring` to avoid.
+axum-server = { version = "0.8.0", default-features = false, features = ["tls-rustls-no-provider"] }
+# The runtime `axum-server` needs, plus `spawn_blocking`: every
+# existing handler this crate re-serves through `axum` is blocking
+# (Postgres, `git http-backend`, `ureq` to a tenant pod) and none of
+# it is being converted to async -- it runs on the blocking pool
+# instead. "sync"/"macros"/"io-util" (M5-12): `connection_registry.rs`
+# needs `tokio::sync::Notify` (via `tokio-util`'s `CancellationToken`,
+# below) and its own `#[tokio::test]`/`tokio::io::duplex` test
+# coverage -- both were already present transitively (`axum-server`'s
+# own dependency tree pulls them in via Cargo's feature unification),
+# made direct here since this crate's own code now names them
+# explicitly, matching this dependency's existing "declare what's
+# actually used" convention.
+tokio = { version = "1", default-features = false, features = ["rt-multi-thread", "net", "time", "sync", "macros", "io-util"] }
+# M5-10 (ADR-0011): `front_door::PeerCertAcceptor` wraps `axum-server`'s
+# `RustlsAcceptor` to read the peer certificate off the completed
+# handshake (`tokio_rustls::server::TlsStream::get_ref`) and inject it
+# as a per-connection request extension (`axum::Extension` +
+# `tower_layer::Layer`) -- both already in this workspace's `Cargo.lock`
+# transitively (`axum-server`'s own dependency tree), made direct here
+# because `front_door.rs` names their types explicitly rather than only
+# through `axum-server`'s own re-exports. `tower-layer` rather than the
+# full `tower` crate: only the `Layer` trait itself is needed, not
+# `tower`'s service/middleware machinery this crate has no other use
+# for.
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring"] }
+tower-layer = "0.3"
+# M5-12 (ADR-0011 addendum): `connection_registry.rs`'s own
+# cancel-a-specific-open-connection mechanism. Already present
+# transitively (`hyper-util`/`tower`'s own dependency tree) -- made
+# direct because this crate now names `CancellationToken` explicitly.
+# `default-features = false, features = []`: `CancellationToken` isn't
+# gated behind any `tokio-util` feature at all (unlike its `codec`/
+# `io-util`/`compat` utilities, which this crate has no use for).
+tokio-util = { version = "0.7", default-features = false }
+
+[dev-dependencies]
+# M5-4: `tenant_repo`'s own tests and `tests/post_receive_hook.rs` need a
+# real per-test temp directory -- `tempfile::TempDir`, not
+# `std::env::temp_dir()` + a hand-rolled unique name, per this repo's own
+# semgrep gate and the identical choice `wkp-git`/`wkp-cli`'s test
+# fixtures already make (see their `test_support.rs` module docs).
+tempfile = "3.27.0"

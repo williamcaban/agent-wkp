@@ -1,0 +1,31 @@
+{
+  "_comment": "Applied to a tenant pod's indexing container only (crates/wkp-hub/src/tenant_pod.rs, issue #159) via `podman run --security-opt seccomp=...`. Default-allow, explicit-deny on every syscall that could create or use a network socket -- verified by hand against real podman (a sibling container in the same pod, with an unrestricted listener, could no longer even call socket() once this profile was applied: 'nc: socket: Operation not permitted'). Kept as a deny-list rather than a full allow-list profile: an allow-list is fragile across libc/kernel versions for a filesystem-and-SQLite-only process, and this needs to comprehensively block one specific capability (networking), not minimize the whole syscall surface.",
+  "defaultAction": "SCMP_ACT_ALLOW",
+  "architectures": ["SCMP_ARCH_X86_64", "SCMP_ARCH_AARCH64"],
+  "syscalls": [
+    {
+      "names": [
+        "socket",
+        "socketpair",
+        "connect",
+        "accept",
+        "accept4",
+        "bind",
+        "listen",
+        "sendto",
+        "sendmsg",
+        "sendmmsg",
+        "recvfrom",
+        "recvmsg",
+        "recvmmsg",
+        "getsockname",
+        "getpeername",
+        "setsockopt",
+        "getsockopt",
+        "shutdown"
+      ],
+      "action": "SCMP_ACT_ERRNO",
+      "errnoRet": 1
+    }
+  ]
+}

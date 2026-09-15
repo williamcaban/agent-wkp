@@ -1,0 +1,72 @@
+[package]
+name = "wkp-cli"
+description = "The wkp binary (wkpd is a subcommand)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "wkp"
+path = "src/main.rs"
+
+[dependencies]
+wkp-core = { version = "0.1.0", path = "../wkp-core" }
+wkp-git = { path = "../wkp-git" }
+# M4-4: the encryption filter's own real linkage of wkp-crypto (M4-1
+# through M4-3 landed the crate itself with no consumer yet). See the
+# M4-4 PR description for the measured target/release/wkp size delta.
+wkp-crypto = { path = "../wkp-crypto" }
+# M3-8 (wkpd): file-watch cycle. Named explicitly by design 4.2.
+notify = "8"
+# M3-8 (wkpd): safe UDS peer-credential verification without `unsafe` in
+# this crate. See docs/adr/0004-wkpd-peer-credential-verification.md.
+# Already a transitive dependency (via `tempfile`) before this; promoted
+# to direct here, no new supply-chain surface.
+rustix = { version = "1.1.4", default-features = false, features = ["net", "process", "std"] }
+# M5-2: `wkp hub register`'s HTTP client (RFC 8628 device-authorization
+# grant against `wkp-hub`, design 6.4). `serde`/`serde_json` alongside it
+# for the same request/response bodies -- deliberately not a hand-rolled
+# parser for this one: unlike promote.rs's small, local, trusted TOML
+# config, this parses untrusted network responses, where a well-vetted
+# library is the safer choice, not a shortcut.
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+# M5-13 (ADR-0011): `wkp hub register` now targets a real `https://`
+# hub (M5-8's front door is TLS-only, no plain-HTTP listener at all) --
+# the "revisit if/when a real https:// hub target lands" this comment
+# used to end on. `rustls-no-provider`, not the `rustls` convenience
+# feature: the latter also pulls in `rustls-webpki-roots`
+# (CDLA-Permissive-2.0, which this workspace's `deny.toml` disallows,
+# same reasoning `wkp-hub/Cargo.toml`'s own `ureq` entry already gives)
+# *and* the public web PKI is actively the wrong trust anchor here --
+# the hub is always its own private CA (ADR-0011), never a publicly
+# trusted one. `rustls-no-provider` leaves the crypto provider
+# unconfigured, wired explicitly in `hub_register.rs` to `ring` (see
+# the `rustls`/`rustls-pki-types` entries below) -- the same pinning
+# `wkp-hub`'s own `rustls`/`rcgen` entries already use, for the same
+# reason (no `aws-lc-rs`, a C library with `unsafe` FFI).
+ureq = { version = "3.4.1", default-features = false, features = ["rustls-no-provider", "json", "gzip"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "tls12", "logging"] }
+
+[dev-dependencies]
+tempfile = "3.27.0"
+
+# M6-1 (issue #170, design 7.5): process hardening -- a Landlock
+# ruleset restricting write-class filesystem access, and a seccomp
+# filter denying syscalls no normal `wkp` operation has any legitimate
+# reason to call. Both are Linux-specific (Landlock is a Linux Security
+# Module; seccomp-bpf is a Linux syscall-filtering facility), hence a
+# platform-specific dependency table rather than an unconditional one --
+# the macOS build (`aarch64-apple-darwin`) never compiles either crate.
+[target.'cfg(target_os = "linux")'.dependencies]
+landlock = "0.4.7"
+seccompiler = "0.4"
+libc = "0.2"
+
+[features]
+# M1-9: forwards to wkp-core's own opt-in hybrid-search feature. See
+# crates/wkp-core/Cargo.toml and docs/adr/0003-hybrid-search-embed-feature-gate.md.
+embed = ["wkp-core/embed"]

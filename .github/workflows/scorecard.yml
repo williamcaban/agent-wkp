@@ -1,0 +1,130 @@
+# M0-2 (issue #2) built the informational half: Scorecard publishes
+# results to the repo's Security tab on push/schedule, but never failed
+# a PR. M6-9 (issue #178) adds the actual gate design 9.6/9.2 asks for
+# ("OpenSSF Scorecard gate," not "OpenSSF Scorecard report"): a separate
+# `score-gate` job below fails if the aggregate score drops below a
+# floor -- on pushes, on the weekly schedule, and (per the trigger added
+# below) on pull requests too, so a regression is visible before merge,
+# not only after.
+name: Scorecard supply-chain security
+
+on:
+  push:
+    # main only, not v2-rust: `ossf/scorecard-action` structurally
+    # refuses to run at all on a `push` event to any branch other than
+    # the repo's actual GitHub-configured default branch -- confirmed
+    # the hard way (every push to v2-rust since this workflow existed
+    # has failed with "refs/heads/v2-rust not supported with push
+    # event. Only the default branch main is supported.", not a config
+    # mistake this repo could route around). `pull_request` below
+    # already exercises `score-gate` against v2-rust on every PR (and
+    # does work there -- the action's own restriction is push-specific);
+    # this becomes a non-issue on its own once the M6 cutover (#161)
+    # makes v2-rust's content live on `main`.
+    branches: [main]
+  # Experimental per ossf/scorecard-action's own docs ("pull_request...
+  # triggers are experimental," "not supported on a fork repository").
+  # This repo's own PRs are always same-repo branches, never forks, so
+  # the specifically-documented unsupported case doesn't apply here --
+  # kept for the score-gate job only (see its own `if:` below), not the
+  # existing publish-to-Security-tab job, which has no reason to run
+  # against a PR's own transient state.
+  #
+  # Retargeted from v2-rust to main as part of the cutover itself (issue
+  # #161/PR #205): main's branch protection requires this job's check by
+  # name, and it would otherwise never post against a PR whose base is
+  # main -- the same required-check deadlock class this ADR-0013 cutover
+  # already existed to avoid for the old Python `test (3.12)` check.
+  pull_request:
+    branches: [main]
+  schedule:
+    - cron: "30 1 * * 6" # 01:30 UTC every Saturday
+
+permissions: {}
+
+concurrency:
+  group: scorecard-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  analysis:
+    name: Scorecard analysis
+    # Unchanged from M0-2: publishing to the Security tab is a push/
+    # schedule concern, not something a PR's own transient state should
+    # trigger.
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      # Scorecard's own documented requirements: read the repo, upload a
+      # SARIF file to Security > Code Scanning, and (id-token) mint a
+      # Sigstore signature over its own results.
+      security-events: write
+      id-token: write
+      contents: read
+      actions: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+
+      - uses: ossf/scorecard-action@55891bbd73f2425e97637d96e306fc9d491d0b21 # v2.4.4
+        with:
+          results_file: results.sarif
+          results_format: sarif
+          publish_results: true
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: SARIF file
+          path: results.sarif
+          retention-days: 5
+
+      - uses: github/codeql-action/upload-sarif@42c378ffbb438be29e3e1848d520fb0a8ee1c271 # v3.38.0
+        with:
+          sarif_file: results.sarif
+
+  score-gate:
+    name: Scorecard minimum-score gate (M6-9, issue #178)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+
+      # Separate run from `analysis` above, in JSON rather than SARIF --
+      # SARIF is for the Security tab's own UI, not something a threshold
+      # check can easily parse. `publish_results: false`: this run's
+      # only job is the local threshold check below, not another
+      # Security-tab/Sigstore publish of the same analysis.
+      - uses: ossf/scorecard-action@55891bbd73f2425e97637d96e306fc9d491d0b21 # v2.4.4
+        with:
+          results_file: results.json
+          results_format: json
+          publish_results: false
+
+      # Threshold picked from real, measured numbers (2026-09-14), not
+      # guessed: this repo's actual score was 7.6 (v2-rust, via the
+      # scorecard CLI run directly against that commit) and 4.3 (main,
+      # the frozen Python history, via the CLI's default whole-repo
+      # analysis, which runs a wider set of checks -- Maintained,
+      # Contributors, Fuzzing, SAST, Signed-Releases, Branch-Protection,
+      # among others -- than a single-commit analysis does). Several of
+      # those wider checks structurally can't score well for a
+      # single-maintainer-plus-agent project (Contributors, CII-Best-
+      # Practices) regardless of how sound the actual security posture
+      # is, so a floor near either measured number would be too fragile;
+      # 4 is a real regression-catching floor, not an aspirational
+      # target -- reconsider once more real CI runs establish how this
+      # specific job (not my local CLI test) actually scores over time.
+      - name: enforce minimum score
+        run: |
+          SCORE=$(jq '.score' results.json)
+          echo "Scorecard aggregate score: $SCORE"
+          python3 -c "import sys; sys.exit(0 if float('$SCORE') >= 4 else 1)" || {
+            echo "::error::Scorecard score $SCORE is below the required minimum of 4"
+            exit 1
+          }

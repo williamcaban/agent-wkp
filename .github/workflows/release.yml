@@ -1,0 +1,565 @@
+name: Release
+
+# Design 9.6 / M6-3 (issue #172): reproducible release build pipeline.
+# This is the *first piece* of the release pipeline (design 9.6: "No
+# release workflow, signing, or SLSA provenance exists today") -- cosign
+# signing + SLSA provenance (issue #173), SBOM attachment (issue #174),
+# and the Homebrew tap / OCI image publishing (issues #175/#176) are
+# separate, later tasks that extend this workflow's own draft release
+# rather than replacing it.
+#
+# Reproducibility is verified for real, not assumed: every target is
+# built twice, on two independent runner instances (the `attempt`
+# matrix dimension below), and a separate job fails the whole workflow
+# if the two attempts' SHA256 hashes don't match -- the same "verify by
+# hand against the real mechanism" standard issue #159's seccomp profile
+# and issue #165's shared-mount fix were held to.
+#
+# Triggers on a `v*` tag push for a real release, or manually
+# (`workflow_dispatch`) so this pipeline itself can be exercised and
+# iterated on without cutting an actual release tag.
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch: {}
+
+permissions: {}
+
+jobs:
+  build:
+    name: build (${{ matrix.target }}, attempt ${{ matrix.attempt }})
+    runs-on: ${{ matrix.os }}
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        # `target` must be a real matrix dimension of its own (not
+        # only present inside `include`), so `attempt` cross-products
+        # against it (3 targets x 2 attempts = 6 jobs) and `include`'s
+        # entries -- which share the `target` key with those 6 -- get
+        # merged into each matching one (adding `os`) rather than
+        # creating their own standalone combinations. Got this
+        # backwards originally (`include` alone, no top-level
+        # `target:`): the real v0.1.0-rc5 tag push found only 2 of the
+        # intended 6 build jobs ever ran (both aarch64-apple-darwin,
+        # attempt 1 and 2 -- the *last* include entry, applied to
+        # every attempt-only combination instead of creating separate
+        # per-target ones), which is exactly GitHub's documented
+        # behavior when an include entry shares no key with the base
+        # matrix: it's added as its own new combination, last one
+        # wins when multiple entries have nothing to distinguish them
+        # by outside of `attempt`.
+        # aarch64-unknown-linux-musl temporarily dropped (William,
+        # 2026-09-14): v0.1.0-rc6 found it's genuinely not
+        # reproducible right now -- the two independent `cross`
+        # (Docker-based) build attempts produced different SHA256
+        # hashes of the same size, a real non-determinism in that
+        # toolchain path, not an infra bug like the ones before it in
+        # this same tag-push verification pass. Root cause not yet
+        # investigated (a real candidate: `cross` builds inside a
+        # container at its own internal path, which
+        # `--remap-path-prefix=${{ github.workspace }}=/build` doesn't
+        # account for, since that's the *host's* workspace path, not
+        # the container's). `rust-ci.yml`'s own cross-compile CI job
+        # still builds and smoke-tests this target on every push/PR --
+        # this only affects the release pipeline's reproducibility
+        # claim specifically. Revisit and re-add once actually fixed;
+        # don't re-add by just deleting this comment without fixing
+        # the underlying non-determinism first.
+        target:
+          - x86_64-unknown-linux-musl
+          - aarch64-apple-darwin
+        attempt: [1, 2]
+        include:
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-latest
+          - target: aarch64-apple-darwin
+            os: macos-14
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - uses: dtolnay/rust-toolchain@d1031067263f94b142dd6c0ce24c5eb9d02d52a0 # master, 2026-09-03
+        with:
+          toolchain: "1.98.1" # keep in sync with rust-toolchain.toml
+          targets: ${{ matrix.target }}
+
+      # Deliberately no Swatinem/rust-cache here, unlike rust-ci.yml's
+      # cross-compile jobs -- a warm incremental-compilation cache is
+      # exactly the kind of build-environment difference that could make
+      # two "reproducible" builds diverge for reasons that have nothing
+      # to do with the source tree. Slower, but this workflow runs on a
+      # release tag or by hand, never per-PR, so the cost is acceptable.
+
+      # SOURCE_DATE_EPOCH: the commit's own timestamp, not "now" -- the
+      # whole point is that building this exact commit later still
+      # produces the same bytes, which requires a value derived from the
+      # commit itself, not the wall-clock time of whichever attempt runs
+      # first.
+      - name: set SOURCE_DATE_EPOCH from the commit timestamp
+        run: echo "SOURCE_DATE_EPOCH=$(git log -1 --format=%ct)" >> "$GITHUB_ENV"
+
+      - name: install musl-tools
+        if: matrix.target == 'x86_64-unknown-linux-musl'
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends musl-tools
+
+      - name: install cross
+        if: matrix.target == 'aarch64-unknown-linux-musl'
+        run: cargo install cross --version 0.2.5 --locked
+
+      - name: cargo build --release --target ${{ matrix.target }}
+        if: matrix.target != 'aarch64-unknown-linux-musl'
+        env:
+          # Normalizes the absolute build path embedded in debug info and
+          # panic messages -- both attempts of the same target run on the
+          # same OS, so `GITHUB_WORKSPACE` already matches between them
+          # today, but this removes that coincidence as a hidden
+          # assumption rather than relying on it holding forever.
+          RUSTFLAGS: "--remap-path-prefix=${{ github.workspace }}=/build"
+        run: cargo build --release --locked -p wkp-cli --target ${{ matrix.target }}
+
+      - name: cross build --release --target ${{ matrix.target }}
+        if: matrix.target == 'aarch64-unknown-linux-musl'
+        env:
+          RUSTFLAGS: "--remap-path-prefix=${{ github.workspace }}=/build"
+        run: cross build --release --locked -p wkp-cli --target ${{ matrix.target }}
+
+      - name: checksum
+        # `sha256sum` doesn't exist on the macOS runner (a real,
+        # previously-undiscovered bug: this job runs across
+        # matrix.os including macos-14, but this step was never
+        # actually exercised until the first real tag push --
+        # `sha256sum: command not found`, exit 127). `shasum -a 256`
+        # is the macOS-native equivalent and produces the identical
+        # `<hash>  <filename>` output format `verify-reproducible`'s
+        # `cut -d' ' -f1` parsing expects; falls back to it only when
+        # `sha256sum` itself isn't found, rather than assuming which
+        # one this specific runner has.
+        run: |
+          BIN="target/${{ matrix.target }}/release/wkp"
+          OUT="wkp-${{ matrix.target }}"
+          mkdir -p "$OUT"
+          cp "$BIN" "$OUT/wkp"
+          if command -v sha256sum >/dev/null 2>&1; then
+            sha256sum "$OUT/wkp" > "$OUT/wkp.sha256"
+          else
+            shasum -a 256 "$OUT/wkp" > "$OUT/wkp.sha256"
+          fi
+          cat "$OUT/wkp.sha256"
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: wkp-${{ matrix.target }}-attempt${{ matrix.attempt }}
+          path: wkp-${{ matrix.target }}/
+          retention-days: 7
+
+  verify-reproducible:
+    name: verify reproducible (${{ matrix.target }})
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        # aarch64-unknown-linux-musl dropped -- see the build job's
+        # own matrix comment above for why.
+        target:
+          - x86_64-unknown-linux-musl
+          - aarch64-apple-darwin
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: wkp-${{ matrix.target }}-attempt1
+          path: attempt1
+
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: wkp-${{ matrix.target }}-attempt2
+          path: attempt2
+
+      - name: compare SHA256 hashes across the two independent builds
+        run: |
+          H1=$(cut -d' ' -f1 attempt1/wkp.sha256)
+          H2=$(cut -d' ' -f1 attempt2/wkp.sha256)
+          echo "attempt 1: $H1"
+          echo "attempt 2: $H2"
+          if [ "$H1" != "$H2" ]; then
+            echo "::error::${{ matrix.target }} is not reproducible: two independent builds of the same commit produced different binaries"
+            exit 1
+          fi
+
+      # Named `release-wkp-*`, not `wkp-*` -- the `build` job's own
+      # per-attempt artifacts are also named `wkp-<target>-attempt<N>`,
+      # and `publish-draft-release` below downloads by a `wkp-*` glob.
+      # A shared prefix would let it silently pull in an *unverified*
+      # attempt instead of this job's own hash-checked one.
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: release-wkp-${{ matrix.target }}
+          path: attempt1/
+          retention-days: 30
+
+  sign:
+    name: cosign sign-blob (${{ matrix.target }})
+    needs: verify-reproducible
+    runs-on: ubuntu-latest
+    # Keyless signing writes a real, public, permanent entry to
+    # Sigstore's Rekor transparency log -- a `workflow_dispatch` test run
+    # of this pipeline (issue #172's own way to exercise it without a
+    # real tag) has no business creating one. Only a real `v*` tag push
+    # signs anything.
+    if: github.event_name == 'push'
+    permissions:
+      contents: read
+      id-token: write # keyless signing: needed to mint the OIDC token cosign exchanges with Fulcio for a short-lived signing cert
+    strategy:
+      fail-fast: false
+      matrix:
+        # aarch64-unknown-linux-musl dropped -- see the build job's
+        # own matrix comment above for why.
+        target:
+          - x86_64-unknown-linux-musl
+          - aarch64-apple-darwin
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: release-wkp-${{ matrix.target }}
+          path: artifact
+
+      - uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+
+      # Keyless signing (design 9.6): no private key this repo has to
+      # protect. cosign exchanges this job's own GitHub Actions OIDC
+      # token for a short-lived Fulcio certificate identifying exactly
+      # this workflow/ref, signs with that, and records the signature in
+      # Rekor's public transparency log -- `--bundle` writes signature +
+      # certificate + Rekor inclusion proof into one file, the current
+      # cosign convention (superseding the older separate
+      # --output-signature/--output-certificate flags).
+      - name: cosign sign-blob --bundle
+        run: |
+          cosign sign-blob --yes \
+            --bundle "wkp-${{ matrix.target }}.bundle" \
+            artifact/wkp
+
+      # Verified in the same job, immediately -- a signing step that
+      # "succeeds" but produces a bundle nothing can actually verify
+      # would be worse than no signature at all (a false sense of
+      # integrity). Uses the *exact* identity (this run's own ref, known
+      # precisely here, unlike a later external verifier who'd need a
+      # wildcard/regex -- see the release notes' own verify command
+      # below for that version) -- Fulcio's documented SAN format for a
+      # GitHub Actions OIDC token is
+      # `https://github.com/<owner>/<repo>/.github/workflows/<file>@<ref>`.
+      - name: cosign verify-blob --bundle (self-check)
+        run: |
+          cosign verify-blob \
+            --bundle "wkp-${{ matrix.target }}.bundle" \
+            --certificate-identity "https://github.com/${{ github.repository }}/.github/workflows/release.yml@${{ github.ref }}" \
+            --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
+            artifact/wkp
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: signed-wkp-${{ matrix.target }}
+          path: wkp-${{ matrix.target }}.bundle
+          retention-days: 30
+
+  hashes-for-provenance:
+    name: compute combined hashes for SLSA provenance
+    needs: verify-reproducible
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' # see the `sign` job's own comment on why: no provenance for a manual test run either
+    permissions:
+      contents: read
+    outputs:
+      hashes: ${{ steps.hash.outputs.hashes }}
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: release-wkp-*
+          path: dist
+          merge-multiple: false
+
+      - name: lay out binaries under one flat name per target
+        run: |
+          mkdir -p subjects
+          for dir in dist/release-wkp-*; do
+            target=$(basename "$dir" | sed 's/^release-wkp-//')
+            cp "$dir/wkp" "subjects/wkp-${target}"
+          done
+
+      # The SLSA provenance's own subject list -- design 9.6's "SLSA
+      # provenance attestations generated by the build" is a statement
+      # about exactly these bytes, so the hash has to be computed over
+      # the same binaries `publish-draft-release` below actually
+      # attaches, not a separate recomputation that could quietly drift
+      # from what a user downloads.
+      - name: generate hashes
+        id: hash
+        run: echo "hashes=$(cd subjects && sha256sum wkp-* | base64 -w0)" >> "$GITHUB_OUTPUT"
+
+  provenance:
+    name: SLSA provenance
+    needs: hashes-for-provenance
+    if: github.event_name == 'push' # redundant with hashes-for-provenance's own skip (default success() propagation already skips this), kept explicit for the same reason as its sibling jobs
+    permissions:
+      actions: read # required by the generator to verify this workflow's own run
+      id-token: write # keyless signing of the provenance itself
+      # `write`, not `read`: real root cause of the startup_failure
+      # PR #195 misdiagnosed as a generator-version problem. The
+      # reusable workflow's own job graph statically declares a
+      # `contents: write` need on its (conditionally-run) upload-assets
+      # job, and GitHub's validator checks that against what *this*
+      # job grants regardless of whether upload-assets will actually
+      # run for a given invocation (upload-assets: false, below, is a
+      # runtime decision the validator can't see) -- confirmed by
+      # isolating it as the one-line fix, independent of generator
+      # version (v1.10.0 and v2.1.0 both work once this is `write`;
+      # neither works with this left at `read`, no matter the version).
+      # This job never touches the release itself either way --
+      # publish-draft-release does that -- so this grant is unused in
+      # practice, just required to exist for validation to pass.
+      contents: write
+    # The generic SLSA3 generator -- design 9.6: "SLSA provenance
+    # attestations generated by the build... target SLSA Build L3 via
+    # the official generators." Referenced by version tag, not a pinned
+    # SHA (this repo's usual convention, design 9.2): the generator's own
+    # documentation states it "MUST be referenced by a tag of the form
+    # @vX.Y.Z" and that shorter refs or hash references cause it to fail
+    # -- a real, documented exception to SHA-pinning, not an oversight.
+    uses: slsa-framework/slsa-github-generator/.github/workflows/generator_generic_slsa3.yml@v2.1.0
+    with:
+      base64-subjects: "${{ needs['hashes-for-provenance'].outputs.hashes }}"
+      upload-assets: false # publish-draft-release attaches this job's own artifact to the release itself, alongside the binaries and signatures, in one place
+
+  sbom:
+    name: SBOM (${{ matrix.format }})
+    # No `needs:` -- unlike the binary/signing/provenance jobs, an SBOM
+    # of this workspace's declared dependencies (Cargo.lock) doesn't
+    # depend on any target actually finishing its build, so this starts
+    # immediately in parallel with `build` rather than waiting on it.
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' # consistent with its sibling jobs, even though an SBOM itself isn't a Sigstore/Rekor concern
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - format: cyclonedx-json
+            filename: wkp-sbom.cyclonedx.json
+          - format: spdx-json
+            filename: wkp-sbom.spdx.json
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      # Scans the source tree (Cargo.lock), not the compiled binaries --
+      # design 9.3/9.6's "SBOM generation... inventory for continuous
+      # rescans." A real Cargo.lock-based dependency graph is complete
+      # and exact; Rust binaries don't reliably embed the same
+      # information for a scanner to recover after the fact the way
+      # source analysis does. One SBOM covers every target: the
+      # dependency graph is the same workspace-wide Cargo.lock
+      # regardless of which target a binary was cross-compiled for.
+      - uses: anchore/sbom-action@3ad7283483fc7af8ff2b4ea19663c2d5ca935e26 # v0.24.2
+        with:
+          path: .
+          format: ${{ matrix.format }}
+          # `artifact-name` becomes the exact filename inside the
+          # downloaded artifact too (verified against the action's own
+          # docs) -- a real `.json` name, not the raw Syft format
+          # identifier (`cyclonedx-json` is a format name, not a
+          # filename extension).
+          artifact-name: ${{ matrix.filename }}
+          # publish-draft-release attaches this job's own artifact to
+          # the release itself, alongside the binaries, signatures and
+          # provenance, in one place -- same reasoning as provenance's
+          # own upload-assets: false above.
+          upload-release-assets: false
+
+  oci-image:
+    name: OCI image (linux/amd64 only for now, see build job's matrix comment)
+    needs: verify-reproducible
+    runs-on: ubuntu-latest
+    # Pushes a real image to ghcr.io and writes a real, public Rekor
+    # entry when it signs it -- same reasoning as sign/provenance/sbom's
+    # own guard: a workflow_dispatch test run has no business doing
+    # either.
+    if: github.event_name == 'push'
+    permissions:
+      contents: read
+      packages: write # push to ghcr.io
+      id-token: write # keyless signing of the pushed image
+    outputs:
+      image: ${{ steps.image.outputs.image }}
+      digest: ${{ steps.push.outputs.digest }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: release-wkp-x86_64-unknown-linux-musl
+          path: target/x86_64-unknown-linux-musl/release
+
+      # linux/arm64 (aarch64-unknown-linux-musl) temporarily dropped
+      # here too -- see the build job's own matrix comment for why.
+      # amd64-only for now, not yet multi-arch; the manifest-list
+      # mechanism below is kept as-is (a manifest list with one
+      # platform is valid) so re-adding arm64 later is just restoring
+      # the second `podman build`/`manifest add` pair, not a rewrite.
+      - name: podman build (deploy/Containerfile)
+        run: |
+          chmod +x target/x86_64-unknown-linux-musl/release/wkp
+          podman build --platform linux/amd64 \
+            --build-arg TARGET=x86_64-unknown-linux-musl \
+            -f deploy/Containerfile -t wkp-amd64 .
+
+      # ghcr.io package names must be lowercase; `github.repository_owner`
+      # isn't guaranteed to be (verified by hand: podman build/manifest
+      # mechanics above, not this specific lowercasing edge case, since
+      # this repo's own owner is already lowercase -- kept as a real
+      # safeguard rather than an assumption regardless).
+      #
+      # `containers-storage:localhost/wkp-amd64`, not a bare
+      # `localhost/wkp-amd64` -- v0.1.0-rc7 found `podman manifest add`
+      # treats an unprefixed `localhost/...` reference as an actual
+      # registry hostname to pull from over HTTPS ("pinging container
+      # registry localhost: ... connection refused"), not "look in
+      # local image storage" the way `podman build -t wkp-amd64`'s own
+      # implicit `localhost/` tag prefix suggests. The explicit
+      # `containers-storage:` transport prefix is unambiguous -- no
+      # network involved, confirmed locally before trusting it in CI.
+      - name: build the manifest list
+        id: image
+        run: |
+          OWNER_LOWER=$(echo "${{ github.repository_owner }}" | tr '[:upper:]' '[:lower:]')
+          IMAGE="ghcr.io/${OWNER_LOWER}/wkp"
+          podman manifest create wkp-manifest
+          podman manifest add wkp-manifest containers-storage:localhost/wkp-amd64
+          echo "image=$IMAGE" >> "$GITHUB_OUTPUT"
+
+      # `--authfile ~/.docker/config.json`, not podman's own default
+      # (`${XDG_RUNTIME_DIR}/containers/auth.json`, confirmed via
+      # `man podman-login`): v0.1.0-rc8 found `cosign sign` below
+      # failed to authenticate to ghcr.io ("User cannot be
+      # authenticated with the token provided") even though this
+      # login step itself succeeded and the manifest push (same
+      # session) worked fine -- cosign doesn't read podman's own auth
+      # file, only the standard Docker credential location. Writing
+      # there directly means both tools share one login.
+      - name: podman login ghcr.io
+        run: |
+          mkdir -p "${HOME}/.docker"
+          echo "${{ github.token }}" | podman login ghcr.io -u "${{ github.actor }}" --password-stdin --authfile "${HOME}/.docker/config.json"
+
+      - name: podman manifest push
+        run: |
+          podman manifest push --digestfile digest.txt \
+            wkp-manifest "docker://${{ steps.image.outputs.image }}:${{ github.ref_name }}"
+          echo "digest=$(cat digest.txt)" >> "$GITHUB_OUTPUT"
+        id: push
+
+      - uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+
+      # Signs the pushed manifest list *by digest*, not by the mutable
+      # tag -- the same reasoning `cosign sign-blob` above doesn't apply
+      # to, since an OCI tag can be repointed after the fact but a digest
+      # can't.
+      - name: cosign sign (keyless)
+        run: cosign sign --yes "${{ steps.image.outputs.image }}@${{ steps.push.outputs.digest }}"
+
+  publish-draft-release:
+    name: publish draft release
+    needs: [sign, provenance, sbom, oci-image]
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push'
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: release-wkp-*
+          path: dist
+          merge-multiple: false
+
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: signed-wkp-*
+          path: signed
+          merge-multiple: false
+
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: ${{ needs.provenance.outputs['provenance-name'] }}
+          path: provenance
+
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: wkp-sbom.*
+          path: sbom
+          merge-multiple: true
+
+      - name: lay out release assets
+        run: |
+          mkdir -p release
+          for dir in dist/release-wkp-*; do
+            target=$(basename "$dir" | sed 's/^release-wkp-//')
+            cp "$dir/wkp" "release/wkp-${target}"
+            cp "$dir/wkp.sha256" "release/wkp-${target}.sha256"
+          done
+          for dir in signed/signed-wkp-*; do
+            target=$(basename "$dir" | sed 's/^signed-wkp-//')
+            cp "$dir/wkp-${target}.bundle" "release/wkp-${target}.bundle"
+          done
+          cp provenance/*.intoto.jsonl release/
+          cp sbom/wkp-sbom.* release/
+          ls -la release/
+
+      # design 9.6's exit criterion for this workflow: reproducible
+      # (issue #172), signed with SLSA provenance (issue #173), an SBOM
+      # (issue #174), and a signed multi-arch OCI image (issue #176) --
+      # still published as a draft regardless, since this workflow alone
+      # isn't all of M6 (Homebrew tap/self-update verification/
+      # sandboxing/Scorecard gate are separate, still-open tasks). A
+      # human decides when a draft here actually gets published for
+      # real.
+      - name: gh release create --draft
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          IMAGE: ${{ needs['oci-image'].outputs.image }}
+          DIGEST: ${{ needs['oci-image'].outputs.digest }}
+        run: |
+          {
+            echo "Reproducible cross-target build, verified by two independent CI runners per target (issue #172)."
+            echo "Signed keylessly with cosign (Fulcio + Rekor) and carries SLSA Build L3 provenance (issue #173)."
+            echo "SBOM in both CycloneDX and SPDX formats (issue #174)."
+            echo "OCI image (linux/amd64 only for now -- linux/arm64 temporarily dropped, see release.yml's own comment on why), also cosign-signed: \`${IMAGE}@${DIGEST}\` (issue #176)."
+            echo
+            echo "Verify a binary's signature:"
+            echo '```'
+            echo 'cosign verify-blob --bundle wkp-<target>.bundle \'
+            echo "  --certificate-identity-regexp '^https://github\\.com/${REPO}/\\.github/workflows/release\\.yml@.*\$' \\"
+            echo '  --certificate-oidc-issuer https://token.actions.githubusercontent.com \'
+            echo '  wkp-<target>'
+            echo '```'
+            echo
+            echo "Left as a draft: this workflow alone isn't all of M6 (design 9.6) -- a human decides when this is actually published."
+          } > notes.md
+          # `--repo "$REPO"`, not relying on `gh`'s usual git-remote
+          # auto-detection -- v0.1.0-rc9 found this job has no
+          # `actions/checkout` step (it only ever needed downloaded
+          # artifacts, not the source tree), so there's no `.git`
+          # directory for `gh` to infer the target repo from ("failed
+          # to run git: fatal: not a git repository"). `REPO` is
+          # already set above for the release notes text; explicit
+          # `--repo` avoids adding a whole checkout just for this.
+          gh release create "${{ github.ref_name }}" release/* \
+            --repo "$REPO" \
+            --draft \
+            --title "${{ github.ref_name }}" \
+            --notes-file notes.md

@@ -1,0 +1,25 @@
+# M0-6: minimal `FROM scratch` image proving the `wkp` binary really is
+# static and needs no base image at all -- design 9.6's "no runtime" claim.
+# Not `wkp-hub`'s image (`deploy/hub/Containerfile`, Fedora-based, sshd +
+# git): this one exists purely to prove and exercise the CLI binary's own
+# static-link property, not to run a service.
+#
+# Build a release binary for the matching musl target first (see
+# .github/workflows/rust-ci.yml's `cross-linux-musl`/`cross-linux-musl-
+# aarch64` jobs, or locally:
+# `cargo build --release --locked -p wkp-cli --target x86_64-unknown-linux-musl`),
+# then:
+#   podman build -f deploy/Containerfile -t wkp .
+#   podman run --rm wkp --version
+#
+# `TARGET` (M6-7, issue #176): which cross-compile target's already-built
+# binary to copy in -- `--build-arg TARGET=aarch64-unknown-linux-musl
+# --platform linux/arm64` builds the arm64 image from the same file, no
+# second Containerfile needed. Defaults to the original M0-6 target so
+# every existing caller (this doc, rust-ci.yml's own smoke-test build)
+# keeps working unchanged.
+FROM scratch
+ARG TARGET=x86_64-unknown-linux-musl
+COPY target/${TARGET}/release/wkp /wkp
+USER 65532
+ENTRYPOINT ["/wkp"]
